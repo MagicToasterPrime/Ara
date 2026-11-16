@@ -102,6 +102,67 @@ async function startEmbeddedPgvector() {
     log("Migration SQL initiale (PostgreSQL + pgvector) appliquée sur la base embarquée.");
   }
 
+  await db.exec(`
+    ALTER TABLE "Whiteboard" ADD COLUMN IF NOT EXISTS "isPublic" BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE "Whiteboard" ADD COLUMN IF NOT EXISTS "isIntegrated" BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "revisionEnabled" BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "currentStreak" INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "bestStreak" INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastRevisionDate" TEXT;
+    ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "totalRevisionPoints" INTEGER NOT NULL DEFAULT 0;
+    CREATE TABLE IF NOT EXISTS "DailyRevisionSession" (
+      "id" TEXT NOT NULL,
+      "userId" TEXT NOT NULL,
+      "dateKey" TEXT NOT NULL,
+      "questionsJson" TEXT NOT NULL,
+      "answersJson" TEXT NOT NULL DEFAULT '{}',
+      "score" INTEGER NOT NULL DEFAULT 0,
+      "totalQuestions" INTEGER NOT NULL DEFAULT 0,
+      "completed" BOOLEAN NOT NULL DEFAULT false,
+      "completedAt" TIMESTAMP(3),
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "DailyRevisionSession_pkey" PRIMARY KEY ("id")
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS "DailyRevisionSession_userId_dateKey_key" ON "DailyRevisionSession"("userId", "dateKey");
+    CREATE INDEX IF NOT EXISTS "DailyRevisionSession_userId_createdAt_idx" ON "DailyRevisionSession"("userId", "createdAt");
+    CREATE TABLE IF NOT EXISTS "StudyArtifact" (
+      "id" TEXT NOT NULL,
+      "userId" TEXT NOT NULL,
+      "ueId" TEXT,
+      "documentId" TEXT,
+      "kind" TEXT NOT NULL,
+      "title" TEXT NOT NULL,
+      "prompt" TEXT,
+      "contentJson" TEXT NOT NULL,
+      "isPublic" BOOLEAN NOT NULL DEFAULT false,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "StudyArtifact_pkey" PRIMARY KEY ("id")
+    );
+    CREATE INDEX IF NOT EXISTS "StudyArtifact_userId_createdAt_idx" ON "StudyArtifact"("userId", "createdAt");
+    CREATE INDEX IF NOT EXISTS "StudyArtifact_ueId_createdAt_idx" ON "StudyArtifact"("ueId", "createdAt");
+    CREATE TABLE IF NOT EXISTS "CommunityQuiz" (
+      "id" TEXT NOT NULL,
+      "authorId" TEXT NOT NULL,
+      "ueId" TEXT,
+      "title" TEXT NOT NULL,
+      "description" TEXT NOT NULL DEFAULT '',
+      "questionsJson" TEXT NOT NULL,
+      "isPublic" BOOLEAN NOT NULL DEFAULT true,
+      "isPinned" BOOLEAN NOT NULL DEFAULT false,
+      "attemptsCount" INTEGER NOT NULL DEFAULT 0,
+      "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "CommunityQuiz_pkey" PRIMARY KEY ("id")
+    );
+    CREATE TABLE IF NOT EXISTS "CommunityQuizUpvote" (
+      "userId" TEXT NOT NULL,
+      "quizId" TEXT NOT NULL,
+      CONSTRAINT "CommunityQuizUpvote_pkey" PRIMARY KEY ("userId", "quizId")
+    );
+    CREATE INDEX IF NOT EXISTS "CommunityQuiz_ueId_createdAt_idx" ON "CommunityQuiz"("ueId", "createdAt");
+    CREATE INDEX IF NOT EXISTS "CommunityQuiz_authorId_createdAt_idx" ON "CommunityQuiz"("authorId", "createdAt");
+  `);
+
   const socketServer = new PGLiteSocketServer({
     db,
     host: "127.0.0.1",

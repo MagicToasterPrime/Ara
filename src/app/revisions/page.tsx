@@ -1,0 +1,720 @@
+"use client";
+
+import dynamic from "next/dynamic";
+import { useCallback, useEffect, useState } from "react";
+import Link from "next/link";
+import { useSession } from "next-auth/react";
+import {
+  Award,
+  Check,
+  CheckCircle2,
+  FileText,
+  Flame,
+  Loader2,
+  Power,
+  RefreshCw,
+  Trophy,
+  XCircle,
+} from "lucide-react";
+import { AppShell } from "@/components/AppShell";
+import { CommunityQuizSection } from "@/components/CommunityQuizSection";
+import { useSpix } from "@/components/SpixContext";
+import type {
+  ImagePointAnswer,
+  RevisionAnswerValue,
+  RevisionQuestion,
+} from "@/lib/revisions";
+
+const ImagePointCanvas = dynamic(
+  () =>
+    import("@/components/ImagePointCanvas").then(
+      (mod) => mod.ImagePointCanvas
+    ),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-64 items-center justify-center border border-border bg-paper font-mono text-xs uppercase tracking-wider text-stone">
+        CHARGEMENT DE L&apos;IMAGE DU COURS...
+      </div>
+    ),
+  }
+);
+
+interface UserRevisionState {
+  revisionEnabled: boolean;
+  currentStreak: number;
+  bestStreak: number;
+  lastRevisionDate: string | null;
+  totalRevisionPoints: number;
+  completedToday: boolean;
+}
+
+interface DailySessionData {
+  id: string;
+  dateKey: string;
+  questions: RevisionQuestion[];
+  answers: Record<string, RevisionAnswerValue>;
+  score: number;
+  totalQuestions: number;
+  completed: boolean;
+  completedAt: string | null;
+}
+
+interface LeaderboardEntry {
+  id: string;
+  name: string;
+  currentStreak: number;
+  bestStreak: number;
+  totalRevisionPoints: number;
+  completedToday: boolean;
+}
+
+interface RevisionsPayload {
+  userState: UserRevisionState;
+  todayKey: string;
+  hasCourseContent: boolean;
+  todaySession: DailySessionData | null;
+  leaderboard: LeaderboardEntry[];
+  gradingResults?: Record<string, boolean>;
+}
+
+const TYPE_LABELS: Record<RevisionQuestion["type"], string> = {
+  QCU: "QCU · CHOIX UNIQUE",
+  QCM: "QCM · CHOIX MULTIPLES",
+  FILL_BLANK: "PHRASE À TROU",
+  IMAGE_POINT: "POINTAGE SUR IMAGE",
+};
+
+export default function RevisionsPage() {
+  const { data: session } = useSession();
+  const { setPageContext } = useSpix();
+
+  const [data, setData] = useState<RevisionsPayload | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [answers, setAnswers] = useState<Record<string, RevisionAnswerValue>>(
+    {}
+  );
+  const [gradingResults, setGradingResults] = useState<
+    Record<string, boolean> | null
+  >(null);
+
+  useEffect(() => {
+    setPageContext({ mode: "GLOBAL" });
+  }, [setPageContext]);
+
+  const loadRevisions = useCallback(async () => {
+    try {
+      const res = await fetch("/api/revisions", { cache: "no-store" });
+      if (!res.ok) return;
+      const json = (await res.json()) as RevisionsPayload;
+      setData(json);
+      if (json.todaySession) {
+        setAnswers(json.todaySession.answers || {});
+        if (!json.todaySession.completed) {
+          setGradingResults(null);
+        }
+      }
+    } catch {
+      setError("Impossible de charger les révisions.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadRevisions();
+  }, [loadRevisions]);
+
+  async function postAction(body: Record<string, unknown>) {
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/revisions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const json = (await res.json()) as RevisionsPayload & { error?: string };
+      if (!res.ok) {
+        setError(json.error || "Erreur lors de l'opération.");
+        return;
+      }
+      setData(json);
+      if (json.todaySession) {
+        setAnswers(json.todaySession.answers || {});
+      }
+      if (json.gradingResults) {
+        setGradingResults(json.gradingResults);
+      } else if (json.todaySession && !json.todaySession.completed) {
+        setGradingResults(null);
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function handleSelectQCU(questionId: string, optionIdx: number) {
+    if (data?.todaySession?.completed) return;
+    setAnswers((prev) => ({ ...prev, [questionId]: [optionIdx] }));
+  }
+
+  function handleToggleQCM(questionId: string, optionIdx: number) {
+    if (data?.todaySession?.completed) return;
+    setAnswers((prev) => {
+      const current = Array.isArray(prev[questionId])
+        ? (prev[questionId] as number[])
+        : [];
+      const exists = current.includes(optionIdx);
+      const next = exists
+        ? current.filter((i) => i !== optionIdx)
+        : [...current, optionIdx];
+      return { ...prev, [questionId]: next };
+    });
+  }
+
+  function handleFillBlank(questionId: string, val: string) {
+    if (data?.todaySession?.completed) return;
+    setAnswers((prev) => ({ ...prev, [questionId]: val }));
+  }
+
+  function handleImagePoint(questionId: string, val: ImagePointAnswer) {
+    if (data?.todaySession?.completed) return;
+    setAnswers((prev) => ({ ...prev, [questionId]: val }));
+  }
+
+  const userState = data?.userState;
+  const sessionData = data?.todaySession;
+  const leaderboard = data?.leaderboard || [];
+
+  return (
+    <AppShell>
+      <div className="space-y-6">
+        {/* Top Masthead + Activation Toggle */}
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-4">
+          <div>
+            <h1 className="text-lg font-bold uppercase tracking-tight text-ink">
+              RÉVISIONS JOURNALIÈRES &amp; CLASSEMENT DE STREAK
+            </h1>
+            <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
+              [ ENTRAÎNEMENT LONG TERME AUX PARTIELS · QCM · QCU · TEXTES À TROUS · POINTAGE IMAGE ]
+            </p>
+          </div>
+
+          {userState && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() =>
+                postAction({
+                  action: "TOGGLE",
+                  enabled: !userState.revisionEnabled,
+                })
+              }
+              className={`inline-flex items-center gap-2 border px-4 py-2 font-mono text-xs uppercase tracking-wider transition-colors disabled:opacity-50 ${
+                userState.revisionEnabled
+                  ? "border-forest bg-forest/10 font-semibold text-forest hover:bg-forest/20"
+                  : "border-ink bg-ink text-card hover:bg-ink/90"
+              }`}
+            >
+              <Power className="h-3.5 w-3.5" />
+              <span>
+                {userState.revisionEnabled
+                  ? "RÉVISIONS JOURNALIÈRES : ACTIVÉES"
+                  : "ACTIVER LES RÉVISIONS JOURNALIÈRES"}
+              </span>
+            </button>
+          )}
+        </div>
+
+        {error && (
+          <div className="border border-carmine/40 bg-carmine/10 px-4 py-2.5 font-mono text-xs text-carmine">
+            {error}
+          </div>
+        )}
+
+        {/* Metrics Row */}
+        {userState && (
+          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+            <div
+              className="border border-border bg-card p-4"
+              style={{ borderTop: "3px solid #D99B26" }}
+            >
+              <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-stone">
+                <span>STREAK ACTUEL</span>
+                <Flame className="h-4 w-4 text-amber" />
+              </div>
+              <p className="mt-1.5 font-mono text-xl font-bold text-ink">
+                {userState.currentStreak} JOURS
+              </p>
+            </div>
+
+            <div
+              className="border border-border bg-card p-4"
+              style={{ borderTop: "3px solid #3D6B99" }}
+            >
+              <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-stone">
+                <span>RECORD PERSONNEL</span>
+                <Trophy className="h-4 w-4 text-slate" />
+              </div>
+              <p className="mt-1.5 font-mono text-xl font-bold text-ink">
+                {userState.bestStreak} JOURS
+              </p>
+            </div>
+
+            <div
+              className="border border-border bg-card p-4"
+              style={{ borderTop: "3px solid #3B7A57" }}
+            >
+              <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-stone">
+                <span>POINTS CUMULÉS</span>
+                <Award className="h-4 w-4 text-forest" />
+              </div>
+              <p className="mt-1.5 font-mono text-xl font-bold text-ink">
+                {userState.totalRevisionPoints} PTS
+              </p>
+            </div>
+
+            <div
+              className="border border-border bg-card p-4"
+              style={{
+                borderTop: `3px solid ${
+                  userState.completedToday ? "#3B7A57" : "#C83E4D"
+                }`,
+              }}
+            >
+              <div className="flex items-center justify-between font-mono text-[10px] uppercase tracking-wider text-stone">
+                <span>SÉANCE DU JOUR</span>
+                <CheckCircle2
+                  className={`h-4 w-4 ${
+                    userState.completedToday ? "text-forest" : "text-stone"
+                  }`}
+                />
+              </div>
+              <p
+                className={`mt-1.5 font-mono text-sm font-bold uppercase ${
+                  userState.completedToday ? "text-forest" : "text-ink"
+                }`}
+              >
+                {userState.completedToday
+                  ? "VALIDÉE AUJOURD'HUI"
+                  : userState.revisionEnabled
+                  ? "EN ATTENTE"
+                  : "INACTIVE"}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {loading || !data ? (
+          <div className="border border-border bg-card p-8 font-mono text-xs uppercase tracking-wider text-stone">
+            CHARGEMENT DES SÉANCES DE RÉVISION...
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+            {/* Left 8 Columns: Daily Quiz Engine */}
+            <section className="space-y-4 lg:col-span-8">
+              {!userState?.revisionEnabled ? (
+                <div
+                  className="border border-border bg-card p-8"
+                  style={{ borderTop: "3px solid #D99B26" }}
+                >
+                  <p className="font-mono text-xs font-semibold uppercase tracking-wider text-stone">
+                    PROGRAMME QUOTIDIEN DÉSACTIVÉ
+                  </p>
+                  <h2 className="mt-2 text-lg font-bold uppercase tracking-tight text-ink">
+                    PRÉPAREZ VOS PARTIELS SUR LE LONG TERME
+                  </h2>
+                  <p className="mt-2 text-sm leading-relaxed text-stone">
+                    Activez les révisions journalières pour qu&apos;Ara génère
+                    chaque jour une séance de quiz tirée aléatoirement parmi
+                    les chapitres de vos UE (QCU, QCM, phrases à trou et
+                    pointage direct sur vos polycopiés) et maintenez votre
+                    streak dans le classement de la promotion.
+                  </p>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() =>
+                      postAction({ action: "TOGGLE", enabled: true })
+                    }
+                    className="mt-5 inline-flex items-center gap-2 border border-ink bg-ink px-5 py-2.5 font-mono text-xs uppercase tracking-wider text-card hover:bg-ink/90"
+                  >
+                    <Flame className="h-4 w-4" />
+                    <span>ACTIVER ET GÉNÉRER MA SÉANCE DU JOUR</span>
+                  </button>
+                </div>
+              ) : !data.hasCourseContent ? (
+                <div className="border border-border bg-card p-8 text-center">
+                  <p className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
+                    AUCUN COURS PDF DISPONIBLE POUR GÉNÉRER DES QUESTIONS
+                  </p>
+                  <p className="mt-2 text-sm text-stone">
+                    Déposez au moins un document PDF dans une UE afin
+                    qu&apos;Ara puisse extraire les chapitres et créer vos
+                    quiz quotidiens.
+                  </p>
+                  <Link
+                    href="/"
+                    className="mt-4 inline-block border border-ink bg-ink px-4 py-2 font-mono text-xs uppercase tracking-wider text-card"
+                  >
+                    VOIR LES UE
+                  </Link>
+                </div>
+              ) : !sessionData || sessionData.questions.length === 0 ? (
+                <div className="border border-border bg-card p-8 text-center">
+                  <p className="font-mono text-xs uppercase tracking-wider text-stone">
+                    PRÊT À GÉNÉRER VOTRE SÉANCE DU JOUR ({data.todayKey})
+                  </p>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => postAction({ action: "GENERATE_DAILY" })}
+                    className="mt-4 inline-flex items-center gap-2 border border-ink bg-ink px-5 py-2.5 font-mono text-xs uppercase tracking-wider text-card"
+                  >
+                    {busy ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <RefreshCw className="h-4 w-4" />
+                    )}
+                    <span>GÉNÉRER LE QUIZ DU JOUR</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {/* Session Status Header */}
+                  <div className="flex flex-wrap items-center justify-between gap-3 border border-border bg-card px-4 py-3">
+                    <div>
+                      <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                        SÉANCE DU {sessionData.dateKey} ·{" "}
+                        {sessionData.questions.length} QUESTIONS
+                      </span>
+                      {sessionData.completed && (
+                        <span className="ml-3 bg-badge-bg px-2 py-0.5 font-mono text-[11px] font-bold uppercase tracking-wider text-badge-text">
+                          SCORE : {sessionData.score} /{" "}
+                          {sessionData.totalQuestions}
+                        </span>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => postAction({ action: "GENERATE_BONUS" })}
+                      className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
+                    >
+                      <RefreshCw
+                        className={`h-3.5 w-3.5 ${busy ? "animate-spin" : ""}`}
+                      />
+                      <span>NOUVEAU QUIZ ALÉATOIRE</span>
+                    </button>
+                  </div>
+
+                  {/* Questions List */}
+                  {sessionData.questions.map((q, qIdx) => {
+                    const isGraded = sessionData.completed;
+                    const isCorrect = gradingResults
+                      ? gradingResults[q.id]
+                      : undefined;
+
+                    return (
+                      <article
+                        key={q.id}
+                        className={`border bg-card p-5 ${
+                          isGraded && isCorrect === true
+                            ? "border-forest"
+                            : isGraded && isCorrect === false
+                            ? "border-carmine"
+                            : "border-border"
+                        }`}
+                      >
+                        {/* Meta Header */}
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="border border-ink bg-ink px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-card">
+                              Q{qIdx + 1}
+                            </span>
+                            <span className="bg-badge-bg px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-badge-text">
+                              {TYPE_LABELS[q.type]}
+                            </span>
+                            <span className="border border-border bg-paper px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-stone">
+                              {q.ueCode} · {q.chapterTitle}
+                            </span>
+                          </div>
+
+                          <Link
+                            href={`/ue/${q.ueId}?doc=${encodeURIComponent(
+                              q.documentId
+                            )}&page=${q.pageNumber}`}
+                            className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-badge-text hover:underline"
+                          >
+                            <FileText className="h-3 w-3" />
+                            <span>
+                              {q.fileName} · P.{q.pageNumber}
+                            </span>
+                          </Link>
+                        </div>
+
+                        <p className="mb-4 text-sm font-semibold leading-relaxed text-ink">
+                          {q.prompt}
+                        </p>
+
+                        {/* QCU / QCM */}
+                        {(q.type === "QCU" || q.type === "QCM") && q.options && (
+                          <div className="space-y-2">
+                            {q.options.map((opt, optIdx) => {
+                              const selectedArr = Array.isArray(answers[q.id])
+                                ? (answers[q.id] as number[])
+                                : [];
+                              const isSelected = selectedArr.includes(optIdx);
+                              const isExpected =
+                                q.correctIndices?.includes(optIdx) ?? false;
+
+                              let boxStyle =
+                                "border-border bg-paper text-ink hover:border-ink";
+                              if (isGraded) {
+                                if (isExpected) {
+                                  boxStyle =
+                                    "border-forest bg-forest/10 text-ink";
+                                } else if (isSelected && !isExpected) {
+                                  boxStyle =
+                                    "border-carmine bg-carmine/10 text-ink";
+                                }
+                              } else if (isSelected) {
+                                boxStyle = "border-ink bg-pinned text-ink";
+                              }
+
+                              return (
+                                <button
+                                  key={optIdx}
+                                  type="button"
+                                  disabled={isGraded}
+                                  onClick={() =>
+                                    q.type === "QCU"
+                                      ? handleSelectQCU(q.id, optIdx)
+                                      : handleToggleQCM(q.id, optIdx)
+                                  }
+                                  className={`flex w-full items-start gap-3 border p-3 text-left text-sm transition-colors ${boxStyle}`}
+                                >
+                                  <span
+                                    className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center border font-mono text-[10px] font-bold ${
+                                      isSelected
+                                        ? "border-ink bg-ink text-card"
+                                        : "border-border bg-card text-stone"
+                                    }`}
+                                  >
+                                    {isSelected ? "✓" : String.fromCharCode(65 + optIdx)}
+                                  </span>
+                                  <span className="flex-1 leading-snug">
+                                    {opt}
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        )}
+
+                        {/* FILL_BLANK */}
+                        {q.type === "FILL_BLANK" && (
+                          <div className="space-y-3">
+                            <div className="border border-border bg-paper p-3.5 text-sm leading-relaxed text-ink">
+                              {q.sentenceWithBlank}
+                            </div>
+
+                            <input
+                              type="text"
+                              disabled={isGraded}
+                              value={
+                                typeof answers[q.id] === "string"
+                                  ? (answers[q.id] as string)
+                                  : ""
+                              }
+                              onChange={(e) =>
+                                handleFillBlank(q.id, e.target.value)
+                              }
+                              placeholder="Tapez le terme exact ou sélectionnez-le ci-dessous..."
+                              className="w-full border border-border bg-paper px-3 py-2 font-mono text-xs text-ink focus:border-ink focus:outline-none disabled:opacity-75"
+                            />
+
+                            {q.wordBank && q.wordBank.length > 0 && (
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                                  SUGGESTIONS :
+                                </span>
+                                {q.wordBank.map((term) => {
+                                  const selected = answers[q.id] === term;
+                                  return (
+                                    <button
+                                      key={term}
+                                      type="button"
+                                      disabled={isGraded}
+                                      onClick={() => handleFillBlank(q.id, term)}
+                                      className={`border px-2.5 py-1 font-mono text-xs transition-colors ${
+                                        selected
+                                          ? "border-ink bg-ink text-card"
+                                          : "border-border bg-paper text-ink hover:border-ink"
+                                      }`}
+                                    >
+                                      {term}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* IMAGE_POINT */}
+                        {q.type === "IMAGE_POINT" && (
+                          <ImagePointCanvas
+                            documentId={q.documentId}
+                            pageNumber={q.pageNumber}
+                            targetPhrase={q.targetPhrase}
+                            fallbackZones={q.fallbackZones}
+                            correctZoneId={q.correctZoneId}
+                            value={
+                              answers[q.id] &&
+                              typeof answers[q.id] === "object" &&
+                              !Array.isArray(answers[q.id])
+                                ? (answers[q.id] as ImagePointAnswer)
+                                : undefined
+                            }
+                            disabled={isGraded}
+                            showCorrection={isGraded}
+                            onChange={(val) => handleImagePoint(q.id, val)}
+                          />
+                        )}
+
+                        {/* Correction / Explanation Box */}
+                        {isGraded && (
+                          <div className="mt-4 flex items-start gap-2.5 border-t border-border pt-3">
+                            {isCorrect === false ? (
+                              <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-carmine" />
+                            ) : (
+                              <Check className="mt-0.5 h-4 w-4 shrink-0 text-forest" />
+                            )}
+                            <div className="text-xs leading-relaxed text-ink">
+                              <p className="font-mono text-[10px] font-bold uppercase tracking-wider text-stone">
+                                CORRECTION &amp; SOURCE
+                              </p>
+                              <p className="mt-0.5">{q.explanation}</p>
+                            </div>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+
+                  {/* Submit Button */}
+                  {!sessionData.completed && (
+                    <div className="flex justify-end border border-border bg-card p-4">
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() =>
+                          postAction({ action: "SUBMIT", answers })
+                        }
+                        className="inline-flex items-center gap-2 border border-ink bg-ink px-6 py-3 font-mono text-xs font-semibold uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
+                      >
+                        {busy ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Flame className="h-4 w-4 text-amber" />
+                        )}
+                        <span>VALIDER LA SÉANCE &amp; MON STREAK</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+            </section>
+
+            {/* Right 4 Columns: Streak Leaderboard */}
+            <aside className="space-y-4 lg:col-span-4">
+              <div
+                className="border border-border bg-card"
+                style={{ borderTop: "3px solid #D99B26" }}
+              >
+                <div className="flex items-center justify-between border-b border-border bg-paper px-4 py-3">
+                  <div className="flex items-center gap-2">
+                    <Trophy className="h-4 w-4 text-amber" />
+                    <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                      CLASSEMENT DE STREAK
+                    </span>
+                  </div>
+                  <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                    PROMO
+                  </span>
+                </div>
+
+                {leaderboard.length === 0 ? (
+                  <div className="p-6 text-center font-mono text-xs uppercase tracking-wider text-stone">
+                    AUCUN ÉTUDIANT N&apos;A ENCORE ACTIVÉ LES RÉVISIONS.
+                  </div>
+                ) : (
+                  <div className="divide-y divide-border">
+                    {leaderboard.map((entry, idx) => {
+                      const isMe = entry.id === session?.user?.id;
+                      return (
+                        <div
+                          key={entry.id}
+                          className={`flex items-center justify-between gap-3 px-4 py-3 ${
+                            isMe ? "bg-pinned" : "bg-card"
+                          }`}
+                        >
+                          <div className="flex min-w-0 items-center gap-3">
+                            <span
+                              className={`flex h-7 w-7 shrink-0 items-center justify-center border font-mono text-xs font-bold ${
+                                idx === 0
+                                  ? "border-ink bg-ink text-card"
+                                  : "border-border bg-paper text-ink"
+                              }`}
+                            >
+                              {String(idx + 1).padStart(2, "0")}
+                            </span>
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-bold text-ink">
+                                {entry.name}
+                                {isMe && (
+                                  <span className="ml-1.5 font-mono text-[10px] uppercase text-badge-text">
+                                    (VOUS)
+                                  </span>
+                                )}
+                              </p>
+                              <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                                RECORD : {entry.bestStreak}J ·{" "}
+                                {entry.totalRevisionPoints} PTS
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="shrink-0 text-right">
+                            <span className="inline-flex items-center gap-1 border border-border bg-paper px-2 py-0.5 font-mono text-xs font-bold text-ink">
+                              <Flame className="h-3 w-3 text-amber" />
+                              {entry.currentStreak}J
+                            </span>
+                            {entry.completedToday && (
+                              <p className="mt-1 font-mono text-[9px] uppercase tracking-wider text-forest">
+                                ✓ FAIT AUJOURD&apos;HUI
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </aside>
+          </div>
+        )}
+
+        {/* Community Custom Quizzes & Image Occlusion Editor */}
+        <section className="border-t border-border pt-6">
+          <CommunityQuizSection />
+        </section>
+      </div>
+    </AppShell>
+  );
+}

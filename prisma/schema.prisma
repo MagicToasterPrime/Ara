@@ -28,18 +28,45 @@ enum ChannelType {
 }
 
 model User {
-  id           String           @id @default(cuid())
-  email        String           @unique
-  name         String
-  passwordHash String
-  globalRole   GlobalRole       @default(STUDENT)
-  createdAt    DateTime         @default(now())
+  id                  String   @id @default(cuid())
+  email               String   @unique
+  name                String
+  passwordHash        String
+  globalRole          GlobalRole @default(STUDENT)
+  revisionEnabled     Boolean  @default(false)
+  currentStreak       Int      @default(0)
+  bestStreak          Int      @default(0)
+  lastRevisionDate    String?
+  totalRevisionPoints Int      @default(0)
+  createdAt           DateTime @default(now())
 
-  ueRoles     UERole[]
-  documents   Document[]
-  upvotes     DocumentUpvote[]
-  messages    Message[]
-  whiteboards Whiteboard[]
+  ueRoles          UERole[]
+  documents        Document[]
+  upvotes          DocumentUpvote[]
+  messages         Message[]
+  whiteboards      Whiteboard[]
+  revisionSessions DailyRevisionSession[]
+  studyArtifacts   StudyArtifact[]
+  communityQuizzes CommunityQuiz[]
+  quizUpvotes      CommunityQuizUpvote[]
+}
+
+model DailyRevisionSession {
+  id             String    @id @default(cuid())
+  userId         String
+  dateKey        String
+  questionsJson  String
+  answersJson    String    @default("{}")
+  score          Int       @default(0)
+  totalQuestions Int       @default(0)
+  completed      Boolean   @default(false)
+  completedAt    DateTime?
+  createdAt      DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, dateKey])
+  @@index([userId, createdAt])
 }
 
 model UE {
@@ -53,10 +80,12 @@ model UE {
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
 
-  roles       UERole[]
-  chapters    Chapter[]
-  channels    Channel[]
-  whiteboards Whiteboard[]
+  roles            UERole[]
+  chapters         Chapter[]
+  channels         Channel[]
+  whiteboards      Whiteboard[]
+  studyArtifacts   StudyArtifact[]
+  communityQuizzes CommunityQuiz[]
 }
 
 model UERole {
@@ -153,9 +182,61 @@ model Whiteboard {
   ueId         String?
   title        String
   creatorId    String
+  isPublic     Boolean  @default(false)
+  isIntegrated Boolean  @default(false)
   snapshotData String   @default("{}")
   updatedAt    DateTime @updatedAt
 
   ue      UE?  @relation(fields: [ueId], references: [id], onDelete: SetNull)
   creator User @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+}
+
+model StudyArtifact {
+  id          String   @id @default(cuid())
+  userId      String
+  ueId        String?
+  documentId  String?
+  kind        String
+  title       String
+  prompt      String?
+  contentJson String
+  isPublic    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ue   UE?  @relation(fields: [ueId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt])
+  @@index([ueId, createdAt])
+}
+
+model CommunityQuiz {
+  id            String   @id @default(cuid())
+  authorId      String
+  ueId          String?
+  title         String
+  description   String   @default("")
+  questionsJson String
+  isPublic      Boolean  @default(true)
+  isPinned      Boolean  @default(false)
+  attemptsCount Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  author  User                  @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  ue      UE?                   @relation(fields: [ueId], references: [id], onDelete: SetNull)
+  upvotes CommunityQuizUpvote[]
+
+  @@index([ueId, createdAt])
+  @@index([authorId, createdAt])
+}
+
+model CommunityQuizUpvote {
+  userId String
+  quizId String
+
+  user User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  quiz CommunityQuiz @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  @@id([userId, quizId])
 }

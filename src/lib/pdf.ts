@@ -1,6 +1,7 @@
 export interface ExtractedPdfPage {
   pageNumber: number;
   text: string;
+  imageCount?: number;
 }
 
 export interface ExtractedPdfResult {
@@ -12,6 +13,24 @@ interface PdfPageData {
   getTextContent: () => Promise<{
     items: Array<{ str?: string; hasEOL?: boolean }>;
   }>;
+  getOperatorList?: () => Promise<{
+    fnArray?: number[];
+  }>;
+}
+
+// PDF.js drawing operator codes for embedded raster/inline images
+const IMAGE_OPS = new Set([82, 83, 84, 85, 86, 87, 88]);
+
+function extractFigureLegendHints(pageText: string): string[] {
+  const matches: string[] = [];
+  const regex =
+    /(?:fig(?:ure)?\.?|sch[eé]ma|planche|coupe|diagramme|l[eé]gende)\s*[^.!?;\n]{3,90}/gi;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(pageText)) !== null && matches.length < 4) {
+    const cleaned = m[0].replace(/\s+/g, " ").trim();
+    if (cleaned) matches.push(cleaned);
+  }
+  return matches;
 }
 
 export async function extractPdfPages(
@@ -45,12 +64,42 @@ export async function extractPdfPages(
             pieces.push("\n");
           }
         }
-        const pageText = pieces.join(" ").replace(/\s+/g, " ").trim();
+
+        let imageCount = 0;
+        if (typeof pageData.getOperatorList === "function") {
+          try {
+            const opList = await pageData.getOperatorList();
+            if (Array.isArray(opList?.fnArray)) {
+              for (const fn of opList.fnArray) {
+                if (IMAGE_OPS.has(fn)) {
+                  imageCount += 1;
+                }
+              }
+            }
+          } catch {
+            // Operator list inspection optional
+          }
+        }
+
+        const baseText = pieces.join(" ").replace(/\s+/g, " ").trim();
+        const figureHints = extractFigureLegendHints(baseText);
+
+        let enrichedText = baseText;
+        if (imageCount > 0 || figureHints.length > 0) {
+          const visualTag = `[REPÈRE VISUEL PAGE ${pageNum} : ${imageCount} image(s)/figure(s) détectée(s)${
+            figureHints.length > 0
+              ? ` · Légendes : ${figureHints.join(" | ")}`
+              : ""
+          }]`;
+          enrichedText = baseText ? `${baseText}\n${visualTag}` : visualTag;
+        }
+
         pages.push({
           pageNumber: pageNum,
-          text: pageText,
+          text: enrichedText,
+          imageCount,
         });
-        return pageText;
+        return enrichedText;
       },
     });
 

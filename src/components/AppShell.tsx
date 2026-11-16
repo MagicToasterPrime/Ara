@@ -6,8 +6,8 @@ import { usePathname, useRouter } from "next/navigation";
 import { signOut, useSession } from "next-auth/react";
 import {
   BookOpen,
+  Flame,
   LogOut,
-  MessageSquare,
   PenTool,
   Settings,
   User as UserIcon,
@@ -51,14 +51,14 @@ export function AppShell({ children }: { children: ReactNode }) {
       match: (p: string) => p === "/" || p.startsWith("/ue/"),
     },
     {
-      href: "/chat",
-      label: "CHAT PROMO",
-      icon: MessageSquare,
-      match: (p: string) => p.startsWith("/chat"),
+      href: "/revisions",
+      label: "RÉVISIONS & STREAK",
+      icon: Flame,
+      match: (p: string) => p.startsWith("/revisions"),
     },
     {
       href: "/whiteboard",
-      label: "TABLEAUX BLANCS",
+      label: "MES TABLEAUX BLANCS",
       icon: PenTool,
       match: (p: string) => p.startsWith("/whiteboard"),
     },

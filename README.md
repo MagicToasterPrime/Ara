@@ -2,10 +2,10 @@
 
 **Ara** est une plateforme web collaborative tout-en-un (single-server, 100 % auto-hébergée) conçue pour une promotion d'étudiants. Elle réunit dans une interface éditoriale rigoureuse (*Swiss Editorial / Paper Utility*) :
 
-- **Espaces de cours par UE** : chapitres structurés, distinction *Cours Officiels* / *Notes Étudiantes*, votes (`▲`), épinglage officiel (`VALIDÉ PAR RESP. UE`), et lecteur PDF natif intégré.
-- **Hyacinthe IA (RAG Local)** : indexation automatique des PDF dans PostgreSQL + `pgvector` (`nomic-embed-text` + `qwen2.5:7b` via Ollama) avec réponses en streaming et citations cliquables (`[FICHIER.PDF · P.12]`).
-- **Messagerie temps réel (Socket.io)** : canaux `#général`, canaux automatiques `#ue-...` et groupes d'étude avec partage direct de cours et tableaux blancs.
-- **Tableaux blancs collaboratifs (Tldraw)** : curseurs multi-utilisateurs en temps réel et sauvegarde automatique en PostgreSQL toutes les 3 secondes.
+- **Espaces de cours par UE (Cours, Discussion, Tableaux blancs, Studio Notebook)** : chapitres structurés, distinction *Cours Officiels* / *Notes Étudiantes*, votes (`▲`), épinglage officiel (`VALIDÉ PAR RESP. UE`), lecteur PDF custom intégré (`pdfjs-dist` avec recherche interne, zoom, mode texte et plein écran), canal de discussion temps réel dédié à chaque UE, et Studio Notebook façon NotebookLM (schémas téléchargeables en `.svg`, flashcards, quiz ciblés et fiches synthèses).
+- **Spix IA (RAG Local contextuel & Studio)** : bouton carré flottant en bas de l'écran qui détecte automatiquement la page consultée (cours PDF ouvert, UE ou vue globale) avec indexation dans PostgreSQL + `pgvector` (`nomic-embed-text` + `qwen2.5:7b` via Ollama), streaming, citations cliquables (`[FICHIER.PDF · P.12]`) et génération directe de schémas `.svg`, flashcards et quiz.
+- **Révisions journalières & Classement de Streak** : activation optionnelle par étudiant générant chaque jour des quiz sur des chapitres aléatoires (QCU, QCM, phrases à trou et pointage sur image de cours) avec classement de streak de la promotion.
+- **Tableaux blancs collaboratifs (Tldraw)** : espace personnel par utilisateur (`Privé` ou `Public`), intégration officielle dans l'UE par le responsable d'UE, curseurs multi-utilisateurs temps réel et sauvegarde automatique en PostgreSQL toutes les 3 secondes.
 - **Gouvernance hiérarchique** : bootstrap automatique du premier compte inscrit en **Responsable d'Année (`YEAR_ADMIN`)**, nomination des **Responsables d'UE (`UE_MANAGER`)**, et monitoring système.
 
 ---
@@ -21,7 +21,7 @@ Le script `npm run dev:full` (`scripts/dev-full.mjs`) :
 1. Initialise `.env` et `./storage/uploads/`.
 2. Démarre automatiquement la base PostgreSQL 16 + `pgvector` via Docker Compose si disponible, **ou lance un moteur PostgreSQL 16 + `pgvector` embarqué localement (PGlite)** dans `./storage/pgdata` si Docker n'est pas installé sur votre poste.
 3. Applique le schéma Prisma et démarre le serveur unifié (`Next.js` + `Socket.io`) sur `http://localhost:3000`.
-4. Si Ollama n'est pas allumé en local, Ara reste 100 % fonctionnel : les PDF s'uploadent normalement (`isIndexed = false`) et Hyacinthe affiche un bandeau sobre *« Serveur Ollama hors-ligne (127.0.0.1:11434) »*.
+4. Si Ollama n'est pas allumé en local, Ara reste 100 % fonctionnel : les PDF s'uploadent normalement (`isIndexed = false`) et Spix affiche un bandeau sobre *« Serveur Ollama hors-ligne (127.0.0.1:11434) »*.
 
 ---
 

@@ -6,6 +6,7 @@ import { useSession } from "next-auth/react";
 import {
   ArrowUpRight,
   BookOpen,
+  Flame,
   MessageSquare,
   MoreVertical,
   PenTool,
@@ -13,6 +14,7 @@ import {
   Search,
 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
+import { useSpix } from "@/components/SpixContext";
 
 interface UEItem {
   id: string;
@@ -46,21 +48,47 @@ function getMonogram(code: string, title: string): string {
 
 export default function HomePage() {
   const { data: session } = useSession();
+  const { setPageContext } = useSpix();
   const [ues, setUes] = useState<UEItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [semesterFilter, setSemesterFilter] = useState("ALL");
   const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [revisionSummary, setRevisionSummary] = useState<{
+    revisionEnabled: boolean;
+    currentStreak: number;
+    completedToday: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    setPageContext({ mode: "GLOBAL" });
+  }, [setPageContext]);
 
   useEffect(() => {
     let active = true;
     async function loadUEs() {
       try {
-        const res = await fetch("/api/ues", { cache: "no-store" });
-        if (!res.ok) return;
-        const data = (await res.json()) as { ues?: UEItem[] };
-        if (active && data.ues) {
-          setUes(data.ues);
+        const [ueRes, revRes] = await Promise.all([
+          fetch("/api/ues", { cache: "no-store" }),
+          fetch("/api/revisions", { cache: "no-store" }),
+        ]);
+        if (ueRes.ok) {
+          const data = (await ueRes.json()) as { ues?: UEItem[] };
+          if (active && data.ues) {
+            setUes(data.ues);
+          }
+        }
+        if (revRes.ok) {
+          const revData = (await revRes.json()) as {
+            userState?: {
+              revisionEnabled: boolean;
+              currentStreak: number;
+              completedToday: boolean;
+            };
+          };
+          if (active && revData.userState) {
+            setRevisionSummary(revData.userState);
+          }
         }
       } finally {
         if (active) setLoading(false);
@@ -146,6 +174,52 @@ export default function HomePage() {
           )}
         </div>
       </div>
+
+      {/* Daily Revision & Streak Strip */}
+      {revisionSummary && (
+        <div
+          className="mb-6 flex flex-wrap items-center justify-between gap-3 border border-border bg-card px-4 py-3"
+          style={{
+            borderLeft: `3px solid ${
+              revisionSummary.revisionEnabled ? "#D99B26" : "#DCDAD3"
+            }`,
+          }}
+        >
+          <div className="flex flex-wrap items-center gap-3">
+            <Flame
+              className={`h-4 w-4 ${
+                revisionSummary.revisionEnabled ? "text-amber" : "text-stone"
+              }`}
+            />
+            <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+              {revisionSummary.revisionEnabled
+                ? `STREAK : ${revisionSummary.currentStreak} JOURS`
+                : "RÉVISIONS JOURNALIÈRES DÉSACTIVÉES"}
+            </span>
+            <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
+              {revisionSummary.revisionEnabled
+                ? revisionSummary.completedToday
+                  ? "· SÉANCE DU JOUR VALIDÉE ✓"
+                  : "· QUIZ QUOTIDIEN PRÊT POUR VOS PARTIELS"
+                : "· ACTIVEZ LE MODE LONG TERME (QCM, QCU, TROUS, IMAGE)"}
+            </span>
+          </div>
+
+          <Link
+            href="/revisions"
+            className="inline-flex items-center gap-1.5 border border-ink bg-ink px-3.5 py-1.5 font-mono text-[11px] uppercase tracking-wider text-card hover:bg-ink/90"
+          >
+            <span>
+              {revisionSummary.revisionEnabled
+                ? revisionSummary.completedToday
+                  ? "VOIR CLASSEMENT & S'ENTRAÎNER"
+                  : "LANCER LA SÉANCE DU JOUR"
+                : "ACTIVER LES RÉVISIONS"}
+            </span>
+            <ArrowUpRight className="h-3.5 w-3.5" />
+          </Link>
+        </div>
+      )}
 
       {/* Content */}
       {loading ? (
@@ -282,17 +356,18 @@ export default function HomePage() {
 
                     {openMenuId === ue.id && (
                       <div className="absolute bottom-12 right-0 z-20 w-56 border border-ink bg-card p-1">
-                        {primaryChannel && (
-                          <Link
-                            href={`/chat?channelId=${primaryChannel.id}`}
-                            className="flex items-center gap-2 px-3 py-2 font-mono text-[11px] uppercase tracking-wider text-ink hover:bg-pinned"
-                          >
-                            <MessageSquare className="h-3.5 w-3.5" />
-                            <span>CANAL {primaryChannel.name}</span>
-                          </Link>
-                        )}
                         <Link
-                          href={`/whiteboard?ueId=${ue.id}`}
+                          href={`/ue/${ue.id}?tab=discussion`}
+                          className="flex items-center gap-2 px-3 py-2 font-mono text-[11px] uppercase tracking-wider text-ink hover:bg-pinned"
+                        >
+                          <MessageSquare className="h-3.5 w-3.5" />
+                          <span>
+                            DISCUSSION{" "}
+                            {primaryChannel ? `(${primaryChannel.name})` : ""}
+                          </span>
+                        </Link>
+                        <Link
+                          href={`/ue/${ue.id}?tab=whiteboards`}
                           className="flex items-center gap-2 px-3 py-2 font-mono text-[11px] uppercase tracking-wider text-ink hover:bg-pinned"
                         >
                           <PenTool className="h-3.5 w-3.5" />

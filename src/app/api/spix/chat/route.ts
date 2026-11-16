@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import {
   checkOllamaHealth,
+  describeImageWithOllama,
   formatVectorLiteral,
   generateEmbedding,
   getOllamaConfig,
@@ -57,6 +58,7 @@ export async function POST(req: Request) {
       scope?: "AUTO" | "DOCUMENT" | "UE" | "GLOBAL";
       context?: SpixRequestContext;
       history?: Array<{ role: string; content: string }>;
+      pageImagesBase64?: Array<{ pageNumber: number; base64: string }>;
     };
 
     const question = body.question?.trim() || "";
@@ -312,15 +314,27 @@ export async function POST(req: Request) {
       contextAwarenessLine = `L'étudiant travaille actuellement dans l'UE ${ctx.ueCode || ""} — ${ctx.ueTitle || ""}. Réponds en t'appuyant sur l'ensemble des cours officiels et notes de cette UE.`;
     }
 
+    let visualNote = "";
+    if (Array.isArray(body.pageImagesBase64) && body.pageImagesBase64.length > 0) {
+      const desc = await describeImageWithOllama(
+        body.pageImagesBase64[0].base64,
+        question
+      );
+      if (desc) {
+        visualNote = `ANALYSE VISUELLE DE LA PAGE ${body.pageImagesBase64[0].pageNumber} :\n${desc}\n\n---\n\n`;
+      }
+    }
+
     const contextBlock =
-      finalChunks.length > 0
+      visualNote +
+      (finalChunks.length > 0
         ? finalChunks
             .map(
               (c, idx) =>
                 `Source ${idx + 1}: [${c.fileName.toUpperCase()} · P.${c.pageNumber}] (UE ${c.ueCode} - ${c.documentTitle})\n${c.content}`
             )
             .join("\n\n---\n\n")
-        : "Aucun extrait de document PDF indexé trouvé pour ce périmètre.";
+        : "Aucun extrait de document PDF indexé trouvé pour ce périmètre.");
 
     const systemPrompt = `Tu es Spix, l'assistant académique intelligent local de la plateforme Ara.
 CONTEXTE UTILISATEUR ACTUEL :

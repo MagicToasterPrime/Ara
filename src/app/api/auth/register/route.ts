@@ -70,20 +70,6 @@ export async function POST(req: Request) {
         },
       });
 
-      // Ensure #général channel exists
-      const generalChannel = await tx.channel.findFirst({
-        where: { type: "GENERAL" },
-      });
-
-      if (!generalChannel) {
-        await tx.channel.create({
-          data: {
-            name: "#général",
-            type: "GENERAL",
-          },
-        });
-      }
-
       return user;
     });
 

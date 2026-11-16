@@ -205,3 +205,51 @@ export async function indexDocumentPages(
 
   return { indexed: isIndexed, chunkCount: rawChunks.length };
 }
+
+export async function describeImageWithOllama(
+  imageBase64: string,
+  promptContext?: string
+): Promise<string | null> {
+  const health = await checkOllamaHealth();
+  if (!health.online) return null;
+
+  const configuredVision = process.env.OLLAMA_VISION_MODEL?.trim();
+  const visionModel =
+    (configuredVision &&
+      health.models.find((m) => m.startsWith(configuredVision))) ||
+    health.models.find((m) =>
+      /(vl|llava|vision|moondream|minicpm|gemma3|bakllava)/i.test(m)
+    );
+
+  if (!visionModel) {
+    return null;
+  }
+
+  const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z+]+;base64,/, "");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 16000);
+
+  try {
+    const res = await fetch(`${health.host}/api/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: visionModel,
+        prompt: `Analyse cette page/figure de cours universitaire en français. Décris les schémas, organes, courbes, relations fléchées et légendes visibles.${
+          promptContext ? ` Contexte demandé : ${promptContext}` : ""
+        }`,
+        images: [cleanBase64],
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) return null;
+    const data = (await res.json()) as { response?: string };
+    return data.response?.trim() || null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}

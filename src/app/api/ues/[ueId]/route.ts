@@ -43,14 +43,53 @@ export async function GET(
         select: { id: true, name: true, type: true },
       },
       whiteboards: {
-        orderBy: { updatedAt: "desc" },
-        select: { id: true, title: true, updatedAt: true },
+        where: {
+          OR: [
+            { isIntegrated: true },
+            { isPublic: true },
+            { creatorId: user.id },
+          ],
+        },
+        orderBy: [{ isIntegrated: "desc" }, { updatedAt: "desc" }],
+        select: {
+          id: true,
+          title: true,
+          creatorId: true,
+          isPublic: true,
+          isIntegrated: true,
+          updatedAt: true,
+          creator: {
+            select: { id: true, name: true },
+          },
+        },
       },
     },
   });
 
   if (!ue) {
     return NextResponse.json({ error: "UE introuvable" }, { status: 404 });
+  }
+
+  // Ensure this UE always has a dedicated UE_CHANNEL
+  let channels = ue.channels;
+  if (channels.length === 0) {
+    const slug = ue.code
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
+    const baseName = `#ue-${slug || ue.id.slice(-4)}`;
+    const conflict = await prisma.channel.findUnique({
+      where: { name: baseName },
+    });
+    const createdChannel = await prisma.channel.create({
+      data: {
+        name: conflict ? `${baseName}-${ue.id.slice(-4)}` : baseName,
+        type: "UE_CHANNEL",
+        ueId: ue.id,
+      },
+      select: { id: true, name: true, type: true },
+    });
+    channels = [createdChannel];
   }
 
   const isManager = await canManageUE(user.id, user.globalRole, ue.id);
@@ -91,7 +130,7 @@ export async function GET(
       updatedAt: ue.updatedAt,
       roles: ue.roles,
       chapters,
-      channels: ue.channels,
+      channels,
       whiteboards: ue.whiteboards,
     },
     canManage: isManager,

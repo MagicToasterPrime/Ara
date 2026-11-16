@@ -36,7 +36,20 @@ export async function GET() {
         select: { id: true, name: true, type: true },
       },
       whiteboards: {
-        select: { id: true, title: true, updatedAt: true },
+        where: {
+          OR: [
+            { isIntegrated: true },
+            { isPublic: true },
+            { creatorId: user.id },
+          ],
+        },
+        select: {
+          id: true,
+          title: true,
+          isIntegrated: true,
+          isPublic: true,
+          updatedAt: true,
+        },
       },
     },
   });
