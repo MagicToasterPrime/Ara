@@ -1,0 +1,161 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum GlobalRole {
+  STUDENT
+  YEAR_ADMIN
+}
+
+enum UERoleType {
+  UE_MANAGER
+}
+
+enum DocumentCategory {
+  OFFICIAL_COURSE
+  STUDENT_NOTE
+}
+
+enum ChannelType {
+  GENERAL
+  UE_CHANNEL
+  GROUP
+}
+
+model User {
+  id           String           @id @default(cuid())
+  email        String           @unique
+  name         String
+  passwordHash String
+  globalRole   GlobalRole       @default(STUDENT)
+  createdAt    DateTime         @default(now())
+
+  ueRoles     UERole[]
+  documents   Document[]
+  upvotes     DocumentUpvote[]
+  messages    Message[]
+  whiteboards Whiteboard[]
+}
+
+model UE {
+  id          String       @id @default(cuid())
+  code        String       @unique
+  title       String
+  description String
+  semester    String
+  accentColor String       @default("#D99B26")
+  order       Int          @default(0)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  roles       UERole[]
+  chapters    Chapter[]
+  channels    Channel[]
+  whiteboards Whiteboard[]
+}
+
+model UERole {
+  id     String     @id @default(cuid())
+  userId String
+  ueId   String
+  role   UERoleType @default(UE_MANAGER)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ue   UE   @relation(fields: [ueId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, ueId])
+}
+
+model Chapter {
+  id    String @id @default(cuid())
+  ueId  String
+  title String
+  order Int    @default(0)
+
+  ue        UE         @relation(fields: [ueId], references: [id], onDelete: Cascade)
+  documents Document[]
+}
+
+model Document {
+  id         String           @id @default(cuid())
+  chapterId  String
+  authorId   String
+  title      String
+  fileName   String
+  localPath  String
+  mimeType   String           @default("application/pdf")
+  fileSize   Int              @default(0)
+  category   DocumentCategory @default(STUDENT_NOTE)
+  isPinned   Boolean          @default(false)
+  isIndexed  Boolean          @default(false)
+  pageCount  Int              @default(1)
+  createdAt  DateTime         @default(now())
+
+  chapter Chapter          @relation(fields: [chapterId], references: [id], onDelete: Cascade)
+  author  User             @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  upvotes DocumentUpvote[]
+  chunks  DocumentChunk[]
+}
+
+model DocumentUpvote {
+  userId     String
+  documentId String
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@id([userId, documentId])
+}
+
+model DocumentChunk {
+  id         String                      @id @default(cuid())
+  documentId String
+  content    String
+  pageNumber Int                         @default(1)
+  embedding  Unsupported("vector(768)")?
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+}
+
+model Channel {
+  id   String      @id @default(cuid())
+  name String      @unique
+  type ChannelType @default(GENERAL)
+  ueId String?
+
+  ue       UE?       @relation(fields: [ueId], references: [id], onDelete: Cascade)
+  messages Message[]
+}
+
+model Message {
+  id             String   @id @default(cuid())
+  channelId      String
+  authorId       String
+  content        String
+  attachmentJson String?
+  createdAt      DateTime @default(now())
+
+  channel Channel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  author  User    @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([channelId, createdAt])
+}
+
+model Whiteboard {
+  id           String   @id @default(cuid())
+  ueId         String?
+  title        String
+  creatorId    String
+  snapshotData String   @default("{}")
+  updatedAt    DateTime @updatedAt
+
+  ue      UE?  @relation(fields: [ueId], references: [id], onDelete: SetNull)
+  creator User @relation(fields: [creatorId], references: [id], onDelete: Cascade)
+}

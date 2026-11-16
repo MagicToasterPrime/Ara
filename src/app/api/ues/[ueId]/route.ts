@@ -1,0 +1,195 @@
+import fsp from "node:fs/promises";
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { canManageUE, getCurrentUser } from "@/lib/auth";
+import { resolveDocumentFilePath } from "@/lib/storage";
+
+export async function GET(
+  _req: Request,
+  { params }: { params: { ueId: string } }
+) {
+  const user = await getCurrentUser();
+  if (!user) {
+    return NextResponse.json({ error: "Non authentifié" }, { status: 401 });
+  }
+
+  const ue = await prisma.uE.findUnique({
+    where: { id: params.ueId },
+    include: {
+      roles: {
+        include: {
+          user: {
+            select: { id: true, name: true, email: true },
+          },
+        },
+      },
+      chapters: {
+        orderBy: { order: "asc" },
+        include: {
+          documents: {
+            orderBy: [{ isPinned: "desc" }, { createdAt: "desc" }],
+            include: {
+              author: {
+                select: { id: true, name: true, email: true, globalRole: true },
+              },
+              upvotes: {
+                select: { userId: true },
+              },
+            },
+          },
+        },
+      },
+      channels: {
+        select: { id: true, name: true, type: true },
+      },
+      whiteboards: {
+        orderBy: { updatedAt: "desc" },
+        select: { id: true, title: true, updatedAt: true },
+      },
+    },
+  });
+
+  if (!ue) {
+    return NextResponse.json({ error: "UE introuvable" }, { status: 404 });
+  }
+
+  const isManager = await canManageUE(user.id, user.globalRole, ue.id);
+
+  const chapters = ue.chapters.map((chapter) => ({
+    id: chapter.id,
+    ueId: chapter.ueId,
+    title: chapter.title,
+    order: chapter.order,
+    documents: chapter.documents.map((doc) => ({
+      id: doc.id,
+      chapterId: doc.chapterId,
+      authorId: doc.authorId,
+      author: doc.author,
+      title: doc.title,
+      fileName: doc.fileName,
+      mimeType: doc.mimeType,
+      fileSize: doc.fileSize,
+      category: doc.category,
+      isPinned: doc.isPinned,
+      isIndexed: doc.isIndexed,
+      pageCount: doc.pageCount,
+      createdAt: doc.createdAt,
+      upvoteCount: doc.upvotes.length,
+      hasUpvoted: doc.upvotes.some((u) => u.userId === user.id),
+    })),
+  }));
+
+  return NextResponse.json({
+    ue: {
+      id: ue.id,
+      code: ue.code,
+      title: ue.title,
+      description: ue.description,
+      semester: ue.semester,
+      accentColor: ue.accentColor,
+      order: ue.order,
+      updatedAt: ue.updatedAt,
+      roles: ue.roles,
+      chapters,
+      channels: ue.channels,
+      whiteboards: ue.whiteboards,
+    },
+    canManage: isManager,
+  });
+}
+
+export async function PATCH(
+  req: Request,
+  { params }: { params: { ueId: string } }
+) {
+  const user = await getCurrentUser();
+  if (!user) {
+    return NextResponse.json({ error: "Non authentifié" }, { status: 401 });
+  }
+
+  const allowed = await canManageUE(user.id, user.globalRole, params.ueId);
+  if (!allowed) {
+    return NextResponse.json({ error: "Accès refusé" }, { status: 403 });
+  }
+
+  try {
+    const body = (await req.json()) as {
+      code?: string;
+      title?: string;
+      description?: string;
+      semester?: string;
+      accentColor?: string;
+      order?: number;
+    };
+
+    const updated = await prisma.uE.update({
+      where: { id: params.ueId },
+      data: {
+        ...(body.code ? { code: body.code.trim().toUpperCase() } : {}),
+        ...(body.title ? { title: body.title.trim() } : {}),
+        ...(body.description !== undefined
+          ? { description: body.description.trim() }
+          : {}),
+        ...(body.semester ? { semester: body.semester.trim().toUpperCase() } : {}),
+        ...(body.accentColor ? { accentColor: body.accentColor.trim() } : {}),
+        ...(body.order !== undefined ? { order: Number(body.order) } : {}),
+      },
+    });
+
+    return NextResponse.json({ ue: updated });
+  } catch (error) {
+    console.error("[UE PATCH] Error:", error);
+    return NextResponse.json(
+      { error: "Impossible de mettre à jour l'UE." },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(
+  _req: Request,
+  { params }: { params: { ueId: string } }
+) {
+  const user = await getCurrentUser();
+  if (!user) {
+    return NextResponse.json({ error: "Non authentifié" }, { status: 401 });
+  }
+  if (user.globalRole !== "YEAR_ADMIN") {
+    return NextResponse.json(
+      { error: "Réservé au Responsable d'Année" },
+      { status: 403 }
+    );
+  }
+
+  try {
+    const docs = await prisma.document.findMany({
+      where: {
+        chapter: {
+          ueId: params.ueId,
+        },
+      },
+      select: { localPath: true },
+    });
+
+    await prisma.uE.delete({
+      where: { id: params.ueId },
+    });
+
+    for (const doc of docs) {
+      try {
+        const resolved = resolveDocumentFilePath(doc.localPath);
+        await fsp.unlink(resolved);
+      } catch {
+        // Ignore missing local files during cleanup
+      }
+    }
+
+    return NextResponse.json({ deleted: true });
+  } catch (error) {
+    console.error("[UE DELETE] Error:", error);
+    return NextResponse.json(
+      { error: "Impossible de supprimer l'UE." },
+      { status: 500 }
+    );
+  }
+}

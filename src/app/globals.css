@@ -1,0 +1,33 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body {
+    background-color: #f7f6f2;
+    color: #1a1a1a;
+  }
+
+  * {
+    border-radius: 0px;
+  }
+}
+
+/* Swiss Editorial Scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f7f6f2;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #dcdad3;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #6e6d68;
+}
