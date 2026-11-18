@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { canManageUE, getCurrentUser } from "@/lib/auth";
 import { normalizeClassLevel } from "@/lib/class-levels";
+import { getUeChapterHierarchyMap } from "@/lib/chapter-hierarchy";
 import { resolveDocumentFilePath } from "@/lib/storage";
 import { getUeMeta, setUeMeta } from "@/lib/ue-meta";
 
@@ -94,34 +95,40 @@ export async function GET(
     channels = [createdChannel];
   }
 
-  const [isManager, meta] = await Promise.all([
+  const [isManager, meta, hierarchyMap] = await Promise.all([
     canManageUE(user.id, user.globalRole, ue.id),
     getUeMeta(ue.id),
+    getUeChapterHierarchyMap(ue.id),
   ]);
 
-  const chapters = ue.chapters.map((chapter) => ({
-    id: chapter.id,
-    ueId: chapter.ueId,
-    title: chapter.title,
-    order: chapter.order,
-    documents: chapter.documents.map((doc) => ({
-      id: doc.id,
-      chapterId: doc.chapterId,
-      authorId: doc.authorId,
-      author: doc.author,
-      title: doc.title,
-      fileName: doc.fileName,
-      mimeType: doc.mimeType,
-      fileSize: doc.fileSize,
-      category: doc.category,
-      isPinned: doc.isPinned,
-      isIndexed: doc.isIndexed,
-      pageCount: doc.pageCount,
-      createdAt: doc.createdAt,
-      upvoteCount: doc.upvotes.length,
-      hasUpvoted: doc.upvotes.some((u) => u.userId === user.id),
-    })),
-  }));
+  const chapters = ue.chapters.map((chapter) => {
+    const h = hierarchyMap.get(chapter.id);
+    return {
+      id: chapter.id,
+      ueId: chapter.ueId,
+      title: chapter.title,
+      theme: h?.theme || "",
+      parentId: h?.parentId || null,
+      order: chapter.order,
+      documents: chapter.documents.map((doc) => ({
+        id: doc.id,
+        chapterId: doc.chapterId,
+        authorId: doc.authorId,
+        author: doc.author,
+        title: doc.title,
+        fileName: doc.fileName,
+        mimeType: doc.mimeType,
+        fileSize: doc.fileSize,
+        category: doc.category,
+        isPinned: doc.isPinned,
+        isIndexed: doc.isIndexed,
+        pageCount: doc.pageCount,
+        createdAt: doc.createdAt,
+        upvoteCount: doc.upvotes.length,
+        hasUpvoted: doc.upvotes.some((u) => u.userId === user.id),
+      })),
+    };
+  });
 
   return NextResponse.json({
     ue: {

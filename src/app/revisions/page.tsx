@@ -487,7 +487,7 @@ export default function RevisionsPage() {
                     return (
                       <article
                         key={q.id}
-                        className={`border bg-card p-5 ${
+                        className={`ara-animate-in border bg-card p-5 ${
                           isGraded && isCorrect === true
                             ? "border-forest"
                             : isGraded && isCorrect === false
@@ -620,7 +620,7 @@ export default function RevisionsPage() {
                         {q.type === "FLASHCARD" && (
                           <div className="space-y-3">
                             {!flippedCards[q.id] && !isGraded ? (
-                              <div className="border border-border bg-paper p-5 text-center">
+                              <div className="ara-flip-in border border-border bg-paper p-5 text-center">
                                 <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
                                   RECTO · FORMULEZ MENTALEMENT LA RÉPONSE PUIS
                                   RETOURNEZ LA CARTE
@@ -642,7 +642,7 @@ export default function RevisionsPage() {
                                 </button>
                               </div>
                             ) : (
-                              <div className="space-y-3">
+                              <div className="ara-flip-in space-y-3">
                                 <div
                                   className="border border-border bg-paper p-4"
                                   style={{ borderLeft: "3px solid #3D6B99" }}

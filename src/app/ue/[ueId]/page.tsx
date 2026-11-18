@@ -12,12 +12,22 @@ import {
   BookOpen,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
+  CornerDownRight,
   FileText,
+  Folder,
+  FolderOpen,
   FolderPlus,
+  FolderTree,
   Globe,
+  Layers,
   Loader2,
   Lock,
   MessageSquare,
+  Pencil,
   PenTool,
   Pin,
   PinOff,
@@ -77,9 +87,29 @@ interface ChapterItem {
   id: string;
   ueId: string;
   title: string;
+  theme?: string;
+  parentId?: string | null;
   order: number;
   documents: DocItem[];
 }
+
+interface ChapterTreeNode {
+  chapter: ChapterItem;
+  children: ChapterTreeNode[];
+  depth: number;
+  totalDocsCount: number;
+}
+
+interface ThemeGroup {
+  key: string;
+  label: string;
+  isDefaultGeneral: boolean;
+  nodes: ChapterTreeNode[];
+  totalDocsCount: number;
+  chapterCount: number;
+}
+
+const GENERAL_THEME_KEY = "__GENERAL__";
 
 interface UEWhiteboardItem {
   id: string;
@@ -150,6 +180,15 @@ function UEWorkspaceContent() {
 
   const [selectedChapterId, setSelectedChapterId] = useState<string>("ALL");
   const [validatedOnly, setValidatedOnly] = useState(false);
+  const [courseViewMode, setCourseViewMode] = useState<"tree" | "category">(
+    "tree"
+  );
+  const [expandedThemes, setExpandedThemes] = useState<Record<string, boolean>>(
+    {}
+  );
+  const [expandedChapters, setExpandedChapters] = useState<
+    Record<string, boolean>
+  >({});
 
   const [activeDoc, setActiveDoc] = useState<DocItem | null>(null);
   const [activePage, setActivePage] = useState<number>(1);
@@ -160,9 +199,16 @@ function UEWorkspaceContent() {
     title: string;
   } | null>(null);
 
-  // Chapter form
+  // Chapter form & inline edit
+  const [newChapterTheme, setNewChapterTheme] = useState("");
+  const [newChapterParentId, setNewChapterParentId] = useState("");
   const [newChapterTitle, setNewChapterTitle] = useState("");
   const [creatingChapter, setCreatingChapter] = useState(false);
+  const [editingChapterId, setEditingChapterId] = useState<string | null>(null);
+  const [editChapterTitle, setEditChapterTitle] = useState("");
+  const [editChapterTheme, setEditChapterTheme] = useState("");
+  const [editChapterParentId, setEditChapterParentId] = useState("");
+  const [savingChapterEdit, setSavingChapterEdit] = useState(false);
 
   // Upload form
   const [uploadOpen, setUploadOpen] = useState(false);
@@ -305,14 +351,218 @@ function UEWorkspaceContent() {
     return ue.chapters.flatMap((c) => c.documents);
   }, [ue]);
 
+  const {
+    themeGroups,
+    flatChapters,
+    existingThemes,
+    chapterMap,
+    chapterSubtreeMap,
+  } = useMemo(() => {
+    const map = new Map<string, ChapterItem>();
+    const childrenMap = new Map<string, ChapterItem[]>();
+    const subtreeMap = new Map<string, Set<string>>();
+
+    if (!ue) {
+      return {
+        themeGroups: [] as ThemeGroup[],
+        flatChapters: [] as Array<{ chapter: ChapterItem; depth: number; themeLabel: string }>,
+        existingThemes: [] as string[],
+        chapterMap: map,
+        chapterSubtreeMap: subtreeMap,
+      };
+    }
+
+    for (const ch of ue.chapters) {
+      map.set(ch.id, ch);
+    }
+
+    const roots: ChapterItem[] = [];
+    for (const ch of ue.chapters) {
+      const pid = ch.parentId && ch.parentId !== ch.id ? ch.parentId : null;
+      if (pid && map.has(pid)) {
+        const arr = childrenMap.get(pid) || [];
+        arr.push(ch);
+        childrenMap.set(pid, arr);
+      } else {
+        roots.push(ch);
+      }
+    }
+
+    const buildNode = (
+      chapter: ChapterItem,
+      depth: number,
+      seen: Set<string>
+    ): ChapterTreeNode => {
+      const nextSeen = new Set(seen);
+      nextSeen.add(chapter.id);
+      const rawChildren = (childrenMap.get(chapter.id) || []).filter(
+        (c) => !nextSeen.has(c.id)
+      );
+      const childNodes =
+        depth < 4 ? rawChildren.map((c) => buildNode(c, depth + 1, nextSeen)) : [];
+      const totalDocsCount =
+        chapter.documents.length +
+        childNodes.reduce((sum, child) => sum + child.totalDocsCount, 0);
+
+      const ids = new Set<string>([chapter.id]);
+      for (const child of childNodes) {
+        const sub = subtreeMap.get(child.chapter.id);
+        if (sub) {
+          sub.forEach((id) => ids.add(id));
+        } else {
+          ids.add(child.chapter.id);
+        }
+      }
+      subtreeMap.set(chapter.id, ids);
+
+      return { chapter, children: childNodes, depth, totalDocsCount };
+    };
+
+    const hasNamedThemes = ue.chapters.some(
+      (c) => (c.theme || "").trim().length > 0
+    );
+    const themeOrder: string[] = [];
+    const groupedNodes = new Map<string, ChapterTreeNode[]>();
+
+    for (const root of roots) {
+      const themeName = (root.theme || "").trim();
+      const key = themeName || GENERAL_THEME_KEY;
+      if (!groupedNodes.has(key)) {
+        groupedNodes.set(key, []);
+        themeOrder.push(key);
+      }
+      groupedNodes.get(key)!.push(buildNode(root, 0, new Set()));
+    }
+
+    const countTreeChapters = (nodes: ChapterTreeNode[]): number =>
+      nodes.reduce((sum, n) => sum + 1 + countTreeChapters(n.children), 0);
+
+    const groups: ThemeGroup[] = themeOrder.map((key) => {
+      const nodes = groupedNodes.get(key) || [];
+      const isDefaultGeneral = key === GENERAL_THEME_KEY;
+      const label = isDefaultGeneral
+        ? hasNamedThemes
+          ? "GÉNÉRAL / TRONC COMMUN"
+          : "DOSSIERS & CHAPITRES"
+        : key;
+      return {
+        key,
+        label,
+        isDefaultGeneral,
+        nodes,
+        totalDocsCount: nodes.reduce((sum, n) => sum + n.totalDocsCount, 0),
+        chapterCount: countTreeChapters(nodes),
+      };
+    });
+
+    const flat: Array<{ chapter: ChapterItem; depth: number; themeLabel: string }> = [];
+    const walkFlat = (node: ChapterTreeNode, themeLabel: string) => {
+      flat.push({ chapter: node.chapter, depth: node.depth, themeLabel });
+      for (const child of node.children) {
+        walkFlat(child, themeLabel);
+      }
+    };
+    for (const g of groups) {
+      for (const node of g.nodes) {
+        walkFlat(node, g.label);
+      }
+    }
+
+    const themes = Array.from(
+      new Set(
+        ue.chapters
+          .map((c) => (c.theme || "").trim())
+          .filter((t) => t.length > 0)
+      )
+    );
+
+    return {
+      themeGroups: groups,
+      flatChapters: flat,
+      existingThemes: themes,
+      chapterMap: map,
+      chapterSubtreeMap: subtreeMap,
+    };
+  }, [ue]);
+
   const visibleDocuments = useMemo(() => {
     if (!ue) return [];
     if (selectedChapterId === "ALL") {
       return allUeDocuments;
     }
-    const ch = ue.chapters.find((c) => c.id === selectedChapterId);
-    return ch ? ch.documents : [];
-  }, [ue, selectedChapterId, allUeDocuments]);
+    if (selectedChapterId.startsWith("THEME:")) {
+      const targetThemeKey = selectedChapterId.slice("THEME:".length);
+      const group = themeGroups.find((g) => g.key === targetThemeKey);
+      if (!group) return [];
+      const allowedIds = new Set<string>();
+      for (const rootNode of group.nodes) {
+        const sub = chapterSubtreeMap.get(rootNode.chapter.id);
+        if (sub) sub.forEach((id) => allowedIds.add(id));
+      }
+      return ue.chapters
+        .filter((c) => allowedIds.has(c.id))
+        .flatMap((c) => c.documents);
+    }
+    const subIds =
+      chapterSubtreeMap.get(selectedChapterId) || new Set([selectedChapterId]);
+    return ue.chapters
+      .filter((c) => subIds.has(c.id))
+      .flatMap((c) => c.documents);
+  }, [ue, selectedChapterId, allUeDocuments, themeGroups, chapterSubtreeMap]);
+
+  const visibleChapterIds = useMemo(() => {
+    if (!ue) return new Set<string>();
+    if (selectedChapterId === "ALL") {
+      return new Set(ue.chapters.map((c) => c.id));
+    }
+    if (selectedChapterId.startsWith("THEME:")) {
+      const targetThemeKey = selectedChapterId.slice("THEME:".length);
+      const group = themeGroups.find((g) => g.key === targetThemeKey);
+      const ids = new Set<string>();
+      if (group) {
+        for (const rootNode of group.nodes) {
+          const sub = chapterSubtreeMap.get(rootNode.chapter.id);
+          if (sub) sub.forEach((id) => ids.add(id));
+        }
+      }
+      return ids;
+    }
+    return chapterSubtreeMap.get(selectedChapterId) || new Set([selectedChapterId]);
+  }, [ue, selectedChapterId, themeGroups, chapterSubtreeMap]);
+
+  const activeBreadcrumb = useMemo(() => {
+    if (!ue) return [];
+    const crumbs: Array<{ label: string; target: string }> = [
+      { label: ue.code, target: "ALL" },
+    ];
+    if (selectedChapterId === "ALL") {
+      crumbs.push({ label: "Toute l'arborescence", target: "ALL" });
+      return crumbs;
+    }
+    if (selectedChapterId.startsWith("THEME:")) {
+      const key = selectedChapterId.slice("THEME:".length);
+      const grp = themeGroups.find((g) => g.key === key);
+      crumbs.push({
+        label: grp?.label || "Thème",
+        target: selectedChapterId,
+      });
+      return crumbs;
+    }
+    const ch = chapterMap.get(selectedChapterId);
+    if (ch) {
+      const themeKey = (ch.theme || "").trim() || GENERAL_THEME_KEY;
+      const grp = themeGroups.find((g) => g.key === themeKey);
+      if (grp) {
+        crumbs.push({ label: grp.label, target: `THEME:${grp.key}` });
+      }
+      if (ch.parentId && chapterMap.has(ch.parentId)) {
+        const parent = chapterMap.get(ch.parentId)!;
+        crumbs.push({ label: parent.title, target: parent.id });
+      }
+      crumbs.push({ label: ch.title, target: ch.id });
+    }
+    return crumbs;
+  }, [ue, selectedChapterId, themeGroups, chapterMap]);
 
   const officialDocs = useMemo(
     () => visibleDocuments.filter((d) => d.category === "OFFICIAL_COURSE"),
@@ -328,6 +578,44 @@ function UEWorkspaceContent() {
     [visibleDocuments, validatedOnly]
   );
 
+  function selectNode(nodeId: string) {
+    setSelectedChapterId(nodeId);
+    if (nodeId !== "ALL" && !nodeId.startsWith("THEME:")) {
+      setUploadChapterId(nodeId);
+      setExpandedChapters((prev) => ({ ...prev, [nodeId]: true }));
+      const ch = chapterMap.get(nodeId);
+      if (ch) {
+        const tKey = (ch.theme || "").trim() || GENERAL_THEME_KEY;
+        setExpandedThemes((prev) => ({ ...prev, [tKey]: true }));
+        if (ch.parentId) {
+          setExpandedChapters((prev) => ({ ...prev, [ch.parentId!]: true }));
+        }
+      }
+    } else if (nodeId.startsWith("THEME:")) {
+      const tKey = nodeId.slice("THEME:".length);
+      setExpandedThemes((prev) => ({ ...prev, [tKey]: true }));
+      const grp = themeGroups.find((g) => g.key === tKey);
+      if (grp?.nodes[0]) {
+        setUploadChapterId(grp.nodes[0].chapter.id);
+      }
+    }
+  }
+
+  function handleExpandAllTree(expand: boolean) {
+    const nextThemes: Record<string, boolean> = {};
+    for (const g of themeGroups) {
+      nextThemes[g.key] = expand;
+    }
+    const nextChapters: Record<string, boolean> = {};
+    if (ue) {
+      for (const ch of ue.chapters) {
+        nextChapters[ch.id] = expand;
+      }
+    }
+    setExpandedThemes(nextThemes);
+    setExpandedChapters(nextChapters);
+  }
+
   async function handleCreateChapter(e: React.FormEvent) {
     e.preventDefault();
     if (!newChapterTitle.trim() || creatingChapter) return;
@@ -336,14 +624,59 @@ function UEWorkspaceContent() {
       const res = await fetch(`/api/ues/${ueId}/chapters`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: newChapterTitle.trim() }),
+        body: JSON.stringify({
+          title: newChapterTitle.trim(),
+          theme: newChapterTheme.trim(),
+          parentId: newChapterParentId || null,
+        }),
       });
       if (res.ok) {
+        const data = (await res.json()) as { chapter?: { id: string; theme?: string } };
         setNewChapterTitle("");
+        if (data.chapter?.id) {
+          setUploadChapterId(data.chapter.id);
+          const tKey = (data.chapter.theme || "").trim() || GENERAL_THEME_KEY;
+          setExpandedThemes((prev) => ({ ...prev, [tKey]: true }));
+          if (newChapterParentId) {
+            setExpandedChapters((prev) => ({ ...prev, [newChapterParentId]: true }));
+          }
+        }
+        setNewChapterParentId("");
         await fetchUE();
       }
     } finally {
       setCreatingChapter(false);
+    }
+  }
+
+  function openEditChapter(ch: ChapterItem) {
+    setEditingChapterId(ch.id);
+    setEditChapterTitle(ch.title);
+    setEditChapterTheme(ch.theme || "");
+    setEditChapterParentId(ch.parentId || "");
+  }
+
+  async function handleSaveEditChapter(e: React.FormEvent) {
+    e.preventDefault();
+    if (!editingChapterId || !editChapterTitle.trim() || savingChapterEdit) return;
+    setSavingChapterEdit(true);
+    try {
+      const res = await fetch(`/api/ues/${ueId}/chapters`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          chapterId: editingChapterId,
+          title: editChapterTitle.trim(),
+          theme: editChapterTheme.trim(),
+          parentId: editChapterParentId || null,
+        }),
+      });
+      if (res.ok) {
+        setEditingChapterId(null);
+        await fetchUE();
+      }
+    } finally {
+      setSavingChapterEdit(false);
     }
   }
 
@@ -357,6 +690,7 @@ function UEWorkspaceContent() {
     );
     if (res.ok) {
       if (selectedChapterId === chapterId) setSelectedChapterId("ALL");
+      if (editingChapterId === chapterId) setEditingChapterId(null);
       await fetchUE();
     }
   }
@@ -524,6 +858,413 @@ function UEWorkspaceContent() {
   );
   const examBadge = formatExamBadge(ue.examType, ue.examDate);
 
+  const renderDocumentRow = (doc: DocItem, showCategoryBadge = false) => {
+    const isActive = activeDoc?.id === doc.id;
+    const canDelete = canManage || doc.authorId === session?.user?.id;
+    const isNote = doc.category === "STUDENT_NOTE";
+
+    return (
+      <div
+        key={doc.id}
+        className={`ara-hover-lift flex flex-wrap items-center justify-between gap-3 p-4 ${
+          isActive || doc.isPinned ? "bg-pinned" : "bg-card"
+        }`}
+      >
+        <div className="flex min-w-0 flex-1 items-start gap-3">
+          {isNote ? (
+            <button
+              type="button"
+              onClick={() => handleToggleUpvote(doc.id)}
+              className={`flex w-12 shrink-0 flex-col items-center justify-center border py-1 font-mono text-xs transition-colors ${
+                doc.hasUpvoted
+                  ? "border-ink bg-ink text-card"
+                  : "border-border bg-paper text-ink hover:border-ink"
+              }`}
+              title="Voter pour cette fiche"
+            >
+              <ArrowUp className="h-3 w-3" />
+              <span className="text-[11px] font-bold">{doc.upvoteCount}</span>
+            </button>
+          ) : (
+            <FileText className="mt-1 h-4 w-4 shrink-0 text-ink" />
+          )}
+
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="truncate text-sm font-bold text-ink">
+                {doc.title}
+              </h3>
+              {showCategoryBadge && (
+                <span
+                  className={`px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+                    isNote
+                      ? "border border-border bg-paper text-stone"
+                      : "border border-ink bg-ink text-card"
+                  }`}
+                >
+                  {isNote ? "NOTE ÉTUDIANTE" : "COURS OFFICIEL"}
+                </span>
+              )}
+              {doc.isPinned && (
+                <span className="bg-badge-bg px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-badge-text">
+                  VALIDÉ PAR RESP. UE
+                </span>
+              )}
+              {!isNote && (
+                <span
+                  className={`px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+                    doc.isIndexed
+                      ? "bg-badge-bg text-badge-text"
+                      : "border border-border bg-paper text-stone"
+                  }`}
+                >
+                  {doc.isIndexed ? "RAG INDEXÉ" : "NON INDEXÉ"}
+                </span>
+              )}
+            </div>
+            <p className="mt-1 font-mono text-[11px] uppercase tracking-wider text-stone">
+              {isNote ? `PAR ${doc.author.name} · ` : ""}
+              {doc.fileName} · {doc.pageCount} PAGES ·{" "}
+              {formatBytes(doc.fileSize)}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => {
+              setStudioFocusDocId(doc.id);
+              setActiveTab("studio");
+            }}
+            title="Ouvrir la fiche, flashcards et quiz de ce cours dans le Studio"
+            className="inline-flex items-center gap-1 border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned"
+          >
+            <Sparkles className="h-3 w-3" />
+            <span>PACK RÉVISION</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveDoc(doc);
+              setActivePage(1);
+              setActiveTotalPages(doc.pageCount);
+            }}
+            className={
+              isNote
+                ? "border border-border bg-paper px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-ink hover:border-ink hover:bg-card"
+                : "border border-ink bg-ink px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-card hover:bg-ink/90"
+            }
+          >
+            {isActive ? "OUVERT" : "LIRE PDF"}
+          </button>
+
+          {canManage && isNote && (
+            <button
+              type="button"
+              onClick={() => handleTogglePin(doc)}
+              title={
+                doc.isPinned
+                  ? "Retirer la validation"
+                  : "Épingler / Valider par Resp. UE"
+              }
+              className={`border p-1.5 ${
+                doc.isPinned
+                  ? "border-badge-text bg-badge-bg text-badge-text"
+                  : "border-border bg-paper text-stone hover:text-ink"
+              }`}
+            >
+              {doc.isPinned ? (
+                <PinOff className="h-3.5 w-3.5" />
+              ) : (
+                <Pin className="h-3.5 w-3.5" />
+              )}
+            </button>
+          )}
+
+          {canDelete && (
+            <button
+              type="button"
+              onClick={() => handleDeleteDoc(doc.id)}
+              title="Supprimer"
+              className="border border-border bg-paper p-1.5 text-stone hover:border-carmine hover:text-carmine"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderSidebarTreeNode = (node: ChapterTreeNode) => {
+    const ch = node.chapter;
+    const isSelected = selectedChapterId === ch.id;
+    const isOpen = expandedChapters[ch.id] ?? false;
+    const hasInner = node.children.length > 0 || ch.documents.length > 0;
+    const excludedForEdit = chapterSubtreeMap.get(ch.id) || new Set([ch.id]);
+
+    return (
+      <div key={ch.id} className="border-t border-border/60">
+        <div
+          className={`group flex items-center justify-between gap-1.5 py-2 pr-2 transition-colors ${
+            isSelected ? "bg-pinned" : "bg-card hover:bg-paper"
+          }`}
+          style={{ paddingLeft: `${10 + node.depth * 14}px` }}
+        >
+          <button
+            type="button"
+            onClick={() =>
+              setExpandedChapters((prev) => ({
+                ...prev,
+                [ch.id]: !isOpen,
+              }))
+            }
+            disabled={!hasInner}
+            className="flex h-5 w-5 shrink-0 items-center justify-center text-stone hover:text-ink disabled:opacity-35"
+            title={hasInner ? "Déplier / replier le chapitre" : "Chapitre vide"}
+          >
+            {hasInner ? (
+              isOpen ? (
+                <ChevronDown className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5" />
+              )
+            ) : node.depth > 0 ? (
+              <CornerDownRight className="h-3 w-3" />
+            ) : (
+              <FileText className="h-3 w-3 opacity-40" />
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => selectNode(ch.id)}
+            className="min-w-0 flex-1 text-left"
+          >
+            <span
+              className={`block truncate text-xs ${
+                isSelected ? "font-bold text-ink" : "font-medium text-ink"
+              }`}
+            >
+              {ch.title}
+            </span>
+            <span className="font-mono text-[9px] uppercase tracking-wider text-stone">
+              {node.totalDocsCount} PDF
+              {node.children.length > 0
+                ? ` · ${node.children.length} SOUS-CHAP.`
+                : ""}
+            </span>
+          </button>
+
+          {canManage && (
+            <div className="flex shrink-0 items-center gap-1 opacity-75 transition-opacity group-hover:opacity-100">
+              <button
+                type="button"
+                onClick={() => {
+                  setNewChapterParentId(ch.id);
+                  setNewChapterTheme(ch.theme || "");
+                }}
+                title="Ajouter un sous-chapitre ici"
+                className="p-0.5 text-stone hover:text-ink"
+              >
+                <Plus className="h-3 w-3" />
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  editingChapterId === ch.id
+                    ? setEditingChapterId(null)
+                    : openEditChapter(ch)
+                }
+                title="Modifier thème / parent / titre"
+                className="p-0.5 text-stone hover:text-ink"
+              >
+                <Pencil className="h-3 w-3" />
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDeleteChapter(ch.id)}
+                title="Supprimer ce chapitre"
+                className="p-0.5 text-stone hover:text-carmine"
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+            </div>
+          )}
+        </div>
+
+        {canManage && editingChapterId === ch.id && (
+          <form
+            onSubmit={handleSaveEditChapter}
+            className="ara-tree-collapse space-y-2 border-t border-border bg-paper p-2.5"
+          >
+            <p className="font-mono text-[9px] font-bold uppercase tracking-wider text-stone">
+              MODIFIER L&apos;EMPLACEMENT
+            </p>
+            <input
+              type="text"
+              list="ue-themes-datalist"
+              value={editChapterTheme}
+              onChange={(e) => setEditChapterTheme(e.target.value)}
+              placeholder="Thème (optionnel)..."
+              className="w-full border border-border bg-card px-2 py-1 text-xs text-ink focus:border-ink focus:outline-none"
+            />
+            <select
+              value={editChapterParentId}
+              onChange={(e) => setEditChapterParentId(e.target.value)}
+              className="w-full border border-border bg-card px-2 py-1 text-xs text-ink focus:border-ink focus:outline-none"
+            >
+              <option value="">— Chapitre racine (sans parent) —</option>
+              {flatChapters
+                .filter((item) => !excludedForEdit.has(item.chapter.id))
+                .map((item) => (
+                  <option key={item.chapter.id} value={item.chapter.id}>
+                    {"↳ ".repeat(item.depth)}
+                    {item.chapter.theme ? `[${item.chapter.theme}] ` : ""}
+                    {item.chapter.title}
+                  </option>
+                ))}
+            </select>
+            <input
+              type="text"
+              required
+              value={editChapterTitle}
+              onChange={(e) => setEditChapterTitle(e.target.value)}
+              placeholder="Titre du chapitre..."
+              className="w-full border border-border bg-card px-2 py-1 text-xs text-ink focus:border-ink focus:outline-none"
+            />
+            <div className="flex justify-end gap-1.5">
+              <button
+                type="button"
+                onClick={() => setEditingChapterId(null)}
+                className="border border-border bg-card px-2 py-1 font-mono text-[9px] uppercase text-stone"
+              >
+                ANNULER
+              </button>
+              <button
+                type="submit"
+                disabled={savingChapterEdit || !editChapterTitle.trim()}
+                className="border border-ink bg-ink px-2.5 py-1 font-mono text-[9px] uppercase text-card disabled:opacity-50"
+              >
+                {savingChapterEdit ? "..." : "ENREGISTRER"}
+              </button>
+            </div>
+          </form>
+        )}
+
+        {isOpen && hasInner && (
+          <div className="ara-tree-collapse">
+            {ch.documents.map((doc) => {
+              const isDocActive = activeDoc?.id === doc.id;
+              return (
+                <button
+                  key={doc.id}
+                  type="button"
+                  onClick={() => {
+                    setActiveDoc(doc);
+                    setActivePage(1);
+                    setActiveTotalPages(doc.pageCount);
+                  }}
+                  className={`flex w-full items-center gap-1.5 border-t border-border/40 py-1.5 pr-3 text-left transition-colors ${
+                    isDocActive
+                      ? "bg-ink text-card"
+                      : "bg-paper/60 text-ink hover:bg-pinned"
+                  }`}
+                  style={{ paddingLeft: `${26 + node.depth * 14}px` }}
+                >
+                  <FileText
+                    className={`h-3 w-3 shrink-0 ${
+                      isDocActive ? "text-card" : "text-stone"
+                    }`}
+                  />
+                  <span className="min-w-0 flex-1 truncate text-[11px]">
+                    {doc.title}
+                  </span>
+                  <span
+                    className={`shrink-0 font-mono text-[9px] uppercase ${
+                      isDocActive ? "text-card/80" : "text-stone"
+                    }`}
+                  >
+                    {doc.category === "OFFICIAL_COURSE" ? "CM" : "NOTE"}
+                  </span>
+                </button>
+              );
+            })}
+            {node.children.map((child) => renderSidebarTreeNode(child))}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const renderCenterTreeNode = (node: ChapterTreeNode): React.ReactNode => {
+    const ch = node.chapter;
+    const isVisible = visibleChapterIds.has(ch.id);
+    const docs = ch.documents.filter(
+      (d) =>
+        !validatedOnly || d.category === "OFFICIAL_COURSE" || d.isPinned
+    );
+    const visibleChildren = node.children.filter((c) =>
+      visibleChapterIds.has(c.chapter.id)
+    );
+
+    if (!isVisible && visibleChildren.length === 0) {
+      return null;
+    }
+
+    return (
+      <div
+        key={ch.id}
+        className={
+          node.depth > 0 ? "mt-3 border-l-2 border-border pl-4" : "mt-3 first:mt-0"
+        }
+      >
+        <div className="border border-border bg-card">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-4 py-2.5">
+            <div className="flex items-center gap-2">
+              {node.depth > 0 && (
+                <CornerDownRight className="h-3.5 w-3.5 text-stone" />
+              )}
+              <FolderOpen className="h-3.5 w-3.5 text-ink" />
+              <span className="text-sm font-bold text-ink">{ch.title}</span>
+              <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-badge-text">
+                {docs.length} FICHIER{docs.length > 1 ? "S" : ""}
+              </span>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setUploadChapterId(ch.id);
+                setUploadCategory(canManage ? "OFFICIAL_COURSE" : "STUDENT_NOTE");
+                setUploadOpen(true);
+              }}
+              className="inline-flex items-center gap-1 border border-border bg-card px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned"
+            >
+              <Plus className="h-3 w-3" />
+              <span>DÉPOSER ICI</span>
+            </button>
+          </div>
+
+          {docs.length === 0 ? (
+            <div className="px-4 py-3 font-mono text-[10px] uppercase tracking-wider text-stone">
+              {validatedOnly
+                ? "AUCUNE RESSOURCE VALIDÉE DANS CE CHAPITRE."
+                : "AUCUN FICHIER DÉPOSÉ DIRECTEMENT DANS CE CHAPITRE."}
+            </div>
+          ) : (
+            <div className="divide-y divide-border">
+              {docs.map((doc) => renderDocumentRow(doc, true))}
+            </div>
+          )}
+        </div>
+
+        {visibleChildren.map((child) => renderCenterTreeNode(child))}
+      </div>
+    );
+  };
+
   return (
     <div className="space-y-4">
       {/* UE Top Masthead */}
@@ -663,11 +1404,17 @@ function UEWorkspaceContent() {
 
       {/* TAB 1: COURS & NOTES PDF */}
       {activeTab === "courses" && (
-        <>
+        <div className="ara-animate-in space-y-4">
+          <datalist id="ue-themes-datalist">
+            {existingThemes.map((t) => (
+              <option key={t} value={t} />
+            ))}
+          </datalist>
+
           {uploadOpen && (
             <form
               onSubmit={handleUpload}
-              className="border border-ink bg-card p-5"
+              className="ara-animate-in border border-ink bg-card p-5"
             >
               <div className="mb-4 flex items-center justify-between border-b border-border pb-3">
                 <span className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
@@ -702,10 +1449,20 @@ function UEWorkspaceContent() {
                     {ue.chapters.length === 0 && (
                       <option value="">Aucun chapitre</option>
                     )}
-                    {ue.chapters.map((ch) => (
-                      <option key={ch.id} value={ch.id}>
-                        {ch.title}
-                      </option>
+                    {themeGroups.map((grp) => (
+                      <optgroup key={grp.key} label={grp.label}>
+                        {flatChapters
+                          .filter((item) => item.themeLabel === grp.label)
+                          .map((item) => (
+                            <option
+                              key={item.chapter.id}
+                              value={item.chapter.id}
+                            >
+                              {"↳ ".repeat(item.depth)}
+                              {item.chapter.title}
+                            </option>
+                          ))}
+                      </optgroup>
                     ))}
                   </select>
                 </div>
@@ -799,7 +1556,7 @@ function UEWorkspaceContent() {
 
           {lastGeneratedPack && (
             <div
-              className="flex flex-wrap items-center justify-between gap-3 border border-forest bg-forest/10 px-4 py-3"
+              className="ara-animate-in flex flex-wrap items-center justify-between gap-3 border border-forest bg-forest/10 px-4 py-3"
               style={{ borderLeft: "3px solid #3B7A57" }}
             >
               <div>
@@ -836,75 +1593,170 @@ function UEWorkspaceContent() {
           )}
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-            {/* Left: Chapters */}
-            <aside className="space-y-4 lg:col-span-3">
+            {/* Left: Hierarchical Tree (Thème ▸ Chapitre ▸ Sous-chapitre ▸ Fichiers) */}
+            <aside className="space-y-4 lg:col-span-4 xl:col-span-3">
               <div className="border border-border bg-card">
-                <div className="border-b border-border bg-paper px-4 py-2.5 font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-                  CHAPITRES ({ue.chapters.length})
+                <div className="flex items-center justify-between gap-2 border-b border-border bg-paper px-3.5 py-2.5">
+                  <span className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
+                    ARBORESCENCE ({ue.chapters.length})
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => handleExpandAllTree(true)}
+                      title="Tout déplier"
+                      className="border border-border bg-card p-1 text-stone hover:border-ink hover:text-ink"
+                    >
+                      <ChevronsUpDown className="h-3 w-3" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleExpandAllTree(false)}
+                      title="Tout replier"
+                      className="border border-border bg-card p-1 text-stone hover:border-ink hover:text-ink"
+                    >
+                      <ChevronsDownUp className="h-3 w-3" />
+                    </button>
+                  </div>
                 </div>
 
-                <div className="divide-y divide-border">
+                <div>
                   <button
                     type="button"
-                    onClick={() => setSelectedChapterId("ALL")}
-                    className={`flex w-full items-center justify-between px-4 py-2.5 text-left font-mono text-xs uppercase tracking-wider transition-colors ${
+                    onClick={() => selectNode("ALL")}
+                    className={`flex w-full items-center justify-between px-3.5 py-2.5 text-left font-mono text-xs uppercase tracking-wider transition-colors ${
                       selectedChapterId === "ALL"
                         ? "bg-pinned font-semibold text-ink"
                         : "bg-card text-stone hover:bg-paper hover:text-ink"
                     }`}
                   >
-                    <span>TOUS LES CHAPITRES</span>
+                    <span>TOUTE L&apos;ARBORESCENCE</span>
                     <span>{allUeDocuments.length}</span>
                   </button>
 
-                  {ue.chapters.map((ch) => (
-                    <div
-                      key={ch.id}
-                      className={`flex items-center justify-between gap-2 px-4 py-2.5 ${
-                        selectedChapterId === ch.id ? "bg-pinned" : "bg-card"
-                      }`}
-                    >
-                      <button
-                        type="button"
-                        onClick={() => setSelectedChapterId(ch.id)}
-                        className="min-w-0 flex-1 text-left text-sm font-medium text-ink"
-                      >
-                        <span className="block truncate">{ch.title}</span>
-                        <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
-                          {ch.documents.length} PDF
-                        </span>
-                      </button>
-                      {canManage && (
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteChapter(ch.id)}
-                          title="Supprimer ce chapitre"
-                          className="text-stone hover:text-carmine"
+                  {themeGroups.map((grp) => {
+                    const themeNodeId = `THEME:${grp.key}`;
+                    const isThemeSelected = selectedChapterId === themeNodeId;
+                    const isThemeOpen = expandedThemes[grp.key] ?? true;
+
+                    return (
+                      <div key={grp.key} className="border-t border-border">
+                        <div
+                          className={`group flex items-center justify-between gap-1.5 px-2.5 py-2 transition-colors ${
+                            isThemeSelected
+                              ? "bg-pinned"
+                              : "bg-paper/75 hover:bg-paper"
+                          }`}
                         >
-                          <Trash2 className="h-3.5 w-3.5" />
-                        </button>
-                      )}
-                    </div>
-                  ))}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedThemes((prev) => ({
+                                ...prev,
+                                [grp.key]: !isThemeOpen,
+                              }))
+                            }
+                            className="flex h-5 w-5 shrink-0 items-center justify-center text-stone hover:text-ink"
+                            title="Déplier / replier ce thème"
+                          >
+                            {isThemeOpen ? (
+                              <ChevronDown className="h-3.5 w-3.5" />
+                            ) : (
+                              <ChevronRight className="h-3.5 w-3.5" />
+                            )}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() => selectNode(themeNodeId)}
+                            className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                          >
+                            {isThemeOpen ? (
+                              <FolderOpen className="h-3.5 w-3.5 shrink-0 text-ink" />
+                            ) : (
+                              <Folder className="h-3.5 w-3.5 shrink-0 text-stone" />
+                            )}
+                            <div className="min-w-0 flex-1">
+                              <span className="block truncate font-mono text-[11px] font-bold uppercase tracking-wider text-ink">
+                                {grp.label}
+                              </span>
+                              <span className="font-mono text-[9px] uppercase tracking-wider text-stone">
+                                {grp.chapterCount} CHAP · {grp.totalDocsCount} PDF
+                              </span>
+                            </div>
+                          </button>
+
+                          {canManage && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setNewChapterTheme(
+                                  grp.isDefaultGeneral ? "" : grp.label
+                                );
+                                setNewChapterParentId("");
+                              }}
+                              title={`Ajouter un chapitre dans ${grp.label}`}
+                              className="p-1 text-stone opacity-75 hover:text-ink group-hover:opacity-100"
+                            >
+                              <Plus className="h-3 w-3" />
+                            </button>
+                          )}
+                        </div>
+
+                        {isThemeOpen && (
+                          <div className="ara-tree-collapse">
+                            {grp.nodes.map((node) => renderSidebarTreeNode(node))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
 
                 {canManage && (
                   <form
                     onSubmit={handleCreateChapter}
-                    className="border-t border-border bg-paper p-3"
+                    className="space-y-2 border-t border-border bg-paper p-3"
                   >
+                    <p className="font-mono text-[10px] font-bold uppercase tracking-wider text-stone">
+                      AJOUTER UN THÈME / CHAPITRE
+                    </p>
+                    <input
+                      type="text"
+                      list="ue-themes-datalist"
+                      value={newChapterTheme}
+                      onChange={(e) => setNewChapterTheme(e.target.value)}
+                      placeholder="Thème / Partie (ex : Ostéologie)..."
+                      className="w-full border border-border bg-card px-2.5 py-1.5 text-xs text-ink placeholder:text-stone focus:border-ink focus:outline-none"
+                    />
+                    <select
+                      value={newChapterParentId}
+                      onChange={(e) => setNewChapterParentId(e.target.value)}
+                      className="w-full border border-border bg-card px-2.5 py-1.5 text-xs text-ink focus:border-ink focus:outline-none"
+                    >
+                      <option value="">
+                        — Niveau racine (Chapitre principal) —
+                      </option>
+                      {flatChapters.map((item) => (
+                        <option key={item.chapter.id} value={item.chapter.id}>
+                          Sous-chapitre de : {"↳ ".repeat(item.depth)}
+                          {item.chapter.theme ? `[${item.chapter.theme}] ` : ""}
+                          {item.chapter.title}
+                        </option>
+                      ))}
+                    </select>
                     <div className="flex gap-1.5">
                       <input
                         type="text"
                         value={newChapterTitle}
                         onChange={(e) => setNewChapterTitle(e.target.value)}
-                        placeholder="Nouveau chapitre..."
-                        className="min-w-0 flex-1 border border-border bg-card px-2.5 py-1.5 text-xs text-ink focus:border-ink focus:outline-none"
+                        placeholder="Titre du chapitre..."
+                        className="min-w-0 flex-1 border border-border bg-card px-2.5 py-1.5 text-xs text-ink placeholder:text-stone focus:border-ink focus:outline-none"
                       />
                       <button
                         type="submit"
                         disabled={creatingChapter || !newChapterTitle.trim()}
-                        title="Ajouter le chapitre"
+                        title="Créer dans l'arborescence"
                         className="border border-ink bg-ink px-2.5 py-1.5 text-card disabled:opacity-50"
                       >
                         <FolderPlus className="h-3.5 w-3.5" />
@@ -915,267 +1767,209 @@ function UEWorkspaceContent() {
               </div>
             </aside>
 
-            {/* Center: Custom PDF Reader + Documents */}
-            <section className="space-y-4 lg:col-span-9">
+            {/* Center: Breadcrumb + View Mode + Custom PDF Reader + Documents */}
+            <section className="space-y-4 lg:col-span-8 xl:col-span-9">
               {activeDoc && (
-                <CustomPdfReader
-                  documentId={activeDoc.id}
-                  ueId={ue.id}
-                  title={activeDoc.title}
-                  fileName={activeDoc.fileName}
-                  initialPage={activePage}
-                  pageCountHint={activeDoc.pageCount}
-                  onPageChange={handleReaderPageChange}
-                  onCreateQuizFromCapture={(imageDataUrl, pageNumber) => {
-                    setCapturedQuizSeed({
-                      id: `cap-${Date.now()}`,
-                      imageDataUrl,
-                      title: `${ue.code} · Schéma P.${pageNumber} (${activeDoc.title})`,
-                    });
-                    setActiveTab("studio");
-                  }}
-                  onClose={() => setActiveDoc(null)}
-                />
+                <div className="ara-animate-in">
+                  <CustomPdfReader
+                    documentId={activeDoc.id}
+                    ueId={ue.id}
+                    title={activeDoc.title}
+                    fileName={activeDoc.fileName}
+                    initialPage={activePage}
+                    pageCountHint={activeDoc.pageCount}
+                    onPageChange={handleReaderPageChange}
+                    onCreateQuizFromCapture={(imageDataUrl, pageNumber) => {
+                      setCapturedQuizSeed({
+                        id: `cap-${Date.now()}`,
+                        imageDataUrl,
+                        title: `${ue.code} · Schéma P.${pageNumber} (${activeDoc.title})`,
+                      });
+                      setActiveTab("studio");
+                    }}
+                    onClose={() => setActiveDoc(null)}
+                  />
+                </div>
               )}
 
-              {/* Official Courses Section */}
-              <div className="border border-border bg-card">
-                <div className="flex items-center justify-between border-b border-border bg-paper px-4 py-2.5">
-                  <span className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-                    COURS OFFICIELS ({officialDocs.length})
-                  </span>
-                  <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
-                    SUPPORTS MAGISTRAUX &amp; POLYCOPIÉS
-                  </span>
-                </div>
-
-                {officialDocs.length === 0 ? (
-                  <div className="p-6 text-center">
-                    <p className="font-mono text-xs uppercase tracking-wider text-stone">
-                      AUCUN COURS OFFICIEL DANS CETTE SÉLECTION.
-                    </p>
-                  </div>
-                ) : (
-                  <div className="divide-y divide-border">
-                    {officialDocs.map((doc) => {
-                      const isActive = activeDoc?.id === doc.id;
-                      const canDelete =
-                        canManage || doc.authorId === session?.user?.id;
-                      return (
-                        <div
-                          key={doc.id}
-                          className={`flex flex-wrap items-center justify-between gap-3 p-4 ${
-                            isActive ? "bg-pinned" : "bg-card"
-                          }`}
+              {/* Breadcrumb & View Switcher */}
+              <div className="flex flex-wrap items-center justify-between gap-3 border border-border bg-card px-4 py-2.5">
+                <nav
+                  aria-label="Fil d'Ariane"
+                  className="flex flex-wrap items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider"
+                >
+                  {activeBreadcrumb.map((crumb, idx) => {
+                    const isLast = idx === activeBreadcrumb.length - 1;
+                    return (
+                      <span key={`${crumb.target}-${idx}`} className="inline-flex items-center gap-1.5">
+                        {idx > 0 && (
+                          <ChevronRight className="h-3 w-3 text-stone" />
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => selectNode(crumb.target)}
+                          className={
+                            isLast
+                              ? "font-bold text-ink"
+                              : "text-stone hover:text-ink hover:underline"
+                          }
                         >
-                          <div className="min-w-0 flex-1">
-                            <div className="flex flex-wrap items-center gap-2">
-                              <FileText className="h-4 w-4 shrink-0 text-ink" />
-                              <h3 className="truncate text-sm font-bold text-ink">
-                                {doc.title}
-                              </h3>
-                              <span
-                                className={`px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
-                                  doc.isIndexed
-                                    ? "bg-badge-bg text-badge-text"
-                                    : "border border-border bg-paper text-stone"
-                                }`}
-                              >
-                                {doc.isIndexed ? "RAG INDEXÉ" : "NON INDEXÉ"}
-                              </span>
-                            </div>
-                            <p className="mt-1 font-mono text-[11px] uppercase tracking-wider text-stone">
-                              {doc.fileName} · {doc.pageCount} PAGES ·{" "}
-                              {formatBytes(doc.fileSize)}
-                            </p>
-                          </div>
+                          {crumb.label}
+                        </button>
+                      </span>
+                    );
+                  })}
+                </nav>
 
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setStudioFocusDocId(doc.id);
-                                setActiveTab("studio");
-                              }}
-                              title="Ouvrir la fiche, flashcards et quiz de ce cours dans le Studio"
-                              className="inline-flex items-center gap-1 border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned"
-                            >
-                              <Sparkles className="h-3 w-3" />
-                              <span>PACK RÉVISION</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setActiveDoc(doc);
-                                setActivePage(1);
-                                setActiveTotalPages(doc.pageCount);
-                              }}
-                              className="border border-ink bg-ink px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-card hover:bg-ink/90"
-                            >
-                              {isActive ? "OUVERT" : "LIRE PDF"}
-                            </button>
-                            {canDelete && (
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteDoc(doc.id)}
-                                title="Supprimer"
-                                className="border border-border bg-paper p-1.5 text-stone hover:border-carmine hover:text-carmine"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* Student Notes Section */}
-              <div className="border border-border bg-card">
-                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-4 py-2.5">
-                  <span className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-                    NOTES ÉTUDIANTES ({studentNotes.length})
-                  </span>
-
+                <div className="flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
                     onClick={() => setValidatedOnly((prev) => !prev)}
-                    className={`inline-flex items-center gap-1.5 border px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider ${
+                    className={`inline-flex items-center gap-1 border px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider transition-colors ${
                       validatedOnly
                         ? "border-badge-text bg-badge-bg text-badge-text"
-                        : "border-border bg-card text-stone hover:text-ink"
+                        : "border-border bg-paper text-stone hover:text-ink"
                     }`}
                   >
                     <CheckCircle2 className="h-3 w-3" />
-                    <span>VALIDÉES UNIQUEMENT</span>
+                    <span>VALIDÉES</span>
                   </button>
-                </div>
 
-                {studentNotes.length === 0 ? (
-                  <div className="p-6 text-center">
-                    <p className="font-mono text-xs uppercase tracking-wider text-stone">
-                      AUCUNE NOTE ÉTUDIANTE{" "}
-                      {validatedOnly ? "VALIDÉE " : ""}POUR L&apos;INSTANT.
-                    </p>
+                  <div className="flex border border-border bg-paper">
+                    <button
+                      type="button"
+                      onClick={() => setCourseViewMode("tree")}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+                        courseViewMode === "tree"
+                          ? "bg-ink font-semibold text-card"
+                          : "text-stone hover:text-ink"
+                      }`}
+                    >
+                      <FolderTree className="h-3 w-3" />
+                      <span>ARBORESCENCE</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setCourseViewMode("category")}
+                      className={`inline-flex items-center gap-1 px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+                        courseViewMode === "category"
+                          ? "bg-ink font-semibold text-card"
+                          : "text-stone hover:text-ink"
+                      }`}
+                    >
+                      <Layers className="h-3 w-3" />
+                      <span>CATÉGORIES</span>
+                    </button>
                   </div>
-                ) : (
-                  <div className="divide-y divide-border">
-                    {studentNotes.map((doc) => {
-                      const isActive = activeDoc?.id === doc.id;
-                      const canDelete =
-                        canManage || doc.authorId === session?.user?.id;
+                </div>
+              </div>
+
+              {courseViewMode === "tree" ? (
+                <div className="ara-animate-in space-y-4">
+                  {themeGroups.length === 0 ? (
+                    <div className="border border-border bg-card p-8 text-center">
+                      <p className="font-mono text-xs uppercase tracking-wider text-stone">
+                        AUCUN THÈME OU CHAPITRE CRÉÉ DANS CETTE UE POUR
+                        L&apos;INSTANT.
+                      </p>
+                    </div>
+                  ) : (
+                    themeGroups.map((grp) => {
+                      const hasVisible = grp.nodes.some((n) => {
+                        const sub =
+                          chapterSubtreeMap.get(n.chapter.id) ||
+                          new Set([n.chapter.id]);
+                        return Array.from(sub).some((id) =>
+                          visibleChapterIds.has(id)
+                        );
+                      });
+                      if (!hasVisible) return null;
+
                       return (
                         <div
-                          key={doc.id}
-                          className={`flex flex-wrap items-center justify-between gap-3 p-4 ${
-                            isActive || doc.isPinned ? "bg-pinned" : "bg-card"
-                          }`}
+                          key={grp.key}
+                          className="border border-border bg-paper/50 p-4"
+                          style={{
+                            borderTop: `3px solid ${ue.accentColor || "#D99B26"}`,
+                          }}
                         >
-                          <div className="flex min-w-0 flex-1 items-start gap-3">
-                            <button
-                              type="button"
-                              onClick={() => handleToggleUpvote(doc.id)}
-                              className={`flex w-12 shrink-0 flex-col items-center justify-center border py-1 font-mono text-xs transition-colors ${
-                                doc.hasUpvoted
-                                  ? "border-ink bg-ink text-card"
-                                  : "border-border bg-paper text-ink hover:border-ink"
-                              }`}
-                              title="Voter pour cette fiche"
-                            >
-                              <ArrowUp className="h-3 w-3" />
-                              <span className="text-[11px] font-bold">
-                                {doc.upvoteCount}
-                              </span>
-                            </button>
-
-                            <div className="min-w-0 flex-1">
-                              <div className="flex flex-wrap items-center gap-2">
-                                <h3 className="truncate text-sm font-bold text-ink">
-                                  {doc.title}
-                                </h3>
-                                {doc.isPinned && (
-                                  <span className="bg-badge-bg px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-badge-text">
-                                    VALIDÉ PAR RESP. UE
-                                  </span>
-                                )}
-                              </div>
-                              <p className="mt-1 font-mono text-[11px] uppercase tracking-wider text-stone">
-                                PAR {doc.author.name} · {doc.fileName} ·{" "}
-                                {doc.pageCount} PAGES
-                              </p>
+                          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2">
+                            <div className="flex items-center gap-2">
+                              <Folder className="h-4 w-4 text-ink" />
+                              <h2 className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                                THÈME · {grp.label}
+                              </h2>
                             </div>
+                            <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                              {grp.chapterCount} CHAPITRE
+                              {grp.chapterCount > 1 ? "S" : ""} ·{" "}
+                              {grp.totalDocsCount} PDF
+                            </span>
                           </div>
 
-                          <div className="flex items-center gap-1.5">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setStudioFocusDocId(doc.id);
-                                setActiveTab("studio");
-                              }}
-                              title="Ouvrir la fiche, flashcards et quiz de cette note dans le Studio"
-                              className="inline-flex items-center gap-1 border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned"
-                            >
-                              <Sparkles className="h-3 w-3" />
-                              <span>PACK RÉVISION</span>
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setActiveDoc(doc);
-                                setActivePage(1);
-                                setActiveTotalPages(doc.pageCount);
-                              }}
-                              className="border border-border bg-paper px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-ink hover:border-ink hover:bg-card"
-                            >
-                              {isActive ? "OUVERT" : "LIRE PDF"}
-                            </button>
-
-                            {canManage && (
-                              <button
-                                type="button"
-                                onClick={() => handleTogglePin(doc)}
-                                title={
-                                  doc.isPinned
-                                    ? "Retirer la validation"
-                                    : "Épingler / Valider par Resp. UE"
-                                }
-                                className={`border p-1.5 ${
-                                  doc.isPinned
-                                    ? "border-badge-text bg-badge-bg text-badge-text"
-                                    : "border-border bg-paper text-stone hover:text-ink"
-                                }`}
-                              >
-                                {doc.isPinned ? (
-                                  <PinOff className="h-3.5 w-3.5" />
-                                ) : (
-                                  <Pin className="h-3.5 w-3.5" />
-                                )}
-                              </button>
-                            )}
-
-                            {canDelete && (
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteDoc(doc.id)}
-                                title="Supprimer"
-                                className="border border-border bg-paper p-1.5 text-stone hover:border-carmine hover:text-carmine"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            )}
+                          <div className="space-y-3">
+                            {grp.nodes.map((node) => renderCenterTreeNode(node))}
                           </div>
                         </div>
                       );
-                    })}
+                    })
+                  )}
+                </div>
+              ) : (
+                <div className="ara-animate-in space-y-4">
+                  {/* Official Courses Section */}
+                  <div className="border border-border bg-card">
+                    <div className="flex items-center justify-between border-b border-border bg-paper px-4 py-2.5">
+                      <span className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
+                        COURS OFFICIELS ({officialDocs.length})
+                      </span>
+                      <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                        SUPPORTS MAGISTRAUX &amp; POLYCOPIÉS
+                      </span>
+                    </div>
+
+                    {officialDocs.length === 0 ? (
+                      <div className="p-6 text-center">
+                        <p className="font-mono text-xs uppercase tracking-wider text-stone">
+                          AUCUN COURS OFFICIEL DANS CETTE SÉLECTION.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-border">
+                        {officialDocs.map((doc) => renderDocumentRow(doc, false))}
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
+
+                  {/* Student Notes Section */}
+                  <div className="border border-border bg-card">
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-4 py-2.5">
+                      <span className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
+                        NOTES ÉTUDIANTES ({studentNotes.length})
+                      </span>
+                      <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                        FICHES &amp; PARTAGES DE PROMO
+                      </span>
+                    </div>
+
+                    {studentNotes.length === 0 ? (
+                      <div className="p-6 text-center">
+                        <p className="font-mono text-xs uppercase tracking-wider text-stone">
+                          AUCUNE NOTE ÉTUDIANTE{" "}
+                          {validatedOnly ? "VALIDÉE " : ""}POUR L&apos;INSTANT.
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="divide-y divide-border">
+                        {studentNotes.map((doc) => renderDocumentRow(doc, false))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </section>
           </div>
-        </>
+        </div>
       )}
 
       {/* TAB 2: DISCUSSION DE L'UE */}

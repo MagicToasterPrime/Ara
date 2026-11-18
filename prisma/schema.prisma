@@ -107,10 +107,12 @@ model UERole {
 }
 
 model Chapter {
-  id    String @id @default(cuid())
-  ueId  String
-  title String
-  order Int    @default(0)
+  id       String  @id @default(cuid())
+  ueId     String
+  title    String
+  theme    String  @default("")
+  parentId String?
+  order    Int     @default(0)
 
   ue        UE         @relation(fields: [ueId], references: [id], onDelete: Cascade)
   documents Document[]

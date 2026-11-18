@@ -352,7 +352,7 @@ export default function HomePage() {
             return (
               <article
                 key={ue.id}
-                className="relative flex flex-col justify-between border border-border bg-card p-5"
+                className="ara-animate-in ara-hover-lift relative flex flex-col justify-between border border-border bg-card p-5"
                 style={{ borderTop: `3px solid ${ue.accentColor || "#D99B26"}` }}
               >
                 <div>
@@ -442,7 +442,7 @@ export default function HomePage() {
                     </button>
 
                     {openMenuId === ue.id && (
-                      <div className="absolute bottom-12 right-0 z-20 w-56 border border-ink bg-card p-1">
+                      <div className="ara-tree-collapse absolute bottom-12 right-0 z-20 w-56 border border-ink bg-card p-1">
                         <Link
                           href={`/ue/${ue.id}?tab=discussion`}
                           className="flex items-center gap-2 px-3 py-2 font-mono text-[11px] uppercase tracking-wider text-ink hover:bg-pinned"
@@ -509,7 +509,7 @@ export default function HomePage() {
             {visibleArchives.map((ue) => (
               <article
                 key={ue.id}
-                className="flex flex-col justify-between border border-border bg-card p-4"
+                className="ara-animate-in ara-hover-lift flex flex-col justify-between border border-border bg-card p-4"
               >
                 <div>
                   <div className="mb-2 flex items-center justify-between gap-2 font-mono text-[10px] uppercase tracking-wider text-stone">

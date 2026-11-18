@@ -31,3 +31,74 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #6e6d68;
 }
+
+/* Swiss Editorial Micro-Animations (150ms–200ms, crisp easing, zero bounce) */
+@keyframes araFadeUp {
+  from {
+    opacity: 0;
+    transform: translateY(5px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes araSlideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes araFlipIn {
+  from {
+    opacity: 0;
+    transform: perspective(600px) rotateX(-8deg) translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: perspective(600px) rotateX(0deg) translateY(0);
+  }
+}
+
+.ara-animate-in {
+  animation: araFadeUp 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.ara-tree-collapse {
+  animation: araSlideDown 160ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.ara-flip-in {
+  animation: araFlipIn 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.ara-hover-lift {
+  transition:
+    transform 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 150ms ease,
+    background-color 150ms ease;
+}
+
+.ara-hover-lift:hover {
+  transform: translateY(-1px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ara-animate-in,
+  .ara-tree-collapse,
+  .ara-flip-in {
+    animation: none !important;
+  }
+
+  .ara-hover-lift,
+  .ara-hover-lift:hover {
+    transition: none !important;
+    transform: none !important;
+  }
+}
