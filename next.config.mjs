@@ -1,6 +1,7 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   distDir: process.env.NODE_ENV === "production" ? ".next-prod" : ".next",
+  poweredByHeader: false,
   experimental: {
     serverComponentsExternalPackages: ["pdf-parse", "bcryptjs"],
   },
@@ -23,7 +24,15 @@ const nextConfig = {
           },
           {
             key: "Referrer-Policy",
-            value: "same-origin",
+            value: "no-referrer",
+          },
+          {
+            key: "Permissions-Policy",
+            value: "camera=(), microphone=(), geolocation=(), interest-cohort=()",
+          },
+          {
+            key: "X-DNS-Prefetch-Control",
+            value: "off",
           },
         ],
       },

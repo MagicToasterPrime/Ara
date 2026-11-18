@@ -62,7 +62,9 @@ export async function GET(
               "Content-Range": `bytes ${start}-${end}/${totalSize}`,
               "Accept-Ranges": "bytes",
               "Content-Disposition": `inline; filename*=UTF-8''${encodedName}`,
-              "Cache-Control": "private, max-age=300",
+              "Cache-Control": "private, no-store, no-cache, must-revalidate",
+              "X-Robots-Tag":
+                "noindex, nofollow, noarchive, nosnippet, noimageindex",
             },
           });
         } finally {
@@ -79,7 +81,9 @@ export async function GET(
         "Content-Length": String(totalSize),
         "Accept-Ranges": "bytes",
         "Content-Disposition": `inline; filename*=UTF-8''${encodedName}`,
-        "Cache-Control": "private, max-age=300",
+        "Cache-Control": "private, no-store, no-cache, must-revalidate",
+        "X-Robots-Tag":
+          "noindex, nofollow, noarchive, nosnippet, noimageindex",
       },
     });
   } catch (error) {

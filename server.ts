@@ -3,6 +3,7 @@ import next from "next";
 import { Server as SocketIOServer } from "socket.io";
 import { prisma } from "./src/lib/prisma";
 import type { WhiteboardCollaborator } from "./src/lib/socket-types";
+import { getUserAccountMeta } from "./src/lib/user-schema";
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = process.env.HOSTNAME || "0.0.0.0";
@@ -26,6 +27,19 @@ function emitWhiteboardPresence(io: SocketIOServer, whiteboardId: string) {
 
 app.prepare().then(() => {
   const httpServer = http.createServer((req, res) => {
+    res.removeHeader("X-Powered-By");
+    res.setHeader(
+      "X-Robots-Tag",
+      "noindex, nofollow, noarchive, nosnippet, noimageindex"
+    );
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "SAMEORIGIN");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader(
+      "Permissions-Policy",
+      "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+    );
+    res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
     handler(req, res);
   });
 
@@ -33,9 +47,20 @@ app.prepare().then(() => {
     path: "/api/socketio",
     addTrailingSlash: false,
     cors: {
-      origin: "*",
-      methods: ["GET", "POST"],
+      origin: false,
     },
+  });
+
+  io.use((socket, nextMiddleware) => {
+    const cookieHeader = socket.handshake.headers.cookie || "";
+    const hasSessionCookie =
+      /(?:^|;\s*)(?:__Secure-)?(?:authjs|next-auth)\.session-token(?:\.\d+)?=([^;\s]+)/.test(
+        cookieHeader
+      );
+    if (!hasSessionCookie) {
+      return nextMiddleware(new Error("Non authentifié"));
+    }
+    return nextMiddleware();
   });
 
   globalForSocket.__araSocketIo = io;
@@ -68,6 +93,18 @@ app.prepare().then(() => {
           const attachmentJson = payload.attachmentJson ?? null;
 
           if (!channelId || !authorId || (!content && !attachmentJson)) {
+            return;
+          }
+
+          const authorRecord = await prisma.user.findUnique({
+            where: { id: authorId },
+            select: { id: true, globalRole: true },
+          });
+          if (!authorRecord) {
+            return;
+          }
+          const authorMeta = await getUserAccountMeta(authorId);
+          if (!authorMeta.isApproved && authorRecord.globalRole !== "YEAR_ADMIN") {
             return;
           }
 

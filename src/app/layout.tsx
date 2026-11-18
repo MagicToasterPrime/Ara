@@ -17,9 +17,21 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "ARA — Plateforme Collaborative Académique",
-  description:
-    "Plateforme collaborative auto-hébergée pour promotion d'étudiants : UE, PDF, Spix IA, Chat & Tableaux blancs.",
+  title: "ARA — Accès Privé",
+  description: "Accès restreint sur authentification.",
+  robots: {
+    index: false,
+    follow: false,
+    nocache: true,
+    googleBot: {
+      index: false,
+      follow: false,
+      noimageindex: true,
+      "max-video-preview": -1,
+      "max-image-preview": "none",
+      "max-snippet": -1,
+    },
+  },
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {

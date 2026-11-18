@@ -29,6 +29,21 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [status, router]);
 
   useEffect(() => {
+    if (status !== "authenticated") return;
+    let active = true;
+    fetch("/api/system/health", { cache: "no-store" })
+      .then((res) => {
+        if (active && res.status === 401) {
+          void signOut({ callbackUrl: "/login" });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [status, pathname]);
+
+  useEffect(() => {
     function handleShortcut(e: KeyboardEvent) {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
         e.preventDefault();
