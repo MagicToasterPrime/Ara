@@ -2,6 +2,10 @@ import http from "node:http";
 import next from "next";
 import { Server as SocketIOServer } from "socket.io";
 import { prisma } from "./src/lib/prisma";
+import {
+  hasSharedDailyQuizForToday,
+  runScheduled6AmDailyQuizGeneration,
+} from "./src/lib/revisions";
 import type { WhiteboardCollaborator } from "./src/lib/socket-types";
 import { runNightlyOffPeakStudyGeneration } from "./src/lib/studio";
 import { getUserAccountMeta } from "./src/lib/user-schema";
@@ -13,6 +17,7 @@ const port = Number.parseInt(process.env.PORT || "3000", 10);
 const globalForSocket = globalThis as typeof globalThis & {
   __araSocketIo?: SocketIOServer;
   __araNightlyWorkerStarted?: boolean;
+  __araDailyQuizSchedulerStarted?: boolean;
 };
 
 const app = next({ dev, hostname, port });
@@ -266,6 +271,35 @@ app.prepare().then(() => {
             });
         }
       }, 30 * 60 * 1000);
+    }
+
+    if (!globalForSocket.__araDailyQuizSchedulerStarted) {
+      globalForSocket.__araDailyQuizSchedulerStarted = true;
+
+      const ensureDailyQuizReady = async () => {
+        try {
+          const hour = new Date().getHours();
+          const hasToday = await hasSharedDailyQuizForToday();
+          if (hour === 6 || !hasToday) {
+            const res = await runScheduled6AmDailyQuizGeneration();
+            if (res && (!hasToday || res.preparedSessions > 0)) {
+              console.log(
+                `[DailyQuiz] Quiz journalier commun (${res.dateKey}, ${res.ueCode || "UE"}) prêt : ${res.questionCount} questions, ${res.preparedSessions} séance(s) préparée(s).`
+              );
+            }
+          }
+        } catch (err) {
+          console.warn("[DailyQuiz] Scheduler warning:", err);
+        }
+      };
+
+      setTimeout(() => {
+        void ensureDailyQuizReady();
+      }, 15000);
+
+      setInterval(() => {
+        void ensureDailyQuizReady();
+      }, 5 * 60 * 1000);
     }
   });
 });

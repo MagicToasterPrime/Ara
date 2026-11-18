@@ -7,17 +7,17 @@ import {
   reviewErrorBookItem,
   type SrsRating,
 } from "@/lib/error-book";
-import { checkOllamaHealth } from "@/lib/ollama";
 import {
   computeEffectiveStreak,
   ensureRevisionSchema,
   generateQuizQuestions,
   getLocalDateKey,
+  getOrGenerateSharedDailyQuiz,
   getYesterdayDateKey,
   gradeRevisionAnswers,
-  isLowQualityExcerptQuestion,
   type RevisionAnswerValue,
   type RevisionQuestion,
+  type SharedDailyQuizRecord,
 } from "@/lib/revisions";
 
 function parseJsonSafe<T>(raw: string, fallback: T): T {
@@ -28,10 +28,13 @@ function parseJsonSafe<T>(raw: string, fallback: T): T {
   }
 }
 
-async function buildPayload(userId: string) {
+async function buildPayload(
+  userId: string,
+  sharedQuizArg?: SharedDailyQuizRecord | null
+) {
   const todayKey = getLocalDateKey();
 
-  const [dbUser, todaySession, chunkCount, allParticipants, errorBook] =
+  const [dbUser, todaySession, chunkCount, allParticipants, errorBook, sharedQuiz] =
     await Promise.all([
       prisma.user.findUnique({
         where: { id: userId },
@@ -72,6 +75,9 @@ async function buildPayload(userId: string) {
         },
       }),
       getUserErrorBook(userId),
+      sharedQuizArg !== undefined
+        ? Promise.resolve(sharedQuizArg)
+        : getOrGenerateSharedDailyQuiz(),
     ]);
 
   const effectiveStreak = dbUser
@@ -136,6 +142,15 @@ async function buildPayload(userId: string) {
       : null,
     leaderboard,
     errorBook,
+    sharedQuizMeta: sharedQuiz
+      ? {
+          dateKey: sharedQuiz.dateKey,
+          ueCode: sharedQuiz.ueCode,
+          ueTitle: sharedQuiz.ueTitle,
+          generatedAt: sharedQuiz.generatedAt,
+          generatedByAi: sharedQuiz.generatedByAi,
+        }
+      : null,
   };
 }
 
@@ -147,63 +162,53 @@ export async function GET() {
 
   await ensureRevisionSchema();
 
-  const dbUser = await prisma.user.findUnique({
-    where: { id: user.id },
-    select: { revisionEnabled: true },
-  });
+  const [dbUser, sharedQuiz] = await Promise.all([
+    prisma.user.findUnique({
+      where: { id: user.id },
+      select: { revisionEnabled: true, lastRevisionDate: true },
+    }),
+    getOrGenerateSharedDailyQuiz(),
+  ]);
 
   const todayKey = getLocalDateKey();
-  if (dbUser?.revisionEnabled) {
+  if (dbUser?.revisionEnabled && sharedQuiz && sharedQuiz.questions.length > 0) {
     const existing = await prisma.dailyRevisionSession.findUnique({
       where: { userId_dateKey: { userId: user.id, dateKey: todayKey } },
     });
-    if (!existing) {
-      const questions = await generateQuizQuestions({ userId: user.id });
-      if (questions.length > 0) {
-        await prisma.dailyRevisionSession
-          .upsert({
-            where: { userId_dateKey: { userId: user.id, dateKey: todayKey } },
-            update: {},
-            create: {
-              userId: user.id,
-              dateKey: todayKey,
-              questionsJson: JSON.stringify(questions),
-              totalQuestions: questions.length,
-            },
-          })
-          .catch(() => null);
-      }
-    } else if (!existing.completed) {
-      const parsedExisting = parseJsonSafe<RevisionQuestion[]>(
-        existing.questionsJson,
-        []
-      );
-      const hasStaleCopyPaste = parsedExisting.some((q) =>
-        isLowQualityExcerptQuestion(q.prompt, q.options)
-      );
-      const needsAiUpgrade =
-        parsedExisting.length > 0 &&
-        parsedExisting.every((q) => !q.generatedByAi) &&
-        (await checkOllamaHealth()).online;
+    const sharedQuestionsJson = JSON.stringify(sharedQuiz.questions);
 
-      if (hasStaleCopyPaste || needsAiUpgrade) {
-        const freshQuestions = await generateQuizQuestions({ userId: user.id });
-        if (freshQuestions.length > 0) {
-          await prisma.dailyRevisionSession
-            .update({
-              where: { id: existing.id },
-              data: {
-                questionsJson: JSON.stringify(freshQuestions),
-                totalQuestions: freshQuestions.length,
-              },
-            })
-            .catch(() => null);
-        }
-      }
+    if (!existing) {
+      await prisma.dailyRevisionSession
+        .upsert({
+          where: { userId_dateKey: { userId: user.id, dateKey: todayKey } },
+          update: {},
+          create: {
+            userId: user.id,
+            dateKey: todayKey,
+            questionsJson: sharedQuestionsJson,
+            totalQuestions: sharedQuiz.questions.length,
+          },
+        })
+        .catch(() => null);
+    } else if (
+      !existing.completed &&
+      existing.answersJson === "{}" &&
+      dbUser.lastRevisionDate !== todayKey &&
+      existing.questionsJson !== sharedQuestionsJson
+    ) {
+      await prisma.dailyRevisionSession
+        .update({
+          where: { id: existing.id },
+          data: {
+            questionsJson: sharedQuestionsJson,
+            totalQuestions: sharedQuiz.questions.length,
+          },
+        })
+        .catch(() => null);
     }
   }
 
-  const payload = await buildPayload(user.id);
+  const payload = await buildPayload(user.id, sharedQuiz);
   return NextResponse.json(payload);
 }
 
@@ -224,6 +229,7 @@ export async function POST(req: Request) {
         | "SUBMIT"
         | "REVIEW_ERROR";
       enabled?: boolean;
+      forceShared?: boolean;
       sessionId?: string;
       answers?: Record<string, RevisionAnswerValue>;
       errorItemId?: string;
@@ -265,7 +271,8 @@ export async function POST(req: Request) {
           where: { userId_dateKey: { userId: user.id, dateKey: todayKey } },
         });
         if (!existing) {
-          const questions = await generateQuizQuestions({ userId: user.id });
+          const shared = await getOrGenerateSharedDailyQuiz();
+          const questions = shared?.questions || [];
           if (questions.length > 0) {
             await prisma.dailyRevisionSession
               .upsert({
@@ -293,7 +300,20 @@ export async function POST(req: Request) {
       body.action === "GENERATE_DAILY" ||
       body.action === "GENERATE_BONUS"
     ) {
-      const questions = await generateQuizQuestions({ userId: user.id });
+      let sharedQuizResult: SharedDailyQuizRecord | null | undefined = undefined;
+      let questions: RevisionQuestion[] = [];
+
+      if (body.action === "GENERATE_DAILY") {
+        const forceRegenerate =
+          user.globalRole === "YEAR_ADMIN" && Boolean(body.forceShared);
+        sharedQuizResult = await getOrGenerateSharedDailyQuiz({
+          forceRegenerate,
+        });
+        questions = sharedQuizResult?.questions || [];
+      } else {
+        questions = await generateQuizQuestions({ userId: user.id, count: 8 });
+      }
+
       if (questions.length === 0) {
         return NextResponse.json(
           {
@@ -335,7 +355,7 @@ export async function POST(req: Request) {
         });
       }
 
-      const payload = await buildPayload(user.id);
+      const payload = await buildPayload(user.id, sharedQuizResult);
       return NextResponse.json(payload);
     }
 

@@ -35,7 +35,7 @@ model User {
   globalRole          GlobalRole @default(STUDENT)
   classLevel          String   @default("VET2")
   isApproved          Boolean  @default(true)
-  revisionEnabled     Boolean  @default(false)
+  revisionEnabled     Boolean  @default(true)
   currentStreak       Int      @default(0)
   bestStreak          Int      @default(0)
   lastRevisionDate    String?

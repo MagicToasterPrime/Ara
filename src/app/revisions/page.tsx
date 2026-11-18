@@ -102,6 +102,14 @@ interface UserErrorBookPayload {
   masteredCount: number;
 }
 
+interface SharedQuizMeta {
+  dateKey: string;
+  ueCode: string | null;
+  ueTitle: string | null;
+  generatedAt: string;
+  generatedByAi: boolean;
+}
+
 interface RevisionsPayload {
   userState: UserRevisionState;
   todayKey: string;
@@ -110,6 +118,7 @@ interface RevisionsPayload {
   leaderboard: LeaderboardEntry[];
   errorBook?: UserErrorBookPayload;
   gradingResults?: Record<string, boolean>;
+  sharedQuizMeta?: SharedQuizMeta | null;
 }
 
 const TYPE_LABELS: Record<RevisionQuestion["type"], string> = {
@@ -228,6 +237,8 @@ export default function RevisionsPage() {
 
   const userState = data?.userState;
   const sessionData = data?.todaySession;
+  const sharedMeta = data?.sharedQuizMeta || null;
+  const isYearAdmin = session?.user?.globalRole === "YEAR_ADMIN";
   const leaderboard = data?.leaderboard || [];
   const errorBook = data?.errorBook;
   const activeErrorItems = (errorBook?.items || []).filter(
@@ -253,7 +264,8 @@ export default function RevisionsPage() {
               RÉVISIONS JOURNALIÈRES &amp; CLASSEMENT DE STREAK
             </h1>
             <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
-              [ QUIZ IA SUR UE &amp; COURS ALÉATOIRES · QCU · QCM · QROC · FLASHCARDS ]
+              [ QUIZ JOURNALIER COMMUN À TOUS · GÉNÉRÉ AUTOMATIQUEMENT À 06H00 ·
+              QCU · QCM · QROC · FLASHCARDS ]
             </p>
           </div>
 
@@ -445,9 +457,20 @@ export default function RevisionsPage() {
                         SÉANCE DU {sessionData.dateKey} ·{" "}
                         {sessionData.questions.length} QUESTIONS
                       </span>
+                      <span className="border border-ink bg-ink px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-card">
+                        QUIZ COMMUN 06H00
+                        {sharedMeta?.generatedAt
+                          ? ` · ${new Date(
+                              sharedMeta.generatedAt
+                            ).toLocaleTimeString("fr-FR", {
+                              hour: "2-digit",
+                              minute: "2-digit",
+                            })}`
+                          : ""}
+                      </span>
                       {sessionUe && (
                         <span className="border border-border bg-paper px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink">
-                          UE ALÉATOIRE : {sessionUe.code} — {sessionUe.title}
+                          UE : {sessionUe.code} — {sessionUe.title}
                         </span>
                       )}
                       {sessionGeneratedByAi && (
@@ -464,17 +487,37 @@ export default function RevisionsPage() {
                       )}
                     </div>
 
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => postAction({ action: "GENERATE_BONUS" })}
-                      className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
-                    >
-                      <RefreshCw
-                        className={`h-3.5 w-3.5 ${busy ? "animate-spin" : ""}`}
-                      />
-                      <span>NOUVEAU QUIZ ALÉATOIRE</span>
-                    </button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {isYearAdmin && (
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() =>
+                            postAction({
+                              action: "GENERATE_DAILY",
+                              forceShared: true,
+                            })
+                          }
+                          className="inline-flex items-center gap-1.5 border border-ink bg-paper px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:bg-pinned disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`h-3.5 w-3.5 ${busy ? "animate-spin" : ""}`}
+                          />
+                          <span>REGÉNÉRER LE QUIZ COMMUN (POUR TOUS)</span>
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => postAction({ action: "GENERATE_BONUS" })}
+                        className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-1.5 font-mono text-[11px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
+                      >
+                        <RefreshCw
+                          className={`h-3.5 w-3.5 ${busy ? "animate-spin" : ""}`}
+                        />
+                        <span>QUIZ BONUS D&apos;ENTRAÎNEMENT</span>
+                      </button>
+                    </div>
                   </div>
 
                   {/* Questions List */}

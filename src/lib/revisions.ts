@@ -65,9 +65,22 @@ let schemaEnsured = false;
 export async function ensureRevisionSchema() {
   if (schemaEnsured) return;
   try {
+    const sharedTableCheck = await prisma.$queryRaw<Array<{ reg: string | null }>>`
+      SELECT to_regclass('"SharedDailyQuiz"')::text AS reg
+    `;
+    const isFirstSharedSetup = !sharedTableCheck[0]?.reg;
+
     await prisma.$executeRawUnsafe(`
-      ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "revisionEnabled" BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "revisionEnabled" BOOLEAN NOT NULL DEFAULT true;
     `);
+    await prisma.$executeRawUnsafe(`
+      ALTER TABLE "User" ALTER COLUMN "revisionEnabled" SET DEFAULT true;
+    `);
+    if (isFirstSharedSetup) {
+      await prisma.$executeRawUnsafe(`
+        UPDATE "User" SET "revisionEnabled" = true WHERE "revisionEnabled" = false;
+      `);
+    }
     await prisma.$executeRawUnsafe(`
       ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "currentStreak" INTEGER NOT NULL DEFAULT 0;
     `);
@@ -103,16 +116,34 @@ export async function ensureRevisionSchema() {
       CREATE INDEX IF NOT EXISTS "DailyRevisionSession_userId_createdAt_idx"
       ON "DailyRevisionSession"("userId", "createdAt");
     `);
+    await prisma.$executeRawUnsafe(`
+      CREATE TABLE IF NOT EXISTS "SharedDailyQuiz" (
+        "dateKey" TEXT NOT NULL,
+        "ueId" TEXT,
+        "ueCode" TEXT,
+        "ueTitle" TEXT,
+        "questionsJson" TEXT NOT NULL,
+        "totalQuestions" INTEGER NOT NULL DEFAULT 0,
+        "generatedByAi" BOOLEAN NOT NULL DEFAULT false,
+        "generatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT "SharedDailyQuiz_pkey" PRIMARY KEY ("dateKey")
+      );
+    `);
     schemaEnsured = true;
   } catch (err) {
     console.warn("[Revisions] Schema check warning:", err);
   }
 }
 
+/**
+ * Daily quiz boundary shifts at 06:00 AM local time so nightly generation runs
+ * at 06:00 and late-night students (00:00–05:59) can still finish yesterday's quiz.
+ */
 export function getLocalDateKey(date = new Date()): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+  const shifted = new Date(date.getTime() - 6 * 60 * 60 * 1000);
+  const year = shifted.getFullYear();
+  const month = String(shifted.getMonth() + 1).padStart(2, "0");
+  const day = String(shifted.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
@@ -1679,4 +1710,240 @@ export function gradeRevisionAnswers(
   }
 
   return { score, results };
+}
+
+export interface SharedDailyQuizRecord {
+  dateKey: string;
+  ueId: string | null;
+  ueCode: string | null;
+  ueTitle: string | null;
+  questions: RevisionQuestion[];
+  totalQuestions: number;
+  generatedByAi: boolean;
+  generatedAt: string;
+}
+
+interface SharedDailyQuizRow {
+  dateKey: string;
+  ueId: string | null;
+  ueCode: string | null;
+  ueTitle: string | null;
+  questionsJson: string;
+  totalQuestions: number;
+  generatedByAi: boolean;
+  generatedAt: Date | string;
+}
+
+const globalForSharedQuiz = globalThis as typeof globalThis & {
+  __araSharedDailyQuizInFlight?: Map<
+    string,
+    Promise<SharedDailyQuizRecord | null>
+  >;
+};
+
+function getSharedQuizInFlightMap(): Map<
+  string,
+  Promise<SharedDailyQuizRecord | null>
+> {
+  if (!globalForSharedQuiz.__araSharedDailyQuizInFlight) {
+    globalForSharedQuiz.__araSharedDailyQuizInFlight = new Map();
+  }
+  return globalForSharedQuiz.__araSharedDailyQuizInFlight;
+}
+
+function parseSharedQuizRow(
+  row: SharedDailyQuizRow
+): SharedDailyQuizRecord | null {
+  try {
+    const parsed = JSON.parse(row.questionsJson) as RevisionQuestion[];
+    if (!Array.isArray(parsed) || parsed.length === 0) return null;
+    return {
+      dateKey: row.dateKey,
+      ueId: row.ueId,
+      ueCode: row.ueCode,
+      ueTitle: row.ueTitle,
+      questions: parsed,
+      totalQuestions: Number(row.totalQuestions || parsed.length),
+      generatedByAi: Boolean(row.generatedByAi),
+      generatedAt:
+        row.generatedAt instanceof Date
+          ? row.generatedAt.toISOString()
+          : String(row.generatedAt),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export async function hasSharedDailyQuizForToday(): Promise<boolean> {
+  await ensureRevisionSchema();
+  const dateKey = getLocalDateKey();
+  const rows = await prisma.$queryRaw<Array<{ dateKey: string }>>`
+    SELECT "dateKey" FROM "SharedDailyQuiz" WHERE "dateKey" = ${dateKey} LIMIT 1
+  `;
+  return rows.length > 0;
+}
+
+export async function getOrGenerateSharedDailyQuiz(options?: {
+  forceRegenerate?: boolean;
+  dateKey?: string;
+}): Promise<SharedDailyQuizRecord | null> {
+  await ensureRevisionSchema();
+  const dateKey = options?.dateKey || getLocalDateKey();
+  const forceRegenerate = Boolean(options?.forceRegenerate);
+
+  if (!forceRegenerate) {
+    const existingRows = await prisma.$queryRaw<SharedDailyQuizRow[]>`
+      SELECT "dateKey", "ueId", "ueCode", "ueTitle", "questionsJson",
+             "totalQuestions", "generatedByAi", "generatedAt"
+      FROM "SharedDailyQuiz"
+      WHERE "dateKey" = ${dateKey}
+      LIMIT 1
+    `;
+    const existing = existingRows[0]
+      ? parseSharedQuizRow(existingRows[0])
+      : null;
+
+    if (existing) {
+      const hasStaleCopyPaste = existing.questions.some((q) =>
+        isLowQualityExcerptQuestion(q.prompt, q.options)
+      );
+      const needsAiUpgrade =
+        !existing.generatedByAi && (await checkOllamaHealth()).online;
+
+      if (!hasStaleCopyPaste && !needsAiUpgrade) {
+        return existing;
+      }
+    }
+  }
+
+  const inFlight = getSharedQuizInFlightMap();
+  const lockKey = `${dateKey}:${forceRegenerate ? "force" : "auto"}`;
+  const running = inFlight.get(lockKey);
+  if (running) return running;
+
+  const task = (async (): Promise<SharedDailyQuizRecord | null> => {
+    try {
+      // 8 questions = 2 full rounds (QCU + QCM + QROC + FLASHCARD) across random courses of 1 random UE
+      const questions = await generateQuizQuestions({ count: 8 });
+      if (questions.length === 0) return null;
+
+      const ueId = questions[0]?.ueId || null;
+      const ueCode = questions[0]?.ueCode || null;
+      const ueTitle = questions[0]?.ueTitle || null;
+      const generatedByAi = questions.some((q) => Boolean(q.generatedByAi));
+      const questionsJson = JSON.stringify(questions);
+
+      await prisma.$executeRaw`
+        INSERT INTO "SharedDailyQuiz" (
+          "dateKey", "ueId", "ueCode", "ueTitle",
+          "questionsJson", "totalQuestions", "generatedByAi", "generatedAt"
+        )
+        VALUES (
+          ${dateKey}, ${ueId}, ${ueCode}, ${ueTitle},
+          ${questionsJson}, ${questions.length}, ${generatedByAi}, NOW()
+        )
+        ON CONFLICT ("dateKey") DO UPDATE SET
+          "ueId" = EXCLUDED."ueId",
+          "ueCode" = EXCLUDED."ueCode",
+          "ueTitle" = EXCLUDED."ueTitle",
+          "questionsJson" = EXCLUDED."questionsJson",
+          "totalQuestions" = EXCLUDED."totalQuestions",
+          "generatedByAi" = EXCLUDED."generatedByAi",
+          "generatedAt" = NOW()
+      `;
+
+      // Sync unstarted incomplete daily sessions for today so everyone shares this official quiz
+      await prisma.dailyRevisionSession.updateMany({
+        where: {
+          dateKey,
+          completed: false,
+          answersJson: "{}",
+        },
+        data: {
+          questionsJson,
+          totalQuestions: questions.length,
+        },
+      });
+
+      const savedRows = await prisma.$queryRaw<SharedDailyQuizRow[]>`
+        SELECT "dateKey", "ueId", "ueCode", "ueTitle", "questionsJson",
+               "totalQuestions", "generatedByAi", "generatedAt"
+        FROM "SharedDailyQuiz"
+        WHERE "dateKey" = ${dateKey}
+        LIMIT 1
+      `;
+
+      return savedRows[0]
+        ? parseSharedQuizRow(savedRows[0])
+        : {
+            dateKey,
+            ueId,
+            ueCode,
+            ueTitle,
+            questions,
+            totalQuestions: questions.length,
+            generatedByAi,
+            generatedAt: new Date().toISOString(),
+          };
+    } catch (err) {
+      console.error("[SharedDailyQuiz] Generation error:", err);
+      return null;
+    } finally {
+      inFlight.delete(lockKey);
+    }
+  })();
+
+  inFlight.set(lockKey, task);
+  return task;
+}
+
+export async function runScheduled6AmDailyQuizGeneration(options?: {
+  force?: boolean;
+}): Promise<{
+  dateKey: string;
+  ueCode: string | null;
+  questionCount: number;
+  generatedByAi: boolean;
+  preparedSessions: number;
+} | null> {
+  const shared = await getOrGenerateSharedDailyQuiz({
+    forceRegenerate: options?.force,
+  });
+  if (!shared) return null;
+
+  const questionsJson = JSON.stringify(shared.questions);
+  const [enabledUsers, existingSessions] = await Promise.all([
+    prisma.user.findMany({
+      where: { revisionEnabled: true },
+      select: { id: true },
+    }),
+    prisma.dailyRevisionSession.findMany({
+      where: { dateKey: shared.dateKey },
+      select: { userId: true },
+    }),
+  ]);
+
+  const existingSet = new Set(existingSessions.map((s) => s.userId));
+  const missingUsers = enabledUsers.filter((u) => !existingSet.has(u.id));
+
+  if (missingUsers.length > 0) {
+    await prisma.dailyRevisionSession.createMany({
+      data: missingUsers.map((u) => ({
+        userId: u.id,
+        dateKey: shared.dateKey,
+        questionsJson,
+        totalQuestions: shared.questions.length,
+      })),
+      skipDuplicates: true,
+    });
+  }
+
+  return {
+    dateKey: shared.dateKey,
+    ueCode: shared.ueCode,
+    questionCount: shared.questions.length,
+    generatedByAi: shared.generatedByAi,
+    preparedSessions: missingUsers.length,
+  };
 }
