@@ -2,13 +2,19 @@ import http from "node:http";
 import next from "next";
 import { Server as SocketIOServer } from "socket.io";
 import { prisma } from "./src/lib/prisma";
+import { getParisHour } from "./src/lib/ollama";
 import {
+  getLocalDateKey,
   hasSharedDailyQuizForToday,
   runScheduled6AmDailyQuizGeneration,
 } from "./src/lib/revisions";
 import type { WhiteboardCollaborator } from "./src/lib/socket-types";
 import { runNightlyOffPeakStudyGeneration } from "./src/lib/studio";
 import { getUserAccountMeta } from "./src/lib/user-schema";
+
+if (!process.env.TZ) {
+  process.env.TZ = "Europe/Paris";
+}
 
 const dev = process.env.NODE_ENV !== "production";
 const hostname = process.env.HOSTNAME || "0.0.0.0";
@@ -18,6 +24,7 @@ const globalForSocket = globalThis as typeof globalThis & {
   __araSocketIo?: SocketIOServer;
   __araNightlyWorkerStarted?: boolean;
   __araDailyQuizSchedulerStarted?: boolean;
+  __araLastForced6AmDateKey?: string;
 };
 
 const app = next({ dev, hostname, port });
@@ -252,8 +259,9 @@ app.prepare().then(() => {
 
     if (!globalForSocket.__araNightlyWorkerStarted) {
       globalForSocket.__araNightlyWorkerStarted = true;
-      setInterval(() => {
-        const hour = new Date().getHours();
+
+      const checkOffPeakGeneration = () => {
+        const hour = getParisHour();
         if (hour >= 0 && hour < 7) {
           void runNightlyOffPeakStudyGeneration({ mode: "NIGHTLY_AUTO" })
             .then((res) => {
@@ -262,7 +270,7 @@ app.prepare().then(() => {
                 (res.indexedCount > 0 || res.generatedCount > 0)
               ) {
                 console.log(
-                  `[NightlyStudio] Heures creuses : ${res.indexedCount} PDF indexé(s), ${res.generatedCount} ressource(s) IA générée(s).`
+                  `[NightlyStudio] Heures creuses (Europe/Paris) : ${res.indexedCount} PDF indexé(s), ${res.generatedCount} ressource(s) IA générée(s).`
                 );
               }
             })
@@ -270,7 +278,15 @@ app.prepare().then(() => {
               console.warn("[NightlyStudio] Background tick warning:", err);
             });
         }
-      }, 30 * 60 * 1000);
+      };
+
+      setTimeout(() => {
+        checkOffPeakGeneration();
+      }, 20000);
+
+      setInterval(() => {
+        checkOffPeakGeneration();
+      }, 5 * 60 * 1000);
     }
 
     if (!globalForSocket.__araDailyQuizSchedulerStarted) {
@@ -278,11 +294,20 @@ app.prepare().then(() => {
 
       const ensureDailyQuizReady = async () => {
         try {
-          const hour = new Date().getHours();
+          const hour = getParisHour();
+          const todayKey = getLocalDateKey();
           const hasToday = await hasSharedDailyQuizForToday();
-          if (hour === 6 || !hasToday) {
-            const res = await runScheduled6AmDailyQuizGeneration();
-            if (res && (!hasToday || res.preparedSessions > 0)) {
+          const forceAt6Am =
+            hour === 6 && globalForSocket.__araLastForced6AmDateKey !== todayKey;
+
+          if (forceAt6Am || !hasToday) {
+            if (forceAt6Am) {
+              globalForSocket.__araLastForced6AmDateKey = todayKey;
+            }
+            const res = await runScheduled6AmDailyQuizGeneration({
+              force: forceAt6Am,
+            });
+            if (res) {
               console.log(
                 `[DailyQuiz] Quiz journalier commun (${res.dateKey}, ${res.ueCode || "UE"}) prêt : ${res.questionCount} questions, ${res.preparedSessions} séance(s) préparée(s).`
               );

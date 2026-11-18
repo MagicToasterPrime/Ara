@@ -8,7 +8,9 @@ import {
   formatVectorLiteral,
   generateEmbedding,
   getOllamaConfig,
+  getParisHour,
   storeDocumentChunksUnindexed,
+  withOllamaLock,
 } from "@/lib/ollama";
 import { extractPdfPages } from "@/lib/pdf";
 import {
@@ -750,17 +752,6 @@ export function compileSwissEditorialSvg(params: {
   <rect x="12" y="${height - 42}" width="${width - 24}" height="30" fill="#F4EFE6" stroke="#DCDAD3" stroke-width="1" />
   <text x="26" y="${height - 23}" font-family="monospace" font-size="9.5" fill="#2B547E">${escapeXml(sourcesText.slice(0, 120))}</text>
 </svg>`;
-}
-
-let ollamaQueueTail: Promise<void> = Promise.resolve();
-
-function withOllamaLock<T>(task: () => Promise<T>): Promise<T> {
-  const run = ollamaQueueTail.then(task, task);
-  ollamaQueueTail = run.then(
-    () => undefined,
-    () => undefined
-  );
-  return run;
 }
 
 async function callOllamaJson<T>(
@@ -1922,21 +1913,72 @@ ${segContext}`,
   };
 }
 
+export function isStalePublicArtifact(
+  kind: StudioArtifactKind | string,
+  contentJson: string
+): boolean {
+  try {
+    const parsed = JSON.parse(contentJson) as Partial<StudioArtifactContent> & {
+      questions?: RevisionQuestion[];
+      cards?: FlashcardItem[];
+      sections?: SummarySection[];
+    };
+    if (kind === "QUIZ") {
+      const qs = Array.isArray(parsed.questions) ? parsed.questions : [];
+      if (qs.length === 0) return true;
+      const anyAi = qs.some((q) => Boolean(q.generatedByAi));
+      if (!anyAi) return true;
+      return qs.some((q) => isLowQualityExcerptQuestion(q.prompt || "", q.options));
+    }
+    if (kind === "FLASHCARDS") {
+      const cards = Array.isArray(parsed.cards) ? parsed.cards : [];
+      if (cards.length === 0) return true;
+      return cards.some((c) =>
+        /notion clé\s*\(|quel élément faut-il maîtriser/i.test(c.front || "")
+      );
+    }
+    if (kind === "SUMMARY") {
+      const secs = Array.isArray(parsed.sections) ? parsed.sections : [];
+      if (secs.length === 0) return true;
+      return !secs.some(
+        (s) => Array.isArray(s.subsections) && s.subsections.length > 0
+      );
+    }
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+async function findValidPublicArtifactId(
+  documentId: string,
+  kind: StudioArtifactKind
+): Promise<{ validId: string | null; staleId: string | null }> {
+  const rows = await prisma.studyArtifact.findMany({
+    where: {
+      documentId,
+      kind,
+      isPublic: true,
+    },
+    orderBy: { createdAt: "desc" },
+    select: { id: true, contentJson: true },
+  });
+  for (const r of rows) {
+    if (!isStalePublicArtifact(kind, r.contentJson)) {
+      return { validId: r.id, staleId: null };
+    }
+  }
+  return { validId: null, staleId: rows[0]?.id || null };
+}
+
 export async function hasExistingPublicArtifact(
   documentId: string | null | undefined,
   kind: StudioArtifactKind
 ): Promise<boolean> {
   if (!documentId) return false;
   await ensureStudioSchema();
-  const existing = await prisma.studyArtifact.findFirst({
-    where: {
-      documentId,
-      kind,
-      isPublic: true,
-    },
-    select: { id: true },
-  });
-  return Boolean(existing);
+  const { validId } = await findValidPublicArtifactId(documentId, kind);
+  return Boolean(validId);
 }
 
 export interface IndexingQueueItem {
@@ -2104,6 +2146,7 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
       select: {
         documentId: true,
         kind: true,
+        contentJson: true,
       },
     }),
   ]);
@@ -2121,7 +2164,7 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
 
   const publicSet = new Set<string>();
   for (const row of publicArtifactRows) {
-    if (row.documentId) {
+    if (row.documentId && !isStalePublicArtifact(row.kind, row.contentJson)) {
       publicSet.add(`${row.documentId}:${row.kind}`);
     }
   }
@@ -2248,7 +2291,7 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
       totalTasksAll > 0 ? Math.round((doneTasksAll / totalTasksAll) * 100) : 100;
   }
 
-  const nowHour = new Date().getHours();
+  const nowHour = getParisHour();
   const nextNightlyWindowLabel =
     nowHour >= 0 && nowHour < 7
       ? "FENÊTRE HEURES CREUSES ACTIVE (00H00–07H00)"
@@ -2292,7 +2335,7 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
 }
 
 function isWithinOffPeakWindow(): boolean {
-  const h = new Date().getHours();
+  const h = getParisHour();
   return h >= 0 && h < 7;
 }
 
@@ -2489,70 +2532,90 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
         for (const spec of TARGET_NIGHTLY_KINDS) {
           if (shouldAbort() || generatedCount >= maxItems) break;
 
-          const alreadyPublic = await hasExistingPublicArtifact(
+          const { validId, staleId } = await findValidPublicArtifactId(
             doc.id,
             spec.kind
           );
-          if (alreadyPublic) {
+          if (validId) {
             continue;
           }
 
-          const chunks = await gatherStudioSourceChunks({
-            ueId: doc.chapter.ueId,
-            documentIds: [doc.id],
-            fullDocument: true,
-          });
-          if (chunks.length === 0) {
-            state.completedItemsInRun += 1;
-            continue;
-          }
-
-          state.currentPhase = "AI_GENERATION";
-          state.currentDocumentId = doc.id;
-          state.currentAiKind = spec.kind;
-          state.currentTaskLabel = `${spec.label} (95%) : ${doc.title}`;
-          state.currentItemProgressPercent = 5;
-          state.currentItemStartedAtMs = Date.now();
-
-          const t0 = Date.now();
-          const generated = await generateStudioArtifact({
-            kind: spec.kind,
-            chunks,
-            isPublic: true,
-            title: `${spec.label} — ${doc.title}`,
-            shouldStop: shouldAbort,
-            onProgress: (pct, detail) => {
-              state.currentItemProgressPercent = Math.max(
-                state.currentItemProgressPercent,
-                Math.min(99, pct)
-              );
-              state.currentTaskLabel = `${detail} — ${doc.title}`;
-            },
-          });
-          const elapsedMs = Date.now() - t0;
-
-          if (generated.usedAi) {
-            if (elapsedMs > 2000 && elapsedMs < 900000) {
-              state.avgMsPerAiArtifact = Math.round(
-                state.avgMsPerAiArtifact * 0.7 + elapsedMs * 0.3
-              );
+          try {
+            const chunks = await gatherStudioSourceChunks({
+              ueId: doc.chapter.ueId,
+              documentIds: [doc.id],
+              fullDocument: true,
+            });
+            if (chunks.length === 0) {
+              state.completedItemsInRun += 1;
+              continue;
             }
 
-            await prisma.studyArtifact.create({
-              data: {
-                userId: doc.authorId,
-                ueId: doc.chapter.ueId,
-                documentId: doc.id,
-                kind: spec.kind,
-                title: generated.title,
-                contentJson: JSON.stringify(generated.content),
-                isPublic: true,
+            state.currentPhase = "AI_GENERATION";
+            state.currentDocumentId = doc.id;
+            state.currentAiKind = spec.kind;
+            state.currentTaskLabel = `${spec.label} (95%) : ${doc.title}`;
+            state.currentItemProgressPercent = 5;
+            state.currentItemStartedAtMs = Date.now();
+
+            const t0 = Date.now();
+            const generated = await generateStudioArtifact({
+              kind: spec.kind,
+              chunks,
+              isPublic: true,
+              title: `${spec.label} — ${doc.title}`,
+              shouldStop: shouldAbort,
+              onProgress: (pct, detail) => {
+                state.currentItemProgressPercent = Math.max(
+                  state.currentItemProgressPercent,
+                  Math.min(99, pct)
+                );
+                state.currentTaskLabel = `${detail} — ${doc.title}`;
               },
             });
-            generatedCount += 1;
-          }
+            const elapsedMs = Date.now() - t0;
 
-          state.completedItemsInRun += 1;
+            if (generated.usedAi) {
+              if (elapsedMs > 2000 && elapsedMs < 900000) {
+                state.avgMsPerAiArtifact = Math.round(
+                  state.avgMsPerAiArtifact * 0.7 + elapsedMs * 0.3
+                );
+              }
+
+              if (staleId) {
+                await prisma.studyArtifact.update({
+                  where: { id: staleId },
+                  data: {
+                    title: generated.title,
+                    contentJson: JSON.stringify(generated.content),
+                    isPublic: true,
+                    createdAt: new Date(),
+                  },
+                });
+              } else {
+                await prisma.studyArtifact.create({
+                  data: {
+                    userId: doc.authorId,
+                    ueId: doc.chapter.ueId,
+                    documentId: doc.id,
+                    kind: spec.kind,
+                    title: generated.title,
+                    contentJson: JSON.stringify(generated.content),
+                    isPublic: true,
+                  },
+                });
+              }
+              generatedCount += 1;
+            }
+
+            state.completedItemsInRun += 1;
+          } catch (err) {
+            console.error(
+              `[NightlyAI] Failed for doc ${doc.id} (${spec.kind}):`,
+              err
+            );
+            state.completedItemsInRun += 1;
+          }
         }
       }
     }

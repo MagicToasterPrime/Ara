@@ -91,6 +91,11 @@ main() {
     exit 1
   fi
 
+  # Alignement horloge système sur Europe/Paris (heures creuses 00h–07h & Quiz 06h00)
+  if command -v timedatectl &>/dev/null; then
+    timedatectl set-timezone Europe/Paris 2>/dev/null || true
+  fi
+
   # Bascule automatique vers qwen2.5:3b (plus rapide et mieux calibré sur CPU)
   if grep -qE '^OLLAMA_MODEL="?qwen2\.5:7b"?$' "${APP_DIR}/.env"; then
     sed -i 's|^OLLAMA_MODEL=.*|OLLAMA_MODEL="qwen2.5:3b"|' "${APP_DIR}/.env"

@@ -1,6 +1,10 @@
 import crypto from "node:crypto";
 import { prisma } from "@/lib/prisma";
-import { checkOllamaHealth, getOllamaConfig } from "@/lib/ollama";
+import {
+  checkOllamaHealth,
+  getOllamaConfig,
+  withOllamaLock,
+} from "@/lib/ollama";
 import { getAllUeMetaMap } from "@/lib/ue-meta";
 import { getUserAccountMeta } from "@/lib/user-schema";
 
@@ -136,15 +140,24 @@ export async function ensureRevisionSchema() {
 }
 
 /**
- * Daily quiz boundary shifts at 06:00 AM local time so nightly generation runs
+ * Daily quiz boundary shifts at 06:00 AM Europe/Paris time so nightly generation runs
  * at 06:00 and late-night students (00:00–05:59) can still finish yesterday's quiz.
  */
 export function getLocalDateKey(date = new Date()): string {
   const shifted = new Date(date.getTime() - 6 * 60 * 60 * 1000);
-  const year = shifted.getFullYear();
-  const month = String(shifted.getMonth() + 1).padStart(2, "0");
-  const day = String(shifted.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Europe/Paris",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).format(shifted);
+  } catch {
+    const year = shifted.getFullYear();
+    const month = String(shifted.getMonth() + 1).padStart(2, "0");
+    const day = String(shifted.getDate()).padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
 }
 
 export function getYesterdayDateKey(): string {
@@ -1205,27 +1218,46 @@ async function tryOllamaQuizEnrichment(
   qcuChunk: SampledChunk,
   qcmChunk: SampledChunk,
   qrocChunk: SampledChunk,
-  flashcardChunk: SampledChunk
+  flashcardChunk: SampledChunk,
+  meta?: {
+    chapterTitle?: string;
+    freshnessSeed?: string;
+    avoidPrompts?: string[];
+  }
 ): Promise<{
   qcu?: Partial<RevisionQuestion>;
   qcm?: Partial<RevisionQuestion>;
   qroc?: Partial<RevisionQuestion>;
   flashcard?: Partial<RevisionQuestion>;
 } | null> {
-  const health = await checkOllamaHealth();
-  if (!health.online) return null;
+  return withOllamaLock(async () => {
+    const health = await checkOllamaHealth();
+    if (!health.online) return null;
 
-  const { host, model } = getOllamaConfig();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 90000);
+    const { host, model } = getOllamaConfig();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 90000);
 
-  const ex1 = selectHighValueText(qcuChunk.content, 520);
-  const ex2 = selectHighValueText(qcmChunk.content, 520);
-  const ex3 = selectHighValueText(qrocChunk.content, 520);
-  const ex4 = selectHighValueText(flashcardChunk.content, 520);
+    const ex1 = selectHighValueText(qcuChunk.content, 520);
+    const ex2 = selectHighValueText(qcmChunk.content, 520);
+    const ex3 = selectHighValueText(qrocChunk.content, 520);
+    const ex4 = selectHighValueText(flashcardChunk.content, 520);
 
-  const prompt = `Tu es un générateur de révisions de niveau NotebookLM pour étudiants vétérinaires.
-Génère strictement un objet JSON valide avec 4 exercices basés sur les VALEURS, NOTIONS, DÉFINITIONS et MÉCANISMES extraits de ces 4 cours.
+    const chapterFocus = meta?.chapterTitle
+      ? `CHAPITRE CIBLÉ : « ${meta.chapterTitle} » (${qcuChunk.ueCode}).\n`
+      : "";
+    const freshnessBlock = meta?.freshnessSeed
+      ? `CONSIGNE DE FRAÎCHEUR (${meta.freshnessSeed}) : Crée des questions TOUTES NEUVES et originales sous un angle différent.\n`
+      : "";
+    const avoidBlock =
+      meta?.avoidPrompts && meta.avoidPrompts.length > 0
+        ? `NE RÉPÈTE PAS ces intitulés déjà générés :\n- ${meta.avoidPrompts
+            .slice(-6)
+            .join("\n- ")}\n`
+        : "";
+
+    const prompt = `Tu es un générateur de révisions de niveau NotebookLM pour étudiants vétérinaires.
+${chapterFocus}${freshnessBlock}${avoidBlock}Génère strictement un objet JSON valide avec 4 exercices TOUT NEUFS basés sur les VALEURS, NOTIONS, DÉFINITIONS et MÉCANISMES extraits de ces 4 passages du chapitre.
 
 RÈGLES ABSOLUES :
 1. NE JAMAIS recopier une phrase du polycopié en option de réponse ou demander « quelle affirmation figure dans le cours ».
@@ -1273,167 +1305,171 @@ Réponds STRICTEMENT en JSON :
   }
 }`;
 
-  try {
-    const res = await fetch(`${host}/api/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        prompt,
-        format: "json",
-        stream: false,
-        options: {
-          temperature: 0.25,
-          num_ctx: 4096,
-          num_predict: 1600,
-        },
-      }),
-      signal: controller.signal,
-    });
+    try {
+      const res = await fetch(`${host}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          prompt,
+          format: "json",
+          stream: false,
+          options: {
+            temperature: 0.35,
+            num_ctx: 4096,
+            num_predict: 1600,
+          },
+        }),
+        signal: controller.signal,
+      });
 
-    if (!res.ok) return null;
-    const data = (await res.json()) as { response?: string };
-    if (!data.response) return null;
+      if (!res.ok) return null;
+      const data = (await res.json()) as { response?: string };
+      if (!data.response) return null;
 
-    const parsed = parseOllamaJsonWithRecovery<{
-      qcu?: {
-        prompt?: string;
-        options?: string[];
-        correctIndices?: number[];
-        explanation?: string;
-      };
-      qcm?: {
-        prompt?: string;
-        options?: string[];
-        correctIndices?: number[];
-        explanation?: string;
-      };
-      qroc?: {
-        prompt?: string;
-        correctAnswer?: string;
-        acceptedKeywords?: string[];
-        explanation?: string;
-      };
-      flashcard?: {
-        prompt?: string;
-        flashcardBack?: string;
-        explanation?: string;
-      };
-    }>(data.response);
+      const parsed = parseOllamaJsonWithRecovery<{
+        qcu?: {
+          prompt?: string;
+          options?: string[];
+          correctIndices?: number[];
+          explanation?: string;
+        };
+        qcm?: {
+          prompt?: string;
+          options?: string[];
+          correctIndices?: number[];
+          explanation?: string;
+        };
+        qroc?: {
+          prompt?: string;
+          correctAnswer?: string;
+          acceptedKeywords?: string[];
+          explanation?: string;
+        };
+        flashcard?: {
+          prompt?: string;
+          flashcardBack?: string;
+          explanation?: string;
+        };
+      }>(data.response);
 
-    if (!parsed) return null;
+      if (!parsed) return null;
 
-    const result: {
-      qcu?: Partial<RevisionQuestion>;
-      qcm?: Partial<RevisionQuestion>;
-      qroc?: Partial<RevisionQuestion>;
-      flashcard?: Partial<RevisionQuestion>;
-    } = {};
+      const result: {
+        qcu?: Partial<RevisionQuestion>;
+        qcm?: Partial<RevisionQuestion>;
+        qroc?: Partial<RevisionQuestion>;
+        flashcard?: Partial<RevisionQuestion>;
+      } = {};
 
-    if (
-      parsed.qcu?.prompt &&
-      Array.isArray(parsed.qcu.options) &&
-      parsed.qcu.options.length === 4 &&
-      Array.isArray(parsed.qcu.correctIndices) &&
-      parsed.qcu.correctIndices.length >= 1 &&
-      parsed.qcu.correctIndices[0] >= 0 &&
-      parsed.qcu.correctIndices[0] < 4 &&
-      !isLowQualityExcerptQuestion(parsed.qcu.prompt, parsed.qcu.options)
-    ) {
-      const shuffledQcu = shuffleOptionsWithIndices(
-        parsed.qcu.options.map((o) => String(o).trim()),
-        [parsed.qcu.correctIndices[0]]
-      );
-      result.qcu = {
-        prompt: parsed.qcu.prompt.trim(),
-        options: shuffledQcu.options,
-        correctIndices: shuffledQcu.correctIndices,
-        explanation: (parsed.qcu.explanation || "").trim(),
-        generatedByAi: true,
-      };
-    }
-
-    if (
-      parsed.qcm?.prompt &&
-      Array.isArray(parsed.qcm.options) &&
-      parsed.qcm.options.length === 4 &&
-      Array.isArray(parsed.qcm.correctIndices) &&
-      !isLowQualityExcerptQuestion(parsed.qcm.prompt, parsed.qcm.options)
-    ) {
-      const validIndices = Array.from(
-        new Set(
-          parsed.qcm.correctIndices.filter(
-            (i) => typeof i === "number" && i >= 0 && i < 4
-          )
-        )
-      ).sort((a, b) => a - b);
-
-      if (validIndices.length >= 2) {
-        const shuffledQcm = shuffleOptionsWithIndices(
-          parsed.qcm.options.map((o) => String(o).trim()),
-          validIndices
+      if (
+        parsed.qcu?.prompt &&
+        Array.isArray(parsed.qcu.options) &&
+        parsed.qcu.options.length === 4 &&
+        Array.isArray(parsed.qcu.correctIndices) &&
+        parsed.qcu.correctIndices.length >= 1 &&
+        parsed.qcu.correctIndices[0] >= 0 &&
+        parsed.qcu.correctIndices[0] < 4 &&
+        !isLowQualityExcerptQuestion(parsed.qcu.prompt, parsed.qcu.options)
+      ) {
+        const shuffledQcu = shuffleOptionsWithIndices(
+          parsed.qcu.options.map((o) => String(o).trim()),
+          [parsed.qcu.correctIndices[0]]
         );
-        result.qcm = {
-          prompt: parsed.qcm.prompt.trim(),
-          options: shuffledQcm.options,
-          correctIndices: shuffledQcm.correctIndices,
-          explanation: (parsed.qcm.explanation || "").trim(),
+        result.qcu = {
+          prompt: parsed.qcu.prompt.trim(),
+          options: shuffledQcu.options,
+          correctIndices: shuffledQcu.correctIndices,
+          explanation: (parsed.qcu.explanation || "").trim(),
           generatedByAi: true,
         };
       }
+
+      if (
+        parsed.qcm?.prompt &&
+        Array.isArray(parsed.qcm.options) &&
+        parsed.qcm.options.length === 4 &&
+        Array.isArray(parsed.qcm.correctIndices) &&
+        !isLowQualityExcerptQuestion(parsed.qcm.prompt, parsed.qcm.options)
+      ) {
+        const validIndices = Array.from(
+          new Set(
+            parsed.qcm.correctIndices.filter(
+              (i) => typeof i === "number" && i >= 0 && i < 4
+            )
+          )
+        ).sort((a, b) => a - b);
+
+        if (validIndices.length >= 2) {
+          const shuffledQcm = shuffleOptionsWithIndices(
+            parsed.qcm.options.map((o) => String(o).trim()),
+            validIndices
+          );
+          result.qcm = {
+            prompt: parsed.qcm.prompt.trim(),
+            options: shuffledQcm.options,
+            correctIndices: shuffledQcm.correctIndices,
+            explanation: (parsed.qcm.explanation || "").trim(),
+            generatedByAi: true,
+          };
+        }
+      }
+
+      if (
+        parsed.qroc?.prompt &&
+        typeof parsed.qroc.correctAnswer === "string" &&
+        parsed.qroc.correctAnswer.trim().length > 0 &&
+        !isLowQualityExcerptQuestion(parsed.qroc.prompt)
+      ) {
+        const mainAnswer = parsed.qroc.correctAnswer.trim();
+        const rawKeywords = Array.isArray(parsed.qroc.acceptedKeywords)
+          ? parsed.qroc.acceptedKeywords
+              .map((k) => String(k).trim())
+              .filter((k) => k.length > 0)
+          : [];
+        const keywordSet = Array.from(new Set([mainAnswer, ...rawKeywords]));
+
+        result.qroc = {
+          prompt: parsed.qroc.prompt.trim(),
+          correctAnswer: mainAnswer,
+          acceptedKeywords: keywordSet,
+          explanation: (parsed.qroc.explanation || "").trim(),
+          generatedByAi: true,
+        };
+      }
+
+      if (
+        parsed.flashcard?.prompt &&
+        typeof parsed.flashcard.flashcardBack === "string" &&
+        parsed.flashcard.flashcardBack.trim().length > 0 &&
+        !isLowQualityExcerptQuestion(parsed.flashcard.prompt)
+      ) {
+        result.flashcard = {
+          prompt: parsed.flashcard.prompt.trim(),
+          flashcardBack: parsed.flashcard.flashcardBack.trim(),
+          explanation: (parsed.flashcard.explanation || "").trim(),
+          generatedByAi: true,
+        };
+      }
+
+      return result;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
     }
-
-    if (
-      parsed.qroc?.prompt &&
-      typeof parsed.qroc.correctAnswer === "string" &&
-      parsed.qroc.correctAnswer.trim().length > 0 &&
-      !isLowQualityExcerptQuestion(parsed.qroc.prompt)
-    ) {
-      const mainAnswer = parsed.qroc.correctAnswer.trim();
-      const rawKeywords = Array.isArray(parsed.qroc.acceptedKeywords)
-        ? parsed.qroc.acceptedKeywords
-            .map((k) => String(k).trim())
-            .filter((k) => k.length > 0)
-        : [];
-      const keywordSet = Array.from(new Set([mainAnswer, ...rawKeywords]));
-
-      result.qroc = {
-        prompt: parsed.qroc.prompt.trim(),
-        correctAnswer: mainAnswer,
-        acceptedKeywords: keywordSet,
-        explanation: (parsed.qroc.explanation || "").trim(),
-        generatedByAi: true,
-      };
-    }
-
-    if (
-      parsed.flashcard?.prompt &&
-      typeof parsed.flashcard.flashcardBack === "string" &&
-      parsed.flashcard.flashcardBack.trim().length > 0 &&
-      !isLowQualityExcerptQuestion(parsed.flashcard.prompt)
-    ) {
-      result.flashcard = {
-        prompt: parsed.flashcard.prompt.trim(),
-        flashcardBack: parsed.flashcard.flashcardBack.trim(),
-        explanation: (parsed.flashcard.explanation || "").trim(),
-        generatedByAi: true,
-      };
-    }
-
-    return result;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+  });
 }
 
 export async function generateQuizQuestions(options?: {
   userId?: string;
   ueId?: string;
   count?: number;
+  excludeUeId?: string | null;
+  freshnessSeed?: string;
 }): Promise<RevisionQuestion[]> {
-  const requestedCount = Math.max(4, Math.min(20, options?.count || 4));
+  const requestedCount = Math.max(4, Math.min(20, options?.count || 20));
+  const batchCount = Math.ceil(requestedCount / 4);
 
   let targetUeId = options?.ueId?.trim() || "";
 
@@ -1476,11 +1512,18 @@ export async function generateQuizQuestions(options?: {
       }
     }
 
+    if (options?.excludeUeId) {
+      const rotated = candidateUeIds.filter((id) => id !== options.excludeUeId);
+      if (rotated.length > 0) {
+        candidateUeIds = rotated;
+      }
+    }
+
     targetUeId =
       candidateUeIds[Math.floor(Math.random() * candidateUeIds.length)];
   }
 
-  // Pick random chunks distributed evenly across randomly shuffled courses inside the chosen UE
+  // Group all chunks by chapter inside the randomly selected UE
   const chunkRefs = await prisma.documentChunk.findMany({
     where: {
       document: {
@@ -1489,42 +1532,75 @@ export async function generateQuizQuestions(options?: {
         },
       },
     },
-    select: { id: true, documentId: true },
+    select: {
+      id: true,
+      documentId: true,
+      document: { select: { chapterId: true } },
+    },
   });
 
   if (chunkRefs.length === 0) {
     return [];
   }
 
-  const byDoc = new Map<string, string[]>();
+  const refsByChapter = new Map<
+    string,
+    Array<{ id: string; documentId: string }>
+  >();
   for (const ref of chunkRefs) {
-    const existing = byDoc.get(ref.documentId);
-    if (existing) existing.push(ref.id);
-    else byDoc.set(ref.documentId, [ref.id]);
+    const cid = ref.document.chapterId;
+    const arr = refsByChapter.get(cid) || [];
+    arr.push({ id: ref.id, documentId: ref.documentId });
+    refsByChapter.set(cid, arr);
   }
 
-  const shuffledDocQueues = shuffle(
-    Array.from(byDoc.values()).map((ids) => shuffle(ids))
-  );
+  // Pick up to `batchCount` (default 5) random distinct chapters inside the UE
+  const shuffledChapterIds = shuffle(Array.from(refsByChapter.keys()));
+  const selectedChapterSlots: string[] = [];
+  for (let slot = 0; slot < batchCount; slot += 1) {
+    selectedChapterSlots.push(
+      shuffledChapterIds[slot % shuffledChapterIds.length]
+    );
+  }
 
-  const pickedIds: string[] = [];
-  const maxSample = 48;
-  let depth = 0;
-  while (pickedIds.length < maxSample) {
-    let added = false;
-    for (const queue of shuffledDocQueues) {
-      if (depth < queue.length) {
-        pickedIds.push(queue[depth]);
-        added = true;
-        if (pickedIds.length >= maxSample) break;
-      }
+  // Sample fresh chunks per chapter slot (spread across different documents in each chapter)
+  const pickedIdSet = new Set<string>();
+  const slotPickedIds: string[][] = [];
+
+  for (const chapterId of selectedChapterSlots) {
+    const refs = shuffle(refsByChapter.get(chapterId) || []);
+    const freshRefs = refs.filter((r) => !pickedIdSet.has(r.id));
+    const sourceRefs = freshRefs.length >= 4 ? freshRefs : refs;
+
+    const byDoc = new Map<string, string[]>();
+    for (const r of sourceRefs) {
+      const list = byDoc.get(r.documentId) || [];
+      list.push(r.id);
+      byDoc.set(r.documentId, list);
     }
-    if (!added) break;
-    depth += 1;
+
+    const docQueues = shuffle(Array.from(byDoc.values()));
+    const chosenForSlot: string[] = [];
+    let depth = 0;
+    while (chosenForSlot.length < 10) {
+      let added = false;
+      for (const q of docQueues) {
+        if (depth < q.length) {
+          chosenForSlot.push(q[depth]);
+          pickedIdSet.add(q[depth]);
+          added = true;
+          if (chosenForSlot.length >= 10) break;
+        }
+      }
+      if (!added) break;
+      depth += 1;
+    }
+    slotPickedIds.push(chosenForSlot);
   }
 
+  const allPickedIds = Array.from(new Set(slotPickedIds.flat()));
   const rawChunks = await prisma.documentChunk.findMany({
-    where: { id: { in: pickedIds } },
+    where: { id: { in: allPickedIds } },
     include: {
       document: {
         select: {
@@ -1549,11 +1625,11 @@ export async function generateQuizQuestions(options?: {
     return [];
   }
 
-  const mapped: SampledChunk[] = rawChunks
-    .filter((c) => c.content.trim().length >= 40)
-    .map((c) => ({
+  const chunkMap = new Map<string, SampledChunk>();
+  for (const c of rawChunks) {
+    chunkMap.set(c.id, {
       id: c.id,
-      content: c.content.trim(),
+      content: c.content.trim() || c.document.title,
       pageNumber: c.pageNumber,
       documentId: c.document.id,
       documentTitle: c.document.title,
@@ -1563,82 +1639,63 @@ export async function generateQuizQuestions(options?: {
       ueId: c.document.chapter.ue.id,
       ueCode: c.document.chapter.ue.code,
       ueTitle: c.document.chapter.ue.title,
-    }));
-
-  const baseList: SampledChunk[] =
-    mapped.length > 0
-      ? mapped
-      : rawChunks.map((c) => ({
-          id: c.id,
-          content: c.content.trim() || c.document.title,
-          pageNumber: c.pageNumber,
-          documentId: c.document.id,
-          documentTitle: c.document.title,
-          fileName: c.document.fileName,
-          chapterId: c.document.chapter.id,
-          chapterTitle: c.document.chapter.title,
-          ueId: c.document.chapter.ue.id,
-          ueCode: c.document.chapter.ue.code,
-          ueTitle: c.document.chapter.ue.title,
-        }));
-
-  const pool = shuffle(baseList);
-
-  // Pick chunks from varied random documents & chapters within the selected UE
-  const selected: SampledChunk[] = [];
-  const usedDocs = new Set<string>();
-  const usedChapters = new Set<string>();
-
-  for (const item of pool) {
-    if (!usedDocs.has(item.documentId) && !usedChapters.has(item.chapterId)) {
-      usedDocs.add(item.documentId);
-      usedChapters.add(item.chapterId);
-      selected.push(item);
-    }
-    if (selected.length >= requestedCount) break;
-  }
-  if (selected.length < requestedCount) {
-    for (const item of pool) {
-      if (!usedDocs.has(item.documentId)) {
-        usedDocs.add(item.documentId);
-        selected.push(item);
-      }
-      if (selected.length >= requestedCount) break;
-    }
-  }
-  let fallbackCursor = 0;
-  while (selected.length < requestedCount) {
-    selected.push(pool[fallbackCursor % pool.length]);
-    fallbackCursor += 1;
+    });
   }
 
+  const allPool = shuffle(Array.from(chunkMap.values()));
   const questions: RevisionQuestion[] = [];
-  const batchCount = Math.ceil(requestedCount / 4);
+  const generatedPrompts: string[] = [];
+  const usedSlotChunkIds = new Set<string>();
 
   for (let b = 0; b < batchCount; b += 1) {
-    const c1 = selected[b * 4] || pool[0];
-    const c2 = selected[b * 4 + 1] || pool[1 % pool.length];
-    const c3 = selected[b * 4 + 2] || pool[2 % pool.length];
-    const c4 = selected[b * 4 + 3] || pool[3 % pool.length];
+    const slotChunksRaw = (slotPickedIds[b] || [])
+      .map((id) => chunkMap.get(id))
+      .filter((c): c is SampledChunk => Boolean(c));
 
-    const fallbackQcu = buildFallbackQCU(c1, pool);
-    const fallbackQcm = buildFallbackQCM(c2, pool);
+    const substantial = slotChunksRaw.filter(
+      (c) => c.content.length >= 40 && !usedSlotChunkIds.has(c.id)
+    );
+    const chapterPool =
+      substantial.length >= 4
+        ? substantial
+        : slotChunksRaw.length > 0
+        ? slotChunksRaw
+        : allPool;
+
+    const picked4: SampledChunk[] = [];
+    for (let k = 0; k < 4; k += 1) {
+      const ch = chapterPool[k % chapterPool.length];
+      picked4.push(ch);
+      usedSlotChunkIds.add(ch.id);
+    }
+
+    const [c1, c2, c3, c4] = picked4;
+    const slotChapterTitle = c1.chapterTitle;
+
+    const fallbackQcu = buildFallbackQCU(c1, allPool);
+    const fallbackQcm = buildFallbackQCM(c2, allPool);
     const fallbackQroc = buildFallbackQROC(c3);
     const fallbackFlashcard = buildFallbackFlashcard(c4);
 
-    const aiEnriched =
-      b < 4 ? await tryOllamaQuizEnrichment(c1, c2, c3, c4) : null;
+    const aiEnriched = await tryOllamaQuizEnrichment(c1, c2, c3, c4, {
+      chapterTitle: slotChapterTitle,
+      freshnessSeed: options?.freshnessSeed,
+      avoidPrompts: generatedPrompts,
+    });
 
-    questions.push(
+    const batchQuestions: RevisionQuestion[] = [
       aiEnriched?.qcu ? { ...fallbackQcu, ...aiEnriched.qcu } : fallbackQcu,
       aiEnriched?.qcm ? { ...fallbackQcm, ...aiEnriched.qcm } : fallbackQcm,
-      aiEnriched?.qroc
-        ? { ...fallbackQroc, ...aiEnriched.qroc }
-        : fallbackQroc,
+      aiEnriched?.qroc ? { ...fallbackQroc, ...aiEnriched.qroc } : fallbackQroc,
       aiEnriched?.flashcard
         ? { ...fallbackFlashcard, ...aiEnriched.flashcard }
-        : fallbackFlashcard
-    );
+        : fallbackFlashcard,
+    ];
+
+    for (const bq of batchQuestions) {
+      generatedPrompts.push(bq.prompt);
+      questions.push(bq);
+    }
   }
 
   return questions.slice(0, requestedCount);
@@ -1824,8 +1881,19 @@ export async function getOrGenerateSharedDailyQuiz(options?: {
 
   const task = (async (): Promise<SharedDailyQuizRecord | null> => {
     try {
-      // 8 questions = 2 full rounds (QCU + QCM + QROC + FLASHCARD) across random courses of 1 random UE
-      const questions = await generateQuizQuestions({ count: 8 });
+      // Avoid repeating yesterday's UE if >= 2 UEs have courses
+      const yKey = getYesterdayDateKey();
+      const yRows = await prisma.$queryRaw<Array<{ ueId: string | null }>>`
+        SELECT "ueId" FROM "SharedDailyQuiz" WHERE "dateKey" = ${yKey} LIMIT 1
+      `;
+      const yesterdayUeId = yRows[0]?.ueId || null;
+
+      // 20 questions = 5 random chapters inside 1 random UE (1 fresh 4-exercise quiz per chapter)
+      const questions = await generateQuizQuestions({
+        count: 20,
+        excludeUeId: yesterdayUeId,
+        freshnessSeed: `${dateKey}-${crypto.randomUUID().slice(0, 6)}`,
+      });
       if (questions.length === 0) return null;
 
       const ueId = questions[0]?.ueId || null;

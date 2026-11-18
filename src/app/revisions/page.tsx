@@ -520,16 +520,88 @@ export default function RevisionsPage() {
                     </div>
                   </div>
 
+                  {/* 5 Random Chapters Summary Strip */}
+                  {(() => {
+                    const chapters: Array<{
+                      title: string;
+                      count: number;
+                      slotIndex: number;
+                    }> = [];
+                    const map = new Map<
+                      string,
+                      { title: string; count: number; slotIndex: number }
+                    >();
+                    sessionData.questions.forEach((q, idx) => {
+                      const key = `${Math.floor(idx / 4)}:${q.chapterId || q.chapterTitle}`;
+                      const existing = map.get(key);
+                      if (existing) {
+                        existing.count += 1;
+                      } else {
+                        const entry = {
+                          title: q.chapterTitle,
+                          count: 1,
+                          slotIndex: chapters.length + 1,
+                        };
+                        map.set(key, entry);
+                        chapters.push(entry);
+                      }
+                    });
+                    return (
+                      <div className="border border-border bg-paper px-4 py-3">
+                        <p className="mb-2 font-mono text-[10px] font-semibold uppercase tracking-wider text-stone">
+                          {chapters.length} CHAPITRE
+                          {chapters.length > 1 ? "S" : ""} ALÉATOIRE
+                          {chapters.length > 1 ? "S" : ""} DE{" "}
+                          {sessionUe?.code || "L'UE"} (1 QUIZ TOUT NEUF PAR
+                          CHAPITRE) :
+                        </p>
+                        <div className="flex flex-wrap gap-1.5">
+                          {chapters.map((ch) => (
+                            <span
+                              key={`${ch.slotIndex}-${ch.title}`}
+                              className="border border-border bg-card px-2 py-1 font-mono text-[10px] text-ink"
+                            >
+                              <strong className="text-badge-text">
+                                {ch.slotIndex}.
+                              </strong>{" "}
+                              {ch.title} ({ch.count} Q)
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    );
+                  })()}
+
                   {/* Questions List */}
                   {sessionData.questions.map((q, qIdx) => {
                     const isGraded = sessionData.completed;
                     const isCorrect = gradingResults
                       ? gradingResults[q.id]
                       : undefined;
+                    const totalSlots = Math.max(
+                      1,
+                      Math.ceil(sessionData.questions.length / 4)
+                    );
+                    const chapterSlotNum = Math.floor(qIdx / 4) + 1;
+                    const isStartOfChapterQuiz = qIdx % 4 === 0;
 
                     return (
+                      <div key={q.id} className="space-y-3">
+                        {isStartOfChapterQuiz && (
+                          <div
+                            className="flex flex-wrap items-center justify-between gap-2 border border-border bg-paper px-4 py-2"
+                            style={{ borderLeft: "3px solid #3D6B99" }}
+                          >
+                            <span className="font-mono text-[11px] font-bold uppercase tracking-wider text-ink">
+                              QUIZ CHAPITRE {chapterSlotNum}/{totalSlots} ·{" "}
+                              {q.chapterTitle}
+                            </span>
+                            <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                              {q.ueCode} · QCU · QCM · QROC · FLASHCARD
+                            </span>
+                          </div>
+                        )}
                       <article
-                        key={q.id}
                         className={`ara-animate-in border bg-card p-5 ${
                           isGraded && isCorrect === true
                             ? "border-forest"
@@ -548,7 +620,7 @@ export default function RevisionsPage() {
                               {TYPE_LABELS[q.type]}
                             </span>
                             <span className="border border-border bg-paper px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-stone">
-                              {q.ueCode} · {q.chapterTitle}
+                              CH.{chapterSlotNum}/{totalSlots} · {q.chapterTitle}
                             </span>
                           </div>
 
@@ -842,6 +914,7 @@ export default function RevisionsPage() {
                           </div>
                         )}
                       </article>
+                      </div>
                     );
                   })}
 

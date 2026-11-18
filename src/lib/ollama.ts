@@ -10,6 +10,34 @@ export function getOllamaConfig() {
   };
 }
 
+export function getParisHour(date = new Date()): number {
+  try {
+    const formatted = new Intl.DateTimeFormat("en-GB", {
+      timeZone: "Europe/Paris",
+      hour: "2-digit",
+      hour12: false,
+    }).format(date);
+    const parsed = Number.parseInt(formatted, 10);
+    return Number.isFinite(parsed) ? parsed % 24 : date.getHours();
+  } catch {
+    return date.getHours();
+  }
+}
+
+const globalForOllamaLock = globalThis as typeof globalThis & {
+  __araOllamaQueueTail?: Promise<void>;
+};
+
+export function withOllamaLock<T>(task: () => Promise<T>): Promise<T> {
+  const tail = globalForOllamaLock.__araOllamaQueueTail || Promise.resolve();
+  const run = tail.then(task, task);
+  globalForOllamaLock.__araOllamaQueueTail = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
+
 export interface OllamaHealth {
   online: boolean;
   host: string;
