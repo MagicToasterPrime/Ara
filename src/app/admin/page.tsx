@@ -1,17 +1,22 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import {
   CheckCircle2,
   Clock,
   Database,
   HardDrive,
+  ListChecks,
+  Loader2,
   Pencil,
+  Play,
   Plus,
   RefreshCw,
   Server,
   ShieldAlert,
+  Sparkles,
+  Square,
   Trash2,
   UserCheck,
   UserX,
@@ -23,12 +28,25 @@ import {
   formatExamBadge,
   type ClassLevel,
 } from "@/lib/class-levels";
+import type { BackgroundQueueSnapshot, IndexingQueueItem } from "@/lib/studio";
 
 const ACCENT_COLORS = [
   { label: "AMBRE", hex: "#D99B26" },
   { label: "CARMIN", hex: "#C83E4D" },
   { label: "VERT FORÊT", hex: "#3B7A57" },
   { label: "BLEU ARDOISE", hex: "#3D6B99" },
+  { label: "TERRACOTTA", hex: "#C85A32" },
+  { label: "BORDEAUX", hex: "#8C2D41" },
+  { label: "INDIGO", hex: "#3F4E8C" },
+  { label: "BLEU CANARD", hex: "#1F7A8C" },
+  { label: "ÉMERAUDE", hex: "#2A8C6A" },
+  { label: "VERT SAUGE", hex: "#6B8E63" },
+  { label: "OCRE CUIVRÉ", hex: "#B87333" },
+  { label: "PRUNE", hex: "#6E3B7A" },
+  { label: "VIOLET COBALT", hex: "#5B4B8A" },
+  { label: "VIEUX ROSE", hex: "#B55D7A" },
+  { label: "BLEU NUIT", hex: "#243B55" },
+  { label: "ANTHRACITE", hex: "#4A4E54" },
 ];
 
 interface HealthData {
@@ -95,17 +113,68 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(2)} Mo`;
 }
 
+function formatEtaSeconds(totalSeconds: number): string {
+  const sec = Math.max(0, Math.round(totalSeconds));
+  if (sec < 60) return `${sec} s`;
+  const hours = Math.floor(sec / 3600);
+  const mins = Math.floor((sec % 3600) / 60);
+  const remSec = sec % 60;
+  if (hours > 0) {
+    return `${hours} h ${String(mins).padStart(2, "0")} min`;
+  }
+  return remSec > 0 ? `${mins} min ${remSec} s` : `${mins} min`;
+}
+
+interface IndexingChapterGroup {
+  chapterId: string;
+  ueCode: string;
+  chapterTitle: string;
+  docCount: number;
+  remainingChunks: number;
+  hasRunningDoc: boolean;
+}
+
+function groupIndexingByChapter(
+  items: IndexingQueueItem[]
+): IndexingChapterGroup[] {
+  const map = new Map<string, IndexingChapterGroup>();
+  for (const item of items) {
+    const remaining = Math.max(0, item.totalChunks - item.embeddedChunks);
+    const existing = map.get(item.chapterId);
+    if (existing) {
+      existing.docCount += 1;
+      existing.remainingChunks += remaining;
+      if (item.status === "RUNNING") {
+        existing.hasRunningDoc = true;
+      }
+    } else {
+      map.set(item.chapterId, {
+        chapterId: item.chapterId,
+        ueCode: item.ueCode,
+        chapterTitle: item.chapterTitle,
+        docCount: 1,
+        remainingChunks: remaining,
+        hasRunningDoc: item.status === "RUNNING",
+      });
+    }
+  }
+  return Array.from(map.values());
+}
+
 export default function AdminPage() {
   const { data: session } = useSession();
   const isYearAdmin = session?.user?.globalRole === "YEAR_ADMIN";
 
   const [health, setHealth] = useState<HealthData | null>(null);
   const [ues, setUes] = useState<UEAdminItem[]>([]);
+  const [queue, setQueue] = useState<BackgroundQueueSnapshot | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // Reindex RAG
+  // Reindex RAG & Background Queue Controls
   const [reindexing, setReindexing] = useState(false);
   const [reindexMsg, setReindexMsg] = useState<string | null>(null);
+  const [queueBusy, setQueueBusy] = useState(false);
+  const [queueError, setQueueError] = useState<string | null>(null);
 
   // UE Form
   const [editingUeId, setEditingUeId] = useState<string | null>(null);
@@ -127,11 +196,28 @@ export default function AdminPage() {
   const [roleUserId, setRoleUserId] = useState("");
   const [assigningRole, setAssigningRole] = useState(false);
 
+  const fetchQueue = useCallback(async () => {
+    try {
+      const qRes = await fetch("/api/system/queue", { cache: "no-store" });
+      if (qRes.ok) {
+        const qData = (await qRes.json()) as {
+          queue?: BackgroundQueueSnapshot;
+        };
+        if (qData.queue) {
+          setQueue(qData.queue);
+        }
+      }
+    } catch {
+      // Ignore transient polling failures
+    }
+  }, []);
+
   const fetchAdminData = useCallback(async () => {
     try {
-      const [hRes, uRes] = await Promise.all([
+      const [hRes, uRes, qRes] = await Promise.all([
         fetch("/api/system/health", { cache: "no-store" }),
         fetch("/api/ues", { cache: "no-store" }),
+        fetch("/api/system/queue", { cache: "no-store" }),
       ]);
       if (hRes.ok) {
         const hData = (await hRes.json()) as HealthData;
@@ -147,6 +233,14 @@ export default function AdminPage() {
           setRoleUeId(uData.ues[0].id);
         }
       }
+      if (qRes.ok) {
+        const qData = (await qRes.json()) as {
+          queue?: BackgroundQueueSnapshot;
+        };
+        if (qData.queue) {
+          setQueue(qData.queue);
+        }
+      }
     } finally {
       setLoading(false);
     }
@@ -155,6 +249,59 @@ export default function AdminPage() {
   useEffect(() => {
     void fetchAdminData();
   }, [fetchAdminData]);
+
+  const wasRunningRef = useRef(false);
+
+  useEffect(() => {
+    const running = Boolean(queue?.worker.isRunning);
+    if (wasRunningRef.current && !running) {
+      void fetchAdminData();
+    }
+    wasRunningRef.current = running;
+
+    if (!running) return;
+    const interval = setInterval(() => {
+      void fetchQueue();
+    }, 3000);
+    return () => {
+      clearInterval(interval);
+    };
+  }, [queue?.worker.isRunning, fetchQueue, fetchAdminData]);
+
+  async function handleQueueAction(
+    action: "START_ALL" | "START_INDEXING" | "START_AI" | "STOP",
+    target?: { chapterId?: string; documentId?: string }
+  ) {
+    setQueueBusy(true);
+    setQueueError(null);
+    try {
+      const res = await fetch("/api/system/queue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          chapterId: target?.chapterId,
+          documentId: target?.documentId,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        queue?: BackgroundQueueSnapshot;
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setQueueError(
+          data.message || data.error || "Erreur lors du pilotage de la file."
+        );
+        return;
+      }
+      if (data.queue) {
+        setQueue(data.queue);
+      }
+    } finally {
+      setQueueBusy(false);
+    }
+  }
 
   async function handleReindexAll() {
     setReindexing(true);
@@ -348,6 +495,10 @@ export default function AdminPage() {
     );
   }
 
+  const indexingChapters = queue
+    ? groupIndexingByChapter(queue.indexingQueue)
+    : [];
+
   return (
     <AppShell>
       <div className="space-y-8">
@@ -361,25 +512,25 @@ export default function AdminPage() {
           </p>
         </div>
 
-        {/* Section 1: System Health */}
+        {/* Section 1: System Health & Off-Peak Queue */}
         <section className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-              01 / MONITORING SANTÉ &amp; INDEXATION RAG
+              01 / MONITORING SANTÉ, FILES D&apos;ATTENTE HEURES CREUSES (00H–07H) &amp; ETA
             </h2>
             <button
               type="button"
               onClick={handleReindexAll}
               disabled={reindexing}
-              className="inline-flex items-center gap-2 border border-ink bg-ink px-4 py-2 font-mono text-xs uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
+              className="inline-flex items-center gap-2 border border-border bg-paper px-3.5 py-2 font-mono text-xs uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
             >
               <RefreshCw
                 className={`h-3.5 w-3.5 ${reindexing ? "animate-spin" : ""}`}
               />
               <span>
                 {reindexing
-                  ? "RÉ-INDEXATION EN COURS..."
-                  : "RÉ-INDEXER TOUS LES PDF (RAG)"}
+                  ? "RÉ-INDEXATION COMPLÈTE..."
+                  : "FORCER RÉ-INDEXATION SYNCHRONE"}
               </span>
             </button>
           </div>
@@ -395,80 +546,549 @@ export default function AdminPage() {
               COLLECTE DES MÉTRIQUES SYSTÈME...
             </div>
           ) : (
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-              {/* Ollama Card */}
-              <div
-                className="border border-border bg-card p-4"
-                style={{
-                  borderTop: `3px solid ${
-                    health.ollama.online ? "#3B7A57" : "#C83E4D"
-                  }`,
-                }}
-              >
-                <div className="mb-2 flex items-center justify-between">
-                  <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
-                    SERVEUR OLLAMA LOCAL
-                  </span>
-                  <Server className="h-4 w-4 text-stone" />
-                </div>
-                <p
-                  className={`font-mono text-sm font-bold uppercase ${
-                    health.ollama.online ? "text-forest" : "text-carmine"
-                  }`}
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+                {/* Ollama Card */}
+                <div
+                  className="border border-border bg-card p-4"
+                  style={{
+                    borderTop: `3px solid ${
+                      health.ollama.online ? "#3B7A57" : "#C83E4D"
+                    }`,
+                  }}
                 >
-                  {health.ollama.online
-                    ? "EN LIGNE"
-                    : `HORS-LIGNE (${health.ollama.host.replace(
-                        /^https?:\/\//,
-                        ""
-                      )})`}
-                </p>
-                <p className="mt-2 font-mono text-[10px] uppercase tracking-wider text-stone">
-                  LLM : {health.ollama.configuredModel} · EMBED :{" "}
-                  {health.ollama.embedModel}
-                </p>
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
+                      SERVEUR OLLAMA LOCAL
+                    </span>
+                    <Server className="h-4 w-4 text-stone" />
+                  </div>
+                  <p
+                    className={`font-mono text-sm font-bold uppercase ${
+                      health.ollama.online ? "text-forest" : "text-carmine"
+                    }`}
+                  >
+                    {health.ollama.online
+                      ? "EN LIGNE"
+                      : `HORS-LIGNE (${health.ollama.host.replace(
+                          /^https?:\/\//,
+                          ""
+                        )})`}
+                  </p>
+                  <p className="mt-2 font-mono text-[10px] uppercase tracking-wider text-stone">
+                    LLM : {health.ollama.configuredModel} · EMBED :{" "}
+                    {health.ollama.embedModel}
+                  </p>
+                </div>
+
+                {/* Storage Card */}
+                <div
+                  className="border border-border bg-card p-4"
+                  style={{ borderTop: "3px solid #D99B26" }}
+                >
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
+                      STOCKAGE LOCAL PDF
+                    </span>
+                    <HardDrive className="h-4 w-4 text-stone" />
+                  </div>
+                  <p className="font-mono text-sm font-bold text-ink">
+                    {formatBytes(health.storage.totalBytes)} ·{" "}
+                    {health.storage.fileCount} FICHIERS
+                  </p>
+                  <p className="mt-2 truncate font-mono text-[10px] uppercase tracking-wider text-stone">
+                    ./storage/uploads/
+                  </p>
+                </div>
+
+                {/* Vector DB Card */}
+                <div
+                  className="border border-border bg-card p-4"
+                  style={{ borderTop: "3px solid #3D6B99" }}
+                >
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
+                      INDEX VECTORIEL PGVECTOR
+                    </span>
+                    <Database className="h-4 w-4 text-stone" />
+                  </div>
+                  <p className="font-mono text-sm font-bold text-ink">
+                    {health.stats.indexedDocumentCount} /{" "}
+                    {health.stats.documentCount} PDF INDEXÉS
+                  </p>
+                  <p className="mt-2 font-mono text-[10px] uppercase tracking-wider text-stone">
+                    {health.stats.chunkCount} CHUNKS · {health.stats.userCount}{" "}
+                    UTILISATEURS · {health.stats.ueCount} UE
+                  </p>
+                </div>
               </div>
 
-              {/* Storage Card */}
-              <div
-                className="border border-border bg-card p-4"
-                style={{ borderTop: "3px solid #D99B26" }}
-              >
-                <div className="mb-2 flex items-center justify-between">
-                  <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
-                    STOCKAGE LOCAL PDF
-                  </span>
-                  <HardDrive className="h-4 w-4 text-stone" />
-                </div>
-                <p className="font-mono text-sm font-bold text-ink">
-                  {formatBytes(health.storage.totalBytes)} ·{" "}
-                  {health.storage.fileCount} FICHIERS
-                </p>
-                <p className="mt-2 truncate font-mono text-[10px] uppercase tracking-wider text-stone">
-                  ./storage/uploads/
-                </p>
-              </div>
+              {/* Live Background Queue, Progress & ETA Console */}
+              {queue && (
+                <div
+                  className="border border-ink bg-card p-5"
+                  style={{
+                    borderTop: `3px solid ${
+                      queue.worker.isRunning ? "#D99B26" : "#1A1A1A"
+                    }`,
+                  }}
+                >
+                  <div className="flex flex-wrap items-start justify-between gap-4 border-b border-border pb-4">
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span
+                          className={`inline-flex items-center gap-1.5 border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
+                            queue.worker.isRunning
+                              ? "border-amber bg-amber/15 text-ink"
+                              : "border-border bg-paper text-stone"
+                          }`}
+                        >
+                          {queue.worker.isRunning ? (
+                            <Loader2 className="h-3 w-3 animate-spin text-amber" />
+                          ) : (
+                            <Clock className="h-3 w-3" />
+                          )}
+                          <span>
+                            {queue.worker.isRunning
+                              ? queue.worker.mode === "NIGHTLY_AUTO"
+                                ? "EN COURS · MODE AUTO 00H–07H"
+                                : "EN COURS · LANCÉ PAR ADMIN"
+                              : `EN VEILLE · ${queue.worker.nextNightlyWindowLabel}`}
+                          </span>
+                        </span>
 
-              {/* Vector DB Card */}
-              <div
-                className="border border-border bg-card p-4"
-                style={{ borderTop: "3px solid #3D6B99" }}
-              >
-                <div className="mb-2 flex items-center justify-between">
-                  <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
-                    INDEX VECTORIEL PGVECTOR
-                  </span>
-                  <Database className="h-4 w-4 text-stone" />
+                        <span className="border border-ink bg-ink px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-card">
+                          ETA TOTAL :{" "}
+                          {queue.eta.totalEtaSeconds > 0
+                            ? `~${formatEtaSeconds(queue.eta.totalEtaSeconds)}`
+                            : "FILE VIDE (0 S)"}
+                        </span>
+                      </div>
+
+                      <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
+                        INDEXATION :{" "}
+                        <span className="font-semibold text-ink">
+                          {queue.eta.indexingEtaSeconds > 0
+                            ? `~${formatEtaSeconds(queue.eta.indexingEtaSeconds)}`
+                            : "0 s"}
+                        </span>{" "}
+                        ({queue.counts.pendingIndexingChunks} CHUNKS) · CONTENU
+                        IA :{" "}
+                        <span className="font-semibold text-ink">
+                          {queue.eta.aiEtaSeconds > 0
+                            ? `~${formatEtaSeconds(queue.eta.aiEtaSeconds)}`
+                            : "0 s"}
+                        </span>{" "}
+                        ({queue.counts.pendingAiArtifacts} TÂCHES)
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void fetchQueue()}
+                        disabled={queueBusy}
+                        className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
+                      >
+                        <RefreshCw className="h-3 w-3" />
+                        <span>ACTUALISER</span>
+                      </button>
+
+                      {!queue.worker.isRunning ? (
+                        <>
+                          <button
+                            type="button"
+                            disabled={
+                              queueBusy ||
+                              (queue.counts.unindexedDocuments === 0 &&
+                                queue.counts.pendingAiArtifacts === 0)
+                            }
+                            onClick={() => void handleQueueAction("START_ALL")}
+                            className="inline-flex items-center gap-1.5 border border-ink bg-ink px-3.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-45"
+                          >
+                            <Play className="h-3 w-3" />
+                            <span>LANCER TOUTE LA FILE</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={
+                              queueBusy || queue.counts.unindexedDocuments === 0
+                            }
+                            onClick={() =>
+                              void handleQueueAction("START_INDEXING")
+                            }
+                            className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-45"
+                          >
+                            <Database className="h-3 w-3" />
+                            <span>
+                              INDEXER PDF ({queue.counts.unindexedDocuments})
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={
+                              queueBusy || queue.counts.pendingAiArtifacts === 0
+                            }
+                            onClick={() => void handleQueueAction("START_AI")}
+                            className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-45"
+                          >
+                            <Sparkles className="h-3 w-3" />
+                            <span>
+                              GÉNÉRER IA ({queue.counts.pendingAiArtifacts})
+                            </span>
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          type="button"
+                          disabled={queueBusy || queue.worker.stopRequested}
+                          onClick={() => void handleQueueAction("STOP")}
+                          className="inline-flex items-center gap-1.5 border border-carmine bg-carmine px-3.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-carmine/90 disabled:opacity-60"
+                        >
+                          <Square className="h-3 w-3" />
+                          <span>
+                            {queue.worker.stopRequested
+                              ? "ARRÊT EN COURS..."
+                              : "STOPPER APRÈS LA TÂCHE EN COURS"}
+                          </span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {queueError && (
+                    <div className="mt-3 border border-carmine/40 bg-carmine/10 px-3 py-2 font-mono text-xs text-carmine">
+                      {queueError}
+                    </div>
+                  )}
+
+                  {/* Progress Bars */}
+                  <div className="mt-4 space-y-3">
+                    <div>
+                      <div className="mb-1 flex items-center justify-between font-mono text-[10px] uppercase tracking-wider">
+                        <span className="text-ink">
+                          PROGRESSION GLOBALE
+                          {queue.worker.isRunning &&
+                          queue.worker.totalItemsInRun > 0
+                            ? ` · EXÉCUTION EN COURS (${queue.worker.completedItemsInRun}/${queue.worker.totalItemsInRun})`
+                            : ` · COUVERTURE BASE (${
+                                queue.counts.indexedDocuments
+                              }/${queue.counts.totalDocuments} PDF INDEXÉS · ${
+                                queue.counts.completedPublicAiArtifacts
+                              }/${queue.counts.totalExpectedAiArtifacts} CONTENUS IA)`}
+                        </span>
+                        <span className="font-bold text-ink">
+                          {queue.worker.overallProgressPercent}%
+                        </span>
+                      </div>
+                      <div className="h-2.5 w-full border border-border bg-paper">
+                        <div
+                          className="h-full transition-all duration-300"
+                          style={{
+                            width: `${queue.worker.overallProgressPercent}%`,
+                            backgroundColor: queue.worker.isRunning
+                              ? "#D99B26"
+                              : "#3B7A57",
+                          }}
+                        />
+                      </div>
+                    </div>
+
+                    {queue.worker.isRunning && queue.worker.currentTaskLabel && (
+                      <div className="border border-amber/60 bg-pinned p-3">
+                        <div className="mb-1 flex items-center justify-between font-mono text-[10px] uppercase tracking-wider">
+                          <span className="flex items-center gap-1.5 font-bold text-ink">
+                            <Loader2 className="h-3 w-3 animate-spin text-amber" />
+                            <span>
+                              TÂCHE ACTIVE : {queue.worker.currentTaskLabel}
+                            </span>
+                          </span>
+                          <span className="font-bold text-ink">
+                            {queue.worker.currentItemProgressPercent}%
+                          </span>
+                        </div>
+                        <div className="h-2 w-full border border-border bg-card">
+                          <div
+                            className="h-full bg-ink transition-all duration-300"
+                            style={{
+                              width: `${queue.worker.currentItemProgressPercent}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {!queue.worker.isRunning && queue.worker.lastRunSummary && (
+                      <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                        DERNIÈRE EXÉCUTION{" "}
+                        {queue.worker.lastRunAt
+                          ? `(${new Date(
+                              queue.worker.lastRunAt
+                            ).toLocaleTimeString("fr-FR")}) `
+                          : ""}
+                        : {queue.worker.lastRunSummary}
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Two Queue Columns: Indexing Queue & AI Generation Queue */}
+                  <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
+                    {/* Queue 1: RAG Indexing */}
+                    <div className="border border-border bg-paper/40">
+                      <div className="flex items-center justify-between border-b border-border bg-paper px-3.5 py-2 font-mono text-[11px] font-semibold uppercase tracking-wider text-ink">
+                        <span className="inline-flex items-center gap-1.5">
+                          <Database className="h-3.5 w-3.5 text-slate" />
+                          <span>
+                            FILE D&apos;INDEXATION RAG ({queue.indexingQueue.length}
+                            )
+                          </span>
+                        </span>
+                        <span className="text-[10px] text-stone">
+                          {queue.eta.avgMsPerChunk} MS / CHUNK
+                        </span>
+                      </div>
+
+                      {queue.indexingQueue.length === 0 ? (
+                        <div className="flex items-center gap-2 p-4 font-mono text-xs text-forest">
+                          <CheckCircle2 className="h-4 w-4" />
+                          <span>
+                            TOUS LES DOCUMENTS PDF SONT INDEXÉS DANS PGVECTOR.
+                          </span>
+                        </div>
+                      ) : (
+                        <div>
+                          {/* Quick Force Indexing by Chapter */}
+                          <div className="border-b border-border bg-paper/70 px-3.5 py-2.5">
+                            <div className="mb-2 flex items-center justify-between font-mono text-[10px] font-semibold uppercase tracking-wider text-stone">
+                              <span>FORCER L&apos;INDEXATION D&apos;UN CHAPITRE</span>
+                              <span>
+                                {indexingChapters.length} CHAPITRE(S)
+                              </span>
+                            </div>
+                            <div className="max-h-36 space-y-1.5 overflow-y-auto pr-0.5">
+                              {indexingChapters.map((grp) => {
+                                  const grpEtaSec = Math.ceil(
+                                    (grp.remainingChunks * queue.eta.avgMsPerChunk) /
+                                      1000
+                                  );
+                                  return (
+                                    <div
+                                      key={grp.chapterId}
+                                      className="flex items-center justify-between gap-2 border border-border bg-card px-2.5 py-1.5"
+                                    >
+                                      <div className="min-w-0 flex-1">
+                                        <div className="flex items-center gap-1.5">
+                                          <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase text-badge-text">
+                                            {grp.ueCode}
+                                          </span>
+                                          <span className="truncate text-xs font-semibold text-ink">
+                                            {grp.chapterTitle}
+                                          </span>
+                                        </div>
+                                        <p className="mt-0.5 font-mono text-[9px] uppercase text-stone">
+                                          {grp.docCount} PDF · ~
+                                          {formatEtaSeconds(grpEtaSec)}
+                                        </p>
+                                      </div>
+                                      <button
+                                        type="button"
+                                        disabled={queueBusy || queue.worker.isRunning}
+                                        onClick={() =>
+                                          handleQueueAction("START_INDEXING", {
+                                            chapterId: grp.chapterId,
+                                          })
+                                        }
+                                        className="inline-flex shrink-0 items-center gap-1 border border-ink bg-ink px-2 py-1 font-mono text-[9px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-40"
+                                      >
+                                        <Play className="h-2.5 w-2.5" />
+                                        <span>
+                                          {grp.hasRunningDoc
+                                            ? "EN COURS"
+                                            : "FORCER CE CHAPITRE"}
+                                        </span>
+                                      </button>
+                                    </div>
+                                  );
+                                })}
+                            </div>
+                          </div>
+
+                          <div className="max-h-64 divide-y divide-border overflow-y-auto bg-card">
+                            {queue.indexingQueue.map((item) => {
+                              const remChunks = Math.max(
+                                0,
+                                item.totalChunks - item.embeddedChunks
+                              );
+                              const itemEtaSec = Math.ceil(
+                                (remChunks * queue.eta.avgMsPerChunk) / 1000
+                              );
+                              const pct =
+                                item.totalChunks > 0
+                                  ? Math.round(
+                                      (item.embeddedChunks / item.totalChunks) *
+                                        100
+                                    )
+                                  : 0;
+
+                              return (
+                                <div
+                                  key={item.documentId}
+                                  className={`flex items-center justify-between gap-3 px-3.5 py-2.5 ${
+                                    item.status === "RUNNING"
+                                      ? "bg-pinned"
+                                      : "bg-card"
+                                  }`}
+                                >
+                                  <div className="min-w-0 flex-1">
+                                    <div className="flex flex-wrap items-center gap-1.5">
+                                      <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase text-badge-text">
+                                        {item.ueCode}
+                                      </span>
+                                      <span
+                                        className={`border px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase ${
+                                          item.status === "RUNNING"
+                                            ? "border-amber bg-amber/20 text-ink"
+                                            : "border-border bg-paper text-stone"
+                                        }`}
+                                      >
+                                        {item.status === "RUNNING"
+                                          ? "EN COURS"
+                                          : "00H–07H"}
+                                      </span>
+                                      <span className="truncate font-mono text-[9px] uppercase text-stone">
+                                        {item.chapterTitle}
+                                      </span>
+                                    </div>
+                                    <p className="mt-1 truncate text-xs font-bold text-ink">
+                                      {item.title}
+                                    </p>
+                                    <p className="font-mono text-[10px] uppercase text-stone">
+                                      {item.pageCount} P. · {item.embeddedChunks}/
+                                      {item.totalChunks} CHUNKS ({pct}%)
+                                    </p>
+                                  </div>
+
+                                  <div className="flex shrink-0 flex-col items-end gap-1">
+                                    <span className="font-mono text-[10px] font-semibold uppercase text-ink">
+                                      ~{formatEtaSeconds(itemEtaSec)}
+                                    </span>
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        disabled={queueBusy || queue.worker.isRunning}
+                                        onClick={() =>
+                                          handleQueueAction("START_INDEXING", {
+                                            chapterId: item.chapterId,
+                                          })
+                                        }
+                                        className="inline-flex items-center gap-1 border border-border bg-paper px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase text-ink hover:border-ink disabled:opacity-40"
+                                      >
+                                        <Play className="h-2.5 w-2.5" />
+                                        <span>INDEXER CHAPITRE</span>
+                                      </button>
+                                      <button
+                                        type="button"
+                                        disabled={queueBusy || queue.worker.isRunning}
+                                        onClick={() =>
+                                          handleQueueAction("START_INDEXING", {
+                                            documentId: item.documentId,
+                                          })
+                                        }
+                                        className="inline-flex items-center gap-1 border border-border bg-paper px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase text-ink hover:border-ink disabled:opacity-40"
+                                      >
+                                        <Play className="h-2.5 w-2.5" />
+                                        <span>INDEXER PDF</span>
+                                      </button>
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Queue 2: AI Content Generation */}
+                    <div className="border border-border bg-paper/40">
+                      <div className="flex items-center justify-between border-b border-border bg-paper px-3.5 py-2 font-mono text-[11px] font-semibold uppercase tracking-wider text-ink">
+                        <span className="inline-flex items-center gap-1.5">
+                          <ListChecks className="h-3.5 w-3.5 text-forest" />
+                          <span>
+                            FILE CONTENUS IA ({queue.aiContentQueue.length})
+                          </span>
+                        </span>
+                        <span className="text-[10px] text-stone">
+                          ~{Math.round(queue.eta.avgMsPerAiArtifact / 1000)} S /
+                          TÂCHE
+                        </span>
+                      </div>
+
+                      {queue.aiContentQueue.length === 0 ? (
+                        <div className="flex items-center gap-2 p-4 font-mono text-xs text-forest">
+                          <CheckCircle2 className="h-4 w-4" />
+                          <span>
+                            TOUS LES COURS ONT LEUR FICHE, FLASHCARDS ET QUIZ
+                            PUBLICS.
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="max-h-64 divide-y divide-border overflow-y-auto bg-card">
+                          {queue.aiContentQueue.map((item) => {
+                            const itemEtaSec = Math.ceil(
+                              queue.eta.avgMsPerAiArtifact / 1000
+                            );
+                            return (
+                              <div
+                                key={item.id}
+                                className={`flex items-center justify-between gap-3 px-3.5 py-2.5 ${
+                                  item.status === "RUNNING"
+                                    ? "bg-pinned"
+                                    : "bg-card"
+                                }`}
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase text-badge-text">
+                                      {item.ueCode}
+                                    </span>
+                                    <span className="border border-ink bg-ink px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase text-card">
+                                      {item.label}
+                                    </span>
+                                    <span
+                                      className={`border px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase ${
+                                        item.status === "RUNNING"
+                                          ? "border-amber bg-amber/20 text-ink"
+                                          : "border-border bg-paper text-stone"
+                                      }`}
+                                    >
+                                      {item.status === "RUNNING"
+                                        ? "EN COURS"
+                                        : "00H–07H"}
+                                    </span>
+                                  </div>
+                                  <p className="mt-1 truncate text-xs font-bold text-ink">
+                                    {item.documentTitle}
+                                  </p>
+                                  <p className="font-mono text-[10px] uppercase text-stone">
+                                    {item.chapterTitle} · {item.fileName}
+                                  </p>
+                                </div>
+
+                                <span className="shrink-0 font-mono text-[10px] font-semibold uppercase text-ink">
+                                  ~{formatEtaSeconds(itemEtaSec)}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
-                <p className="font-mono text-sm font-bold text-ink">
-                  {health.stats.indexedDocumentCount} /{" "}
-                  {health.stats.documentCount} PDF INDEXÉS
-                </p>
-                <p className="mt-2 font-mono text-[10px] uppercase tracking-wider text-stone">
-                  {health.stats.chunkCount} CHUNKS · {health.stats.userCount}{" "}
-                  UTILISATEURS · {health.stats.ueCount} UE
-                </p>
-              </div>
+              )}
             </div>
           )}
         </section>
@@ -754,25 +1374,72 @@ export default function AdminPage() {
                 <label className="mb-1.5 block font-mono text-[10px] uppercase tracking-wider text-stone">
                   COULEUR BARRE SUPÉRIEURE (3PX)
                 </label>
-                <div className="grid grid-cols-2 gap-2">
-                  {ACCENT_COLORS.map((c) => (
-                    <button
-                      key={c.hex}
-                      type="button"
-                      onClick={() => setAccentColor(c.hex)}
-                      className={`flex items-center gap-2 border px-2.5 py-2 font-mono text-[10px] uppercase tracking-wider ${
-                        accentColor === c.hex
-                          ? "border-ink bg-pinned font-semibold text-ink"
-                          : "border-border bg-paper text-stone"
-                      }`}
-                    >
-                      <span
-                        className="inline-block h-3 w-3 shrink-0"
-                        style={{ backgroundColor: c.hex }}
-                      />
-                      <span>{c.label}</span>
-                    </button>
-                  ))}
+                <div className="mb-2 border border-border bg-paper">
+                  <div
+                    className="h-[3px] w-full transition-colors"
+                    style={{
+                      backgroundColor: /^#[0-9A-Fa-f]{3,6}$/.test(accentColor)
+                        ? accentColor
+                        : "#D99B26",
+                    }}
+                  />
+                  <div className="flex items-center justify-between px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-stone">
+                    <span>APERÇU BANDEAU UE</span>
+                    <span className="font-semibold text-ink">
+                      {accentColor.toUpperCase()}
+                    </span>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
+                  {ACCENT_COLORS.map((c) => {
+                    const isSelected =
+                      accentColor.toUpperCase() === c.hex.toUpperCase();
+                    return (
+                      <button
+                        key={c.hex}
+                        type="button"
+                        onClick={() => setAccentColor(c.hex)}
+                        className={`flex items-center gap-2 border px-2 py-1.5 text-left font-mono text-[10px] uppercase tracking-wider transition-colors ${
+                          isSelected
+                            ? "border-ink bg-pinned font-semibold text-ink"
+                            : "border-border bg-paper text-stone hover:border-ink/40 hover:text-ink"
+                        }`}
+                      >
+                        <span
+                          className="inline-block h-3 w-3 shrink-0 border border-ink/20"
+                          style={{ backgroundColor: c.hex }}
+                        />
+                        <span className="truncate">{c.label}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                <div className="mt-2 flex items-center gap-2 border border-border bg-paper px-2.5 py-1.5">
+                  <input
+                    type="color"
+                    aria-label="Sélecteur de couleur personnalisée"
+                    value={
+                      /^#[0-9A-Fa-f]{6}$/.test(accentColor)
+                        ? accentColor
+                        : "#D99B26"
+                    }
+                    onChange={(e) => setAccentColor(e.target.value.toUpperCase())}
+                    className="h-6 w-8 shrink-0 cursor-pointer border border-border bg-transparent p-0"
+                  />
+                  <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                    HEX LIBRE
+                  </span>
+                  <input
+                    type="text"
+                    value={accentColor}
+                    onChange={(e) => {
+                      const raw = e.target.value.trim();
+                      setAccentColor(raw.startsWith("#") ? raw.toUpperCase() : `#${raw.toUpperCase()}`);
+                    }}
+                    placeholder="#D99B26"
+                    maxLength={7}
+                    className="ml-auto w-24 border border-border bg-card px-2 py-1 font-mono text-xs uppercase text-ink focus:border-ink focus:outline-none"
+                  />
                 </div>
               </div>
 

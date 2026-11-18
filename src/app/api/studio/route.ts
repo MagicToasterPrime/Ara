@@ -5,6 +5,7 @@ import {
   ensureStudioSchema,
   gatherStudioSourceChunks,
   generateStudioArtifact,
+  hasExistingPublicArtifact,
   type PageImageInput,
   type StudioArtifactKind,
 } from "@/lib/studio";
@@ -21,21 +22,41 @@ export async function GET(req: Request) {
   const ueId = searchParams.get("ueId");
   const documentId = searchParams.get("documentId");
 
-  const artifacts = await prisma.studyArtifact.findMany({
-    where: {
-      ...(ueId ? { ueId } : {}),
-      ...(documentId ? { documentId } : {}),
-      OR: [{ userId: user.id }, { isPublic: true }],
-    },
-    orderBy: { createdAt: "desc" },
-    take: 40,
-    include: {
-      user: { select: { id: true, name: true } },
-      ue: { select: { id: true, code: true, title: true } },
-    },
-  });
+  const [artifacts, publicRows] = await Promise.all([
+    prisma.studyArtifact.findMany({
+      where: {
+        ...(ueId ? { ueId } : {}),
+        ...(documentId ? { documentId } : {}),
+        OR: [{ userId: user.id }, { isPublic: true }],
+      },
+      orderBy: { createdAt: "desc" },
+      take: 60,
+      include: {
+        user: { select: { id: true, name: true } },
+        ue: { select: { id: true, code: true, title: true } },
+      },
+    }),
+    prisma.studyArtifact.findMany({
+      where: {
+        ...(ueId ? { ueId } : {}),
+        ...(documentId ? { documentId } : {}),
+        documentId: { not: null },
+        isPublic: true,
+      },
+      select: {
+        documentId: true,
+        kind: true,
+      },
+    }),
+  ]);
 
-  return NextResponse.json({ artifacts });
+  const publicCoverage = publicRows
+    .filter((r): r is { documentId: string; kind: string } =>
+      Boolean(r.documentId)
+    )
+    .map((r) => ({ documentId: r.documentId, kind: r.kind }));
+
+  return NextResponse.json({ artifacts, publicCoverage });
 }
 
 export async function POST(req: Request) {
@@ -68,11 +89,41 @@ export async function POST(req: Request) {
       ? (body.kind as StudioArtifactKind)
       : "SUMMARY";
 
+    let primaryDocId: string | null =
+      Array.isArray(body.documentIds) && body.documentIds.length > 0
+        ? body.documentIds[0]
+        : null;
+
+    let alreadyHasPublic = false;
+    if (Array.isArray(body.documentIds) && body.documentIds.length > 0) {
+      let uncoveredDocId: string | null = null;
+      for (const docId of body.documentIds) {
+        const hasPub = await hasExistingPublicArtifact(docId, kind);
+        if (!hasPub) {
+          uncoveredDocId = docId;
+          break;
+        }
+      }
+      if (uncoveredDocId) {
+        primaryDocId = uncoveredDocId;
+        alreadyHasPublic = false;
+      } else {
+        primaryDocId = body.documentIds[0];
+        alreadyHasPublic = true;
+      }
+    }
+
+    const preAutoPublishedFirst = Boolean(primaryDocId && !alreadyHasPublic);
+    const preResolvedIsPublic = preAutoPublishedFirst
+      ? true
+      : Boolean(body.isPublic);
+
     const chunks = await gatherStudioSourceChunks({
       ueId: body.ueId,
       documentIds: body.documentIds,
       pageNumber: body.pageNumber,
       prompt: body.prompt,
+      fullDocument: preResolvedIsPublic,
     });
 
     if (chunks.length === 0) {
@@ -85,18 +136,24 @@ export async function POST(req: Request) {
       );
     }
 
+    if (!primaryDocId && chunks[0]?.documentId) {
+      primaryDocId = chunks[0].documentId;
+      alreadyHasPublic = await hasExistingPublicArtifact(primaryDocId, kind);
+    }
+
+    const autoPublishedFirst = Boolean(primaryDocId && !alreadyHasPublic);
+    const resolvedIsPublic = autoPublishedFirst
+      ? true
+      : Boolean(body.isPublic);
+
     const generated = await generateStudioArtifact({
       kind,
       chunks,
       title: body.title,
       prompt: body.prompt,
+      isPublic: resolvedIsPublic,
       pageImagesBase64: body.pageImagesBase64,
     });
-
-    const primaryDocId =
-      body.documentIds?.length === 1
-        ? body.documentIds[0]
-        : chunks[0]?.documentId || null;
 
     const resolvedUeId = body.ueId || chunks[0]?.ueId || null;
 
@@ -109,7 +166,7 @@ export async function POST(req: Request) {
         title: generated.title,
         prompt: body.prompt?.trim() || null,
         contentJson: JSON.stringify(generated.content),
-        isPublic: Boolean(body.isPublic),
+        isPublic: resolvedIsPublic,
       },
       include: {
         user: { select: { id: true, name: true } },
@@ -117,7 +174,14 @@ export async function POST(req: Request) {
       },
     });
 
-    return NextResponse.json({ artifact }, { status: 201 });
+    return NextResponse.json(
+      {
+        artifact,
+        autoPublishedFirst,
+        usedAi: generated.usedAi,
+      },
+      { status: 201 }
+    );
   } catch (error) {
     console.error("[Studio POST] Error:", error);
     return NextResponse.json(

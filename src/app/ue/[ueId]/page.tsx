@@ -218,13 +218,12 @@ function UEWorkspaceContent() {
     "OFFICIAL_COURSE" | "STUDENT_NOTE"
   >("STUDENT_NOTE");
   const [uploadFile, setUploadFile] = useState<File | null>(null);
-  const [autoGenerateOnUpload, setAutoGenerateOnUpload] = useState<boolean>(true);
   const [uploading, setUploading] = useState(false);
   const [uploadFeedback, setUploadFeedback] = useState<string | null>(null);
-  const [lastGeneratedPack, setLastGeneratedPack] = useState<{
+  const [lastUploadedDoc, setLastUploadedDoc] = useState<{
     docTitle: string;
     docId: string;
-    items: Array<{ id: string; kind: string; title: string }>;
+    scheduledNightly: boolean;
   } | null>(null);
   const [studioFocusDocId, setStudioFocusDocId] = useState<string | null>(null);
 
@@ -707,7 +706,6 @@ function UEWorkspaceContent() {
       formData.append("chapterId", uploadChapterId);
       formData.append("title", uploadTitle.trim());
       formData.append("category", uploadCategory);
-      formData.append("autoGenerate", autoGenerateOnUpload ? "true" : "false");
       formData.append("file", uploadFile);
 
       const res = await fetch("/api/documents", {
@@ -718,7 +716,7 @@ function UEWorkspaceContent() {
       const data = (await res.json().catch(() => ({}))) as {
         error?: string;
         document?: { id: string; title: string };
-        generatedPack?: Array<{ id: string; kind: string; title: string }>;
+        scheduledNightly?: boolean;
       };
 
       if (!res.ok) {
@@ -726,11 +724,11 @@ function UEWorkspaceContent() {
         return;
       }
 
-      if (data.document && data.generatedPack && data.generatedPack.length > 0) {
-        setLastGeneratedPack({
+      if (data.document) {
+        setLastUploadedDoc({
           docTitle: data.document.title,
           docId: data.document.id,
-          items: data.generatedPack,
+          scheduledNightly: Boolean(data.scheduledNightly),
         });
       }
 
@@ -1517,18 +1515,10 @@ function UEWorkspaceContent() {
               </div>
 
               <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
-                <label className="flex cursor-pointer items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-ink">
-                  <input
-                    type="checkbox"
-                    checked={autoGenerateOnUpload}
-                    onChange={(e) => setAutoGenerateOnUpload(e.target.checked)}
-                    className="h-3.5 w-3.5 accent-ink"
-                  />
-                  <span>
-                    GÉNÉRER AUTOMATIQUEMENT À L&apos;UPLOAD : FICHE DE RÉVISION +
-                    FLASHCARDS + QUIZ
-                  </span>
-                </label>
+                <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                  TEXTE EXTRAIT À L&apos;ENVOI · INDEXATION RAG &amp; CONTENUS IA EN
+                  FOND LA NUIT (00H–07H) SAUF SI GÉNÉRÉS PAR LA COMMU
+                </p>
 
                 <div className="flex items-center gap-2">
                   <button
@@ -1543,46 +1533,43 @@ function UEWorkspaceContent() {
                     disabled={uploading || !uploadFile || !uploadChapterId}
                     className="border border-ink bg-ink px-5 py-2 font-mono text-xs uppercase tracking-wider text-card disabled:opacity-50"
                   >
-                    {uploading
-                      ? autoGenerateOnUpload
-                        ? "ENVOI & GÉNÉRATION DU PACK..."
-                        : "INDEXATION & ENVOI..."
-                      : "PUBLIER LE PDF"}
+                    {uploading ? "INDEXATION & ENVOI..." : "PUBLIER LE PDF"}
                   </button>
                 </div>
               </div>
             </form>
           )}
 
-          {lastGeneratedPack && (
+          {lastUploadedDoc && (
             <div
               className="ara-animate-in flex flex-wrap items-center justify-between gap-3 border border-forest bg-forest/10 px-4 py-3"
               style={{ borderLeft: "3px solid #3B7A57" }}
             >
               <div>
                 <p className="font-mono text-xs font-bold uppercase tracking-wider text-forest">
-                  PACK DE RÉVISION GÉNÉRÉ POUR « {lastGeneratedPack.docTitle} »
+                  COURS PUBLIÉ &amp; INDEXÉ : « {lastUploadedDoc.docTitle} »
                 </p>
                 <p className="mt-0.5 font-mono text-[10px] uppercase tracking-wider text-ink">
-                  FICHE SYNTHÈSE · FLASHCARDS · QUIZ CIBLÉ ({lastGeneratedPack.items.length}{" "}
-                  RESSOURCES CRÉÉES)
+                  {lastUploadedDoc.scheduledNightly
+                    ? "GÉNÉRATION IA PROGRAMMÉE AUX HEURES CREUSES (00H–07H) SAUF SI GÉNÉRÉE EN PUBLIC PAR LA COMMU D'ICI LÀ."
+                    : "DOCUMENT PRÊT DANS L'UE."}
                 </p>
               </div>
               <div className="flex items-center gap-2">
                 <button
                   type="button"
                   onClick={() => {
-                    setStudioFocusDocId(lastGeneratedPack.docId);
+                    setStudioFocusDocId(lastUploadedDoc.docId);
                     setActiveTab("studio");
                   }}
                   className="inline-flex items-center gap-1.5 border border-ink bg-ink px-3.5 py-1.5 font-mono text-[11px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90"
                 >
                   <Sparkles className="h-3.5 w-3.5" />
-                  <span>CONSULTER DANS LE STUDIO →</span>
+                  <span>GÉNÉRER EN PUBLIC DANS LE STUDIO →</span>
                 </button>
                 <button
                   type="button"
-                  onClick={() => setLastGeneratedPack(null)}
+                  onClick={() => setLastUploadedDoc(null)}
                   className="border border-border bg-card p-1 text-stone hover:text-ink"
                   title="Fermer"
                 >

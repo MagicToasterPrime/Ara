@@ -1,13 +1,18 @@
 import crypto from "node:crypto";
+import fsp from "node:fs/promises";
 import { prisma } from "@/lib/prisma";
 import {
   checkOllamaHealth,
   describeImageWithOllama,
+  embedExistingDocumentChunks,
   formatVectorLiteral,
   generateEmbedding,
   getOllamaConfig,
+  storeDocumentChunksUnindexed,
 } from "@/lib/ollama";
+import { extractPdfPages } from "@/lib/pdf";
 import type { RevisionQuestion } from "@/lib/revisions";
+import { resolveDocumentFilePath } from "@/lib/storage";
 
 export type StudioArtifactKind =
   | "SVG_DIAGRAM"
@@ -73,9 +78,17 @@ export interface QuizPayload {
   sources: StudioSourceRef[];
 }
 
+export interface SummarySection {
+  title: string;
+  pageRange: string;
+  content: string;
+  keyPoints: string[];
+}
+
 export interface SummaryPayload {
   kind: "SUMMARY";
   overview: string;
+  sections?: SummarySection[];
   keyConcepts: Array<{
     term: string;
     definition: string;
@@ -146,12 +159,16 @@ export async function gatherStudioSourceChunks(params: {
   documentIds?: string[];
   pageNumber?: number;
   prompt?: string;
+  fullDocument?: boolean;
 }): Promise<SourceChunk[]> {
-  const { ueId, documentIds, pageNumber, prompt } = params;
+  const { ueId, documentIds, pageNumber, prompt, fullDocument } = params;
   const docFilter =
     Array.isArray(documentIds) && documentIds.length > 0
       ? documentIds
       : undefined;
+
+  const targetLimit = fullDocument ? 60 : 12;
+  const minSubstantialLen = fullDocument ? 60 : 80;
 
   const collected: SourceChunk[] = [];
   const seen = new Set<string>();
@@ -163,8 +180,14 @@ export async function gatherStudioSourceChunks(params: {
     }
   };
 
-  // 1. If a specific page of a single document is active, prioritize it
-  if (docFilter && docFilter.length === 1 && pageNumber && pageNumber > 0) {
+  // 1. If a specific page of a single document is active (targeted mode), prioritize it
+  if (
+    !fullDocument &&
+    docFilter &&
+    docFilter.length === 1 &&
+    pageNumber &&
+    pageNumber > 0
+  ) {
     const pageRows = await prisma.documentChunk.findMany({
       where: { documentId: docFilter[0], pageNumber },
       take: 4,
@@ -200,8 +223,8 @@ export async function gatherStudioSourceChunks(params: {
     }
   }
 
-  // 2. If prompt is provided and embeddings are available, fetch vector matches
-  if (prompt && prompt.trim().length > 2) {
+  // 2. If custom context/prompt is provided in targeted mode, combine vector + keyword search
+  if (!fullDocument && prompt && prompt.trim().length > 2) {
     const emb = await generateEmbedding(prompt.trim());
     if (emb) {
       const vec = formatVectorLiteral(emb);
@@ -292,53 +315,168 @@ export async function gatherStudioSourceChunks(params: {
         pushChunk(row);
       }
     }
+
+    const keywords = Array.from(
+      new Set(
+        prompt
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-zà-ÿ0-9\s-]/gi, " ")
+          .split(/\s+/)
+          .filter((w) => w.length >= 4)
+      )
+    ).slice(0, 6);
+
+    if (keywords.length > 0) {
+      const kwRows = await prisma.documentChunk.findMany({
+        where: {
+          ...(docFilter
+            ? { documentId: { in: docFilter } }
+            : ueId
+            ? { document: { chapter: { ueId } } }
+            : {}),
+          OR: keywords.map((kw) => ({
+            content: { contains: kw, mode: "insensitive" as const },
+          })),
+        },
+        take: 6,
+        orderBy: { pageNumber: "asc" },
+        include: {
+          document: {
+            select: {
+              id: true,
+              title: true,
+              fileName: true,
+              chapter: {
+                select: {
+                  title: true,
+                  ue: { select: { id: true, code: true, title: true } },
+                },
+              },
+            },
+          },
+        },
+      });
+      for (const r of kwRows) {
+        pushChunk({
+          id: r.id,
+          content: r.content,
+          pageNumber: r.pageNumber,
+          documentId: r.document.id,
+          documentTitle: r.document.title,
+          fileName: r.document.fileName,
+          chapterTitle: r.document.chapter.title,
+          ueId: r.document.chapter.ue.id,
+          ueCode: r.document.chapter.ue.code,
+          ueTitle: r.document.chapter.ue.title,
+        });
+      }
+    }
   }
 
-  // 3. Fill up with representative chunks from the selected documents / UE
-  if (collected.length < 8) {
-    const rows = await prisma.documentChunk.findMany({
+  // 3. Evenly distribute chunks across the full length of all selected documents
+  if (collected.length < targetLimit) {
+    const chunkRefs = await prisma.documentChunk.findMany({
       where: docFilter
         ? { documentId: { in: docFilter } }
         : ueId
         ? { document: { chapter: { ueId } } }
         : undefined,
-      take: 14,
-      orderBy: [{ pageNumber: "asc" }],
-      include: {
-        document: {
-          select: {
-            id: true,
-            title: true,
-            fileName: true,
-            chapter: {
-              select: {
-                title: true,
-                ue: { select: { id: true, code: true, title: true } },
+      select: { id: true, documentId: true, pageNumber: true, content: true },
+      orderBy: [{ documentId: "asc" }, { pageNumber: "asc" }],
+      take: fullDocument ? 1200 : 400,
+    });
+
+    const refsByDoc = new Map<
+      string,
+      Array<{ id: string; substantial: boolean }>
+    >();
+    for (const ref of chunkRefs) {
+      const list = refsByDoc.get(ref.documentId) || [];
+      list.push({
+        id: ref.id,
+        substantial: ref.content.trim().length >= minSubstantialLen,
+      });
+      refsByDoc.set(ref.documentId, list);
+    }
+
+    const docEntries = Array.from(refsByDoc.entries());
+    const perDocQuota = Math.max(
+      2,
+      Math.ceil(
+        (targetLimit - collected.length) / Math.max(1, docEntries.length)
+      )
+    );
+
+    const sampledIds: string[] = [];
+    for (const [, list] of docEntries) {
+      const preferred = list.filter((item) => item.substantial);
+      const sourceList = preferred.length >= 2 ? preferred : list;
+      if (sourceList.length <= perDocQuota) {
+        for (const item of sourceList) sampledIds.push(item.id);
+      } else {
+        for (let i = 0; i < perDocQuota; i += 1) {
+          const idx = Math.floor(
+            (i * (sourceList.length - 1)) / Math.max(1, perDocQuota - 1)
+          );
+          sampledIds.push(sourceList[idx].id);
+        }
+      }
+    }
+
+    const uniqueSampledIds = Array.from(new Set(sampledIds)).filter(
+      (id) => !seen.has(id)
+    );
+
+    if (uniqueSampledIds.length > 0) {
+      const rows = await prisma.documentChunk.findMany({
+        where: { id: { in: uniqueSampledIds.slice(0, targetLimit + 6) } },
+        orderBy: [{ documentId: "asc" }, { pageNumber: "asc" }],
+        include: {
+          document: {
+            select: {
+              id: true,
+              title: true,
+              fileName: true,
+              chapter: {
+                select: {
+                  title: true,
+                  ue: { select: { id: true, code: true, title: true } },
+                },
               },
             },
           },
         },
-      },
-    });
-
-    for (const r of rows) {
-      pushChunk({
-        id: r.id,
-        content: r.content,
-        pageNumber: r.pageNumber,
-        documentId: r.document.id,
-        documentTitle: r.document.title,
-        fileName: r.document.fileName,
-        chapterTitle: r.document.chapter.title,
-        ueId: r.document.chapter.ue.id,
-        ueCode: r.document.chapter.ue.code,
-        ueTitle: r.document.chapter.ue.title,
       });
-      if (collected.length >= 10) break;
+
+      for (const r of rows) {
+        pushChunk({
+          id: r.id,
+          content: r.content,
+          pageNumber: r.pageNumber,
+          documentId: r.document.id,
+          documentTitle: r.document.title,
+          fileName: r.document.fileName,
+          chapterTitle: r.document.chapter.title,
+          ueId: r.document.chapter.ue.id,
+          ueCode: r.document.chapter.ue.code,
+          ueTitle: r.document.chapter.ue.title,
+        });
+        if (collected.length >= targetLimit) break;
+      }
     }
   }
 
-  return collected;
+  const finalChunks = collected.slice(0, targetLimit);
+  if (fullDocument) {
+    finalChunks.sort((a, b) => {
+      if (a.documentId !== b.documentId) {
+        return a.documentId.localeCompare(b.documentId);
+      }
+      return a.pageNumber - b.pageNumber;
+    });
+  }
+  return finalChunks;
 }
 
 function buildSourceRefs(chunks: SourceChunk[]): StudioSourceRef[] {
@@ -574,35 +712,70 @@ export function compileSwissEditorialSvg(params: {
 </svg>`;
 }
 
-async function callOllamaJson<T>(prompt: string): Promise<T | null> {
-  const health = await checkOllamaHealth();
-  if (!health.online) return null;
+let ollamaQueueTail: Promise<void> = Promise.resolve();
 
-  const { host, model } = getOllamaConfig();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 16000);
+function withOllamaLock<T>(task: () => Promise<T>): Promise<T> {
+  const run = ollamaQueueTail.then(task, task);
+  ollamaQueueTail = run.then(
+    () => undefined,
+    () => undefined
+  );
+  return run;
+}
 
+function parseLooseJson<T>(raw: string): T | null {
+  const trimmed = raw.trim();
   try {
-    const res = await fetch(`${host}/api/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        prompt,
-        format: "json",
-        stream: false,
-      }),
-      signal: controller.signal,
-    });
-    if (!res.ok) return null;
-    const data = (await res.json()) as { response?: string };
-    if (!data.response) return null;
-    return JSON.parse(data.response) as T;
+    return JSON.parse(trimmed) as T;
   } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
+    const match = trimmed.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]) as T;
+    } catch {
+      return null;
+    }
   }
+}
+
+async function callOllamaJson<T>(
+  prompt: string,
+  timeoutMs = 120000
+): Promise<T | null> {
+  return withOllamaLock(async () => {
+    const health = await checkOllamaHealth();
+    if (!health.online) return null;
+
+    const { host, model } = getOllamaConfig();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    try {
+      const res = await fetch(`${host}/api/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          prompt,
+          format: "json",
+          stream: false,
+          options: {
+            temperature: 0.4,
+            num_predict: 2800,
+          },
+        }),
+        signal: controller.signal,
+      });
+      if (!res.ok) return null;
+      const data = (await res.json()) as { response?: string };
+      if (!data.response) return null;
+      return parseLooseJson<T>(data.response);
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  });
 }
 
 function splitSentences(text: string): string[] {
@@ -612,10 +785,88 @@ function splitSentences(text: string): string[] {
     .filter((s) => s.length >= 25);
 }
 
+function resolveSourceChunkByPage(
+  chunks: SourceChunk[],
+  pageHint?: number,
+  fallbackIdx = 0
+): SourceChunk {
+  if (typeof pageHint === "number" && Number.isFinite(pageHint) && pageHint > 0) {
+    const exact = chunks.find((c) => c.pageNumber === pageHint);
+    if (exact) return exact;
+    let closest = chunks[0];
+    let bestDist = Infinity;
+    for (const c of chunks) {
+      const dist = Math.abs(c.pageNumber - pageHint);
+      if (dist < bestDist) {
+        bestDist = dist;
+        closest = c;
+      }
+    }
+    if (closest) return closest;
+  }
+  return chunks[fallbackIdx % chunks.length];
+}
+
 export interface PageImageInput {
   pageNumber: number;
   documentTitle?: string;
   base64: string;
+}
+
+function formatChunksForPrompt(
+  segmentChunks: SourceChunk[],
+  maxCharsPerChunk = 800,
+  maxChunks = 10
+): string {
+  return segmentChunks
+    .slice(0, maxChunks)
+    .map(
+      (c) =>
+        `[${c.fileName} · P.${c.pageNumber}] (${c.ueCode} - ${c.chapterTitle})\n${c.content.slice(
+          0,
+          maxCharsPerChunk
+        )}`
+    )
+    .join("\n\n");
+}
+
+function partitionChunks(
+  allChunks: SourceChunk[],
+  segmentCount: number
+): SourceChunk[][] {
+  if (allChunks.length === 0) return [];
+  if (segmentCount <= 1) return [allChunks];
+
+  if (allChunks.length <= segmentCount) {
+    const out: SourceChunk[][] = [];
+    for (let i = 0; i < segmentCount; i += 1) {
+      out.push([allChunks[i % allChunks.length]]);
+    }
+    return out;
+  }
+
+  const result: SourceChunk[][] = [];
+  for (let i = 0; i < segmentCount; i += 1) {
+    const start = Math.floor((i * allChunks.length) / segmentCount);
+    const end = Math.max(
+      start + 1,
+      Math.floor(((i + 1) * allChunks.length) / segmentCount)
+    );
+    result.push(allChunks.slice(start, end));
+  }
+  return result;
+}
+
+function computePageRangeLabel(segmentChunks: SourceChunk[]): string {
+  if (segmentChunks.length === 0) return "P.1";
+  let minP = Infinity;
+  let maxP = 0;
+  for (const c of segmentChunks) {
+    if (c.pageNumber < minP) minP = c.pageNumber;
+    if (c.pageNumber > maxP) maxP = c.pageNumber;
+  }
+  if (!Number.isFinite(minP)) return "P.1";
+  return minP === maxP ? `P.${minP}` : `P.${minP}–${maxP}`;
 }
 
 export async function generateStudioArtifact(params: {
@@ -623,16 +874,29 @@ export async function generateStudioArtifact(params: {
   chunks: SourceChunk[];
   title?: string;
   prompt?: string;
+  isPublic?: boolean;
   pageImagesBase64?: PageImageInput[];
-}): Promise<{ title: string; content: StudioArtifactContent }> {
-  const { kind, chunks, prompt, pageImagesBase64 } = params;
+  onProgress?: (percent: number, detailLabel: string) => void;
+  shouldStop?: () => boolean;
+}): Promise<{ title: string; content: StudioArtifactContent; usedAi: boolean }> {
+  const {
+    kind,
+    chunks,
+    prompt,
+    isPublic = false,
+    pageImagesBase64,
+    onProgress,
+    shouldStop,
+  } = params;
+  const fullCourseMode = Boolean(isPublic);
   const sources = buildSourceRefs(chunks);
 
-  // Prioritize chunks that contain visual figure markers alongside regular chunks
-  const orderedChunks = [
-    ...chunks.filter((c) => c.content.includes("[REPÈRE VISUEL")),
-    ...chunks.filter((c) => !c.content.includes("[REPÈRE VISUEL")),
-  ];
+  const orderedChunks = fullCourseMode
+    ? [...chunks]
+    : [
+        ...chunks.filter((c) => c.content.includes("[REPÈRE VISUEL")),
+        ...chunks.filter((c) => !c.content.includes("[REPÈRE VISUEL")),
+      ];
 
   let visualContextNote = "";
   if (Array.isArray(pageImagesBase64) && pageImagesBase64.length > 0) {
@@ -653,22 +917,20 @@ export async function generateStudioArtifact(params: {
   }
 
   const contextText =
-    visualContextNote +
-    orderedChunks
-      .slice(0, 6)
-      .map(
-        (c) =>
-          `[${c.fileName} · P.${c.pageNumber}] (${c.ueCode} - ${c.chapterTitle})\n${c.content}`
-      )
-      .join("\n\n");
+    visualContextNote + formatChunksForPrompt(orderedChunks, 850, 10);
 
   const defaultTopic =
-    prompt?.trim() ||
+    prompt?.trim().slice(0, 72) ||
     chunks[0]?.documentTitle ||
     chunks[0]?.ueTitle ||
     "Synthèse de cours";
 
+  const customContextBlock = prompt?.trim()
+    ? `\nOBJECTIF ET CONTEXTE PRIORITAIRE DE L'ÉTUDIANT :\n« ${prompt.trim()} »\nAdapte impérativement les explications, exemples et questions à ce que l'étudiant cherche à comprendre.\n`
+    : "";
+
   if (kind === "SVG_DIAGRAM") {
+    onProgress?.(20, "Génération du schéma vectoriel .SVG...");
     const aiDiagram = await callOllamaJson<{
       title?: string;
       subtitle?: string;
@@ -676,7 +938,8 @@ export async function generateStudioArtifact(params: {
       nodes?: SvgNodeSpec[];
       edges?: SvgEdgeSpec[];
     }>(
-      `À partir des extraits de cours suivants, conçois un schéma conceptuel structuré en français répondant à : "${defaultTopic}".
+      `Tu es Spix, professeur universitaire vétérinaire. À partir des extraits de cours ci-dessous, conçois un schéma conceptuel clair en français qui aide à comprendre la logique et les relations entre notions sur : "${defaultTopic}".
+${customContextBlock}
 Réponds STRICTEMENT en JSON :
 {
   "title": "Titre court du schéma",
@@ -700,12 +963,14 @@ ${contextText}`
     let diagramTitle = params.title?.trim() || `Schéma : ${defaultTopic}`;
     let subtitle = `${chunks[0]?.ueCode || "ARA"} · ${chunks[0]?.documentTitle || "COURS"}`;
     let layout: "FLOW" | "HIERARCHY" | "RADIAL" = "FLOW";
+    let usedAi = false;
 
     if (
       aiDiagram?.nodes &&
       Array.isArray(aiDiagram.nodes) &&
       aiDiagram.nodes.length >= 2
     ) {
+      usedAi = true;
       nodes = aiDiagram.nodes.slice(0, 6).map((n, idx) => ({
         id: n.id || `n${idx + 1}`,
         code: n.code || `0${idx + 1}`,
@@ -724,7 +989,6 @@ ${contextText}`
         layout = aiDiagram.layout;
       }
     } else {
-      // Deterministic node/edge diagram extraction from course chunks
       const usedChunks = chunks.slice(0, 5);
       nodes = usedChunks.map((c, idx) => {
         const sents = splitSentences(c.content);
@@ -755,8 +1019,10 @@ ${contextText}`
       sources,
     });
 
+    onProgress?.(100, "Schéma .SVG terminé");
     return {
       title: diagramTitle,
+      usedAi,
       content: {
         kind: "SVG_DIAGRAM",
         title: diagramTitle,
@@ -771,331 +1037,1272 @@ ${contextText}`
   }
 
   if (kind === "FLASHCARDS") {
-    const title = params.title?.trim() || `Flashcards : ${defaultTopic}`;
-    const aiCards = await callOllamaJson<{
-      cards?: Array<{ front?: string; back?: string; tag?: string }>;
-    }>(
-      `Génère 6 flashcards recto/verso de révision universitaire en français sur : "${defaultTopic}".
+    const targetCount = fullCourseMode ? 60 : 10;
+    const title =
+      params.title?.trim() ||
+      (fullCourseMode
+        ? `60 Flashcards — ${chunks[0]?.documentTitle || defaultTopic}`
+        : `Flashcards ciblées : ${defaultTopic}`);
+
+    const segments = fullCourseMode
+      ? partitionChunks(orderedChunks, 6)
+      : [orderedChunks.slice(0, 10)];
+
+    const cards: FlashcardItem[] = [];
+    const seenFronts = new Set<string>();
+    let anyAiUsed = false;
+
+    for (let sIdx = 0; sIdx < segments.length; sIdx += 1) {
+      if (shouldStop?.() || cards.length >= targetCount) break;
+
+      const segChunks = segments[sIdx];
+      const pageSpan = computePageRangeLabel(segChunks);
+      onProgress?.(
+        Math.round((sIdx / segments.length) * 100),
+        `Flashcards (${pageSpan} · Lot ${sIdx + 1}/${segments.length})`
+      );
+
+      const segContext = formatChunksForPrompt(segChunks, 820, 10);
+      const countForPass = fullCourseMode ? "10 à 12" : "10";
+      const scopeHint = fullCourseMode
+        ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : couvre exhaustivement toutes les notions de ces pages (objectif global : 95 % du cours sur les ${segments.length} lots).`
+        : "Focus ciblé et pointu sur la difficulté ou notion demandée.";
+
+      const aiCards = await callOllamaJson<{
+        cards?: Array<{
+          front?: string;
+          back?: string;
+          tag?: string;
+          sourcePage?: number;
+        }>;
+      }>(
+        `Tu es Spix, professeur universitaire vétérinaire. Génère exactement ${countForPass} flashcards distinctes de RÉVISION ACTIVE et de COMPRÉHENSION en français basées sur ces extraits.
+${scopeHint}
+${customContextBlock}
+RÈGLES PÉDAGOGIQUES STRICTES :
+- Chaque RECTO ("front") pose une question précise testant un mécanisme, une cause/conséquence, un critère différentiel, un rôle ou un seuil clé.
+- Chaque VERSO ("back") donne une réponse complète, claire et rigoureuse (1 à 3 phrases) tirée du cours.
+- Aucun doublon avec les autres lots, et indique "sourcePage" (numéro de page de l'extrait).
+
 Réponds STRICTEMENT en JSON :
 {
   "cards": [
-    { "front": "Question précise au recto ?", "back": "Réponse concise et rigoureuse au verso.", "tag": "NOTION" }
+    {
+      "front": "Pourquoi / Comment / Quel mécanisme ... ?",
+      "back": "Explication claire, mécanisme précis et conséquence clé.",
+      "tag": "MÉCANISME",
+      "sourcePage": 1
+    }
   ]
 }
 
 EXTRAITS :
-${contextText}`
-    );
+${segContext}`
+      );
 
-    let cards: FlashcardItem[] = [];
-    if (aiCards?.cards && Array.isArray(aiCards.cards) && aiCards.cards.length > 0) {
-      cards = aiCards.cards
-        .filter((c) => c.front && c.back)
-        .slice(0, 8)
-        .map((c, idx) => {
-          const src = chunks[idx % chunks.length];
-          return {
-            id: `fc-${crypto.randomUUID().slice(0, 6)}`,
-            front: String(c.front),
-            back: String(c.back),
-            tag: String(c.tag || src?.ueCode || "COURS"),
+      if (aiCards?.cards && Array.isArray(aiCards.cards) && aiCards.cards.length > 0) {
+        anyAiUsed = true;
+        for (let idx = 0; idx < aiCards.cards.length; idx += 1) {
+          const c = aiCards.cards[idx];
+          if (!c.front || !c.back) continue;
+          const cleanFront = String(c.front).trim();
+          const normKey = cleanFront.toLowerCase().slice(0, 60);
+          if (seenFronts.has(normKey)) continue;
+          seenFronts.add(normKey);
+
+          const src = resolveSourceChunkByPage(segChunks, c.sourcePage, idx);
+          cards.push({
+            id: `fc-${cards.length + 1}-${crypto.randomUUID().slice(0, 4)}`,
+            front: cleanFront,
+            back: String(c.back).trim(),
+            tag: String(c.tag || src?.ueCode || "COURS").trim(),
             documentId: src?.documentId || "",
             fileName: src?.fileName || "document.pdf",
             pageNumber: src?.pageNumber || 1,
             ueId: src?.ueId || "",
-          };
-        });
+          });
+          if (cards.length >= targetCount) break;
+        }
+      }
     }
 
-    if (cards.length === 0) {
-      cards = chunks.slice(0, 6).map((c, idx) => {
+    // Complete remaining slots only if non-AI fallback or slight AI shortfall during interactive mode
+    if (cards.length < targetCount && (anyAiUsed || !shouldStop?.())) {
+      const sentencePool: Array<{ chunk: SourceChunk; sent: string }> = [];
+      for (const c of orderedChunks) {
         const sents = splitSentences(c.content);
-        const answer = sents[0] || c.content.slice(0, 180);
-        return {
-          id: `fc-${idx + 1}`,
-          front: `Que précise « ${c.documentTitle} » (${c.chapterTitle}, p.${c.pageNumber}) sur ce point clé ?`,
-          back: answer,
-          tag: c.ueCode,
-          documentId: c.documentId,
-          fileName: c.fileName,
-          pageNumber: c.pageNumber,
-          ueId: c.ueId,
-        };
-      });
+        if (sents.length > 0) {
+          for (const s of sents) sentencePool.push({ chunk: c, sent: s });
+        } else if (c.content.trim().length > 20) {
+          sentencePool.push({ chunk: c, sent: c.content.trim().slice(0, 220) });
+        }
+      }
+      if (sentencePool.length > 0) {
+        let cursor = 0;
+        const maxFallbackFill = anyAiUsed
+          ? targetCount
+          : Math.min(targetCount, sentencePool.length);
+        while (cards.length < maxFallbackFill && cursor < targetCount * 2) {
+          const entry = sentencePool[cursor % sentencePool.length];
+          cursor += 1;
+          const frontText = `Notion clé (${entry.chunk.chapterTitle}, p.${entry.chunk.pageNumber} · #${cards.length + 1}) : quel élément faut-il maîtriser ?`;
+          const normKey = frontText.toLowerCase().slice(0, 60);
+          if (seenFronts.has(normKey)) continue;
+          seenFronts.add(normKey);
+          cards.push({
+            id: `fc-${cards.length + 1}`,
+            front: frontText,
+            back: entry.sent,
+            tag: entry.chunk.ueCode,
+            documentId: entry.chunk.documentId,
+            fileName: entry.chunk.fileName,
+            pageNumber: entry.chunk.pageNumber,
+            ueId: entry.chunk.ueId,
+          });
+        }
+      }
     }
 
+    onProgress?.(100, `${cards.length} flashcards générées`);
     return {
       title,
+      usedAi: anyAiUsed,
       content: {
         kind: "FLASHCARDS",
-        cards,
+        cards: cards.slice(0, targetCount),
         sources,
       },
     };
   }
 
   if (kind === "QUIZ") {
-    const title = params.title?.trim() || `Quiz ciblé : ${defaultTopic}`;
-    const aiQuiz = await callOllamaJson<{
-      questions?: Array<{
-        type?: "QCU" | "QCM" | "FILL_BLANK";
-        prompt?: string;
-        options?: string[];
-        correctIndices?: number[];
-        sentenceWithBlank?: string;
-        correctAnswer?: string;
-        distractors?: string[];
-        explanation?: string;
-      }>;
-    }>(
-      `Génère 4 questions de quiz universitaire en français sur : "${defaultTopic}".
-Inclus des QCU (1 bonne réponse), QCM (2 bonnes réponses) et FILL_BLANK (avec [ ______ ]).
+    const targetCount = fullCourseMode ? 30 : 6;
+    const title =
+      params.title?.trim() ||
+      (fullCourseMode
+        ? `Quiz complet (30 Q) — ${chunks[0]?.documentTitle || defaultTopic}`
+        : `Quiz ciblé : ${defaultTopic}`);
+
+    const segments = fullCourseMode
+      ? partitionChunks(orderedChunks, 6)
+      : [orderedChunks.slice(0, 10)];
+
+    const questions: RevisionQuestion[] = [];
+    const seenPrompts = new Set<string>();
+    let anyAiUsed = false;
+
+    for (let sIdx = 0; sIdx < segments.length; sIdx += 1) {
+      if (shouldStop?.() || questions.length >= targetCount) break;
+
+      const segChunks = segments[sIdx];
+      const pageSpan = computePageRangeLabel(segChunks);
+      onProgress?.(
+        Math.round((sIdx / segments.length) * 100),
+        `Quiz (${pageSpan} · Lot ${sIdx + 1}/${segments.length})`
+      );
+
+      const segContext = formatChunksForPrompt(segChunks, 820, 10);
+      const batchSize = fullCourseMode ? 5 : 6;
+      const scopeHint = fullCourseMode
+        ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : interroge en profondeur cette portion pour couvrir 95 % du cours sur les ${segments.length} lots.`
+        : "Focus ciblé et exigeant sur ce que l'étudiant cherche à comprendre.";
+
+      const aiQuiz = await callOllamaJson<{
+        questions?: Array<{
+          type?: "QCU" | "QCM" | "QROC" | "FILL_BLANK";
+          prompt?: string;
+          options?: string[];
+          correctIndices?: number[];
+          sentenceWithBlank?: string;
+          correctAnswer?: string;
+          acceptedKeywords?: string[];
+          distractors?: string[];
+          explanation?: string;
+          sourcePage?: number;
+        }>;
+      }>(
+        `Tu es Spix, professeur universitaire vétérinaire. Génère un QUIZ ORIGINAL de ${batchSize} questions en français conçu pour vérifier que l'étudiant a COMPRIS les notions et mécanismes des extraits ci-dessous.
+${scopeHint}
+${customContextBlock}
+RÈGLES PÉDAGOGIQUES STRICTES :
+1. NE JAMAIS recopier une phrase brute en demandant « quelle phrase figure dans le cours ».
+2. Pose des questions de COMPRÉHENSION et de RAISONNEMENT : mécanismes, relations cause -> effet, scénarios ("Que se passe-t-il si... ?"), comparaisons, cas pratiques/cliniques, et pièges classiques.
+3. Varie les formats sur ces ${batchSize} questions : inclus des "QCU" (1 bonne réponse parmi 4), des "QCM" (2 ou 3 bonnes réponses parmi 4), et au moins 1 "QROC" (question ouverte courte dont la réponse tient en 1 à 5 mots).
+4. Chaque "explanation" doit justifier clairement pourquoi la bonne réponse est exacte et pourquoi les distracteurs sont faux.
+
 Réponds STRICTEMENT en JSON :
 {
   "questions": [
     {
       "type": "QCU",
-      "prompt": "...",
-      "options": ["A", "B", "C", "D"],
+      "prompt": "Question originale de compréhension ou mise en situation ?",
+      "options": ["Proposition A", "Proposition B", "Proposition C", "Proposition D"],
       "correctIndices": [0],
-      "explanation": "..."
+      "explanation": "Justification pédagogique précise.",
+      "sourcePage": 2
+    },
+    {
+      "type": "QCM",
+      "prompt": "Parmi les affirmations suivantes sur ce mécanisme, lesquelles sont exactes ?",
+      "options": ["Prop 1", "Prop 2", "Prop 3", "Prop 4"],
+      "correctIndices": [0, 2],
+      "explanation": "Justification pédagogique.",
+      "sourcePage": 4
+    },
+    {
+      "type": "QROC",
+      "prompt": "Question ouverte courte vérifiant une notion clé ?",
+      "correctAnswer": "Réponse courte attendue",
+      "acceptedKeywords": ["motcle1", "synonyme"],
+      "explanation": "Justification pédagogique.",
+      "sourcePage": 5
     }
   ]
 }
 
 EXTRAITS :
-${contextText}`
-    );
+${segContext}`
+      );
 
-    const questions: RevisionQuestion[] = [];
+      if (aiQuiz?.questions && Array.isArray(aiQuiz.questions) && aiQuiz.questions.length > 0) {
+        for (let idx = 0; idx < aiQuiz.questions.length; idx += 1) {
+          if (questions.length >= targetCount) break;
+          const q = aiQuiz.questions[idx];
+          const src = resolveSourceChunkByPage(segChunks, q.sourcePage, idx);
+          if (!src || !q.prompt) continue;
 
-    if (aiQuiz?.questions && Array.isArray(aiQuiz.questions)) {
-      aiQuiz.questions.slice(0, 5).forEach((q, idx) => {
-        const src = chunks[idx % chunks.length];
-        if (!src || !q.prompt) return;
+          const cleanPrompt = q.prompt.trim();
+          const promptKey = cleanPrompt.toLowerCase().slice(0, 60);
+          if (seenPrompts.has(promptKey)) continue;
 
-        if (
-          (q.type === "QCU" || q.type === "QCM") &&
-          Array.isArray(q.options) &&
-          q.options.length === 4 &&
-          Array.isArray(q.correctIndices) &&
-          q.correctIndices.length > 0
+          if (
+            (q.type === "QCU" || q.type === "QCM") &&
+            Array.isArray(q.options) &&
+            q.options.length === 4 &&
+            Array.isArray(q.correctIndices)
+          ) {
+            const validIndices = Array.from(
+              new Set(
+                q.correctIndices.filter(
+                  (i) => typeof i === "number" && i >= 0 && i < 4
+                )
+              )
+            ).sort((a, b) => a - b);
+
+            if (validIndices.length > 0) {
+              seenPrompts.add(promptKey);
+              anyAiUsed = true;
+              questions.push({
+                id: `sq-${questions.length + 1}`,
+                type: q.type,
+                ueId: src.ueId,
+                ueCode: src.ueCode,
+                ueTitle: src.ueTitle,
+                chapterTitle: src.chapterTitle,
+                documentId: src.documentId,
+                documentTitle: src.documentTitle,
+                fileName: src.fileName,
+                pageNumber: src.pageNumber,
+                prompt: cleanPrompt,
+                options: q.options.map((o) => String(o).trim()),
+                correctIndices:
+                  q.type === "QCU" ? [validIndices[0]] : validIndices,
+                explanation:
+                  q.explanation?.trim() ||
+                  `Source : ${src.documentTitle} (p.${src.pageNumber}).`,
+                generatedByAi: true,
+              });
+            }
+          } else if (
+            q.type === "QROC" &&
+            typeof q.correctAnswer === "string" &&
+            q.correctAnswer.trim().length > 0
+          ) {
+            seenPrompts.add(promptKey);
+            anyAiUsed = true;
+            const mainAnswer = q.correctAnswer.trim();
+            const kw = Array.isArray(q.acceptedKeywords)
+              ? q.acceptedKeywords
+                  .map((k) => String(k).trim())
+                  .filter((k) => k.length > 0)
+              : [];
+            questions.push({
+              id: `sq-${questions.length + 1}`,
+              type: "QROC",
+              ueId: src.ueId,
+              ueCode: src.ueCode,
+              ueTitle: src.ueTitle,
+              chapterTitle: src.chapterTitle,
+              documentId: src.documentId,
+              documentTitle: src.documentTitle,
+              fileName: src.fileName,
+              pageNumber: src.pageNumber,
+              prompt: cleanPrompt,
+              correctAnswer: mainAnswer,
+              acceptedKeywords: Array.from(new Set([mainAnswer, ...kw])),
+              explanation:
+                q.explanation?.trim() ||
+                `Réponse attendue : « ${mainAnswer} » (p.${src.pageNumber}).`,
+              generatedByAi: true,
+            });
+          } else if (
+            q.type === "FILL_BLANK" &&
+            q.sentenceWithBlank &&
+            q.correctAnswer
+          ) {
+            seenPrompts.add(promptKey);
+            anyAiUsed = true;
+            const bank = [
+              q.correctAnswer,
+              ...(Array.isArray(q.distractors) ? q.distractors.slice(0, 3) : []),
+            ];
+            questions.push({
+              id: `sq-${questions.length + 1}`,
+              type: "FILL_BLANK",
+              ueId: src.ueId,
+              ueCode: src.ueCode,
+              ueTitle: src.ueTitle,
+              chapterTitle: src.chapterTitle,
+              documentId: src.documentId,
+              documentTitle: src.documentTitle,
+              fileName: src.fileName,
+              pageNumber: src.pageNumber,
+              prompt: cleanPrompt,
+              sentenceWithBlank: q.sentenceWithBlank,
+              correctAnswer: q.correctAnswer,
+              wordBank: bank,
+              explanation:
+                q.explanation?.trim() ||
+                `Terme attendu : « ${q.correctAnswer} » (p.${src.pageNumber}).`,
+              generatedByAi: true,
+            });
+          }
+        }
+      }
+    }
+
+    if (questions.length < targetCount && (anyAiUsed || !shouldStop?.())) {
+      const sentencePool: Array<{ chunk: SourceChunk; sent: string }> = [];
+      for (const c of orderedChunks) {
+        const sents = splitSentences(c.content);
+        if (sents.length > 0) {
+          for (const s of sents) sentencePool.push({ chunk: c, sent: s });
+        } else if (c.content.trim().length > 20) {
+          sentencePool.push({ chunk: c, sent: c.content.trim().slice(0, 180) });
+        }
+      }
+      if (sentencePool.length > 0) {
+        let cursor = 0;
+        const maxFallbackQuestions = anyAiUsed
+          ? targetCount
+          : Math.min(targetCount, Math.max(3, sentencePool.length));
+        while (
+          questions.length < maxFallbackQuestions &&
+          cursor < targetCount * 2
         ) {
+          const item = sentencePool[cursor % sentencePool.length];
+          const other =
+            sentencePool[(cursor + 1) % sentencePool.length] || item;
+          cursor += 1;
+          const fallbackPrompt = `D'après « ${item.chunk.documentTitle} » (${item.chunk.ueCode}, p.${item.chunk.pageNumber} · Q${questions.length + 1}), quelle proposition correspond exactement au cours ?`;
+          const key = fallbackPrompt.toLowerCase().slice(0, 60);
+          if (seenPrompts.has(key)) continue;
+          seenPrompts.add(key);
+
           questions.push({
-            id: `sq-${idx + 1}`,
-            type: q.type,
-            ueId: src.ueId,
-            ueCode: src.ueCode,
-            ueTitle: src.ueTitle,
-            chapterTitle: src.chapterTitle,
-            documentId: src.documentId,
-            documentTitle: src.documentTitle,
-            fileName: src.fileName,
-            pageNumber: src.pageNumber,
-            prompt: q.prompt,
-            options: q.options,
-            correctIndices: q.correctIndices,
-            explanation:
-              q.explanation ||
-              `Source : ${src.documentTitle} (p.${src.pageNumber}).`,
-          });
-        } else if (
-          q.type === "FILL_BLANK" &&
-          q.sentenceWithBlank &&
-          q.correctAnswer
-        ) {
-          const bank = [
-            q.correctAnswer,
-            ...(Array.isArray(q.distractors) ? q.distractors.slice(0, 3) : []),
-          ];
-          questions.push({
-            id: `sq-${idx + 1}`,
-            type: "FILL_BLANK",
-            ueId: src.ueId,
-            ueCode: src.ueCode,
-            ueTitle: src.ueTitle,
-            chapterTitle: src.chapterTitle,
-            documentId: src.documentId,
-            documentTitle: src.documentTitle,
-            fileName: src.fileName,
-            pageNumber: src.pageNumber,
-            prompt: q.prompt,
-            sentenceWithBlank: q.sentenceWithBlank,
-            correctAnswer: q.correctAnswer,
-            wordBank: bank,
-            explanation:
-              q.explanation ||
-              `Terme attendu : « ${q.correctAnswer} » (p.${src.pageNumber}).`,
+            id: `sq-${questions.length + 1}`,
+            type: "QCU",
+            ueId: item.chunk.ueId,
+            ueCode: item.chunk.ueCode,
+            ueTitle: item.chunk.ueTitle,
+            chapterTitle: item.chunk.chapterTitle,
+            documentId: item.chunk.documentId,
+            documentTitle: item.chunk.documentTitle,
+            fileName: item.chunk.fileName,
+            pageNumber: item.chunk.pageNumber,
+            prompt: fallbackPrompt,
+            options: [
+              item.sent,
+              other.sent !== item.sent
+                ? other.sent
+                : `Affirmation inversée concernant ${item.chunk.chapterTitle}.`,
+              `Cette notion n'est pas abordée dans ${item.chunk.chapterTitle}.`,
+              `Assertion contradictoire avec la page ${item.chunk.pageNumber}.`,
+            ],
+            correctIndices: [0],
+            explanation: `Extrait direct de ${item.chunk.fileName} (page ${item.chunk.pageNumber}).`,
+            generatedByAi: false,
           });
         }
-      });
+      }
     }
 
-    if (questions.length === 0) {
-      chunks.slice(0, 3).forEach((src, idx) => {
-        const sents = splitSentences(src.content);
-        const correct = sents[0] || src.content.slice(0, 160);
-        const other = chunks[(idx + 1) % chunks.length];
-        const otherSent =
-          splitSentences(other?.content || "")[0] ||
-          "Proposition sans lien direct avec cette page.";
-        questions.push({
-          id: `sq-${idx + 1}`,
-          type: "QCU",
-          ueId: src.ueId,
-          ueCode: src.ueCode,
-          ueTitle: src.ueTitle,
-          chapterTitle: src.chapterTitle,
-          documentId: src.documentId,
-          documentTitle: src.documentTitle,
-          fileName: src.fileName,
-          pageNumber: src.pageNumber,
-          prompt: `D'après « ${src.documentTitle} » (${src.ueCode}, p.${src.pageNumber}), quel énoncé est exact ?`,
-          options: [
-            correct,
-            otherSent,
-            `Cette section ne traite pas de ${src.chapterTitle}.`,
-            `Assertion contradictoire avec la page ${src.pageNumber}.`,
-          ],
-          correctIndices: [0],
-          explanation: `Extrait direct de ${src.fileName} (page ${src.pageNumber}).`,
-        });
-      });
-    }
-
+    onProgress?.(100, `${questions.length} questions générées`);
     return {
       title,
+      usedAi: anyAiUsed,
       content: {
         kind: "QUIZ",
-        questions,
+        questions: questions.slice(0, targetCount),
         sources,
       },
     };
   }
 
-  // SUMMARY
-  const title = params.title?.trim() || `Fiche Synthèse : ${defaultTopic}`;
-  const aiSummary = await callOllamaJson<{
-    overview?: string;
-    keyConcepts?: Array<{ term?: string; definition?: string }>;
-    examPitfalls?: string[];
-  }>(
-    `Rédige une fiche de synthèse structurée style NotebookLM en français sur : "${defaultTopic}".
+  // SUMMARY: Full-course structured summary (public 95%) vs targeted (private 5%)
+  const title =
+    params.title?.trim() ||
+    (fullCourseMode
+      ? `Fiche Cours Complet (95%) — ${chunks[0]?.documentTitle || defaultTopic}`
+      : `Fiche Ciblée : ${defaultTopic}`);
+
+  const segments = fullCourseMode
+    ? partitionChunks(orderedChunks, 4)
+    : [orderedChunks.slice(0, 10)];
+
+  const sections: SummarySection[] = [];
+  const overviewParts: string[] = [];
+  const allConcepts: SummaryPayload["keyConcepts"] = [];
+  const seenTerms = new Set<string>();
+  const allPitfalls: string[] = [];
+  const seenPitfalls = new Set<string>();
+  let anyAiUsed = false;
+
+  for (let sIdx = 0; sIdx < segments.length; sIdx += 1) {
+    if (shouldStop?.()) break;
+
+    const segChunks = segments[sIdx];
+    const pageSpan = computePageRangeLabel(segChunks);
+    onProgress?.(
+      Math.round((sIdx / segments.length) * 100),
+      fullCourseMode
+        ? `Fiche complète (${pageSpan} · Partie ${sIdx + 1}/${segments.length})`
+        : "Rédaction de la fiche ciblée..."
+    );
+
+    const segContext = formatChunksForPrompt(segChunks, 850, 12);
+    const scopeInstruction = fullCourseMode
+      ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : Rédige un chapitre complet permettant à l'étudiant d'APPRENDRE INTÉGRALEMENT cette partie du polycopié sans avoir à rouvrir le PDF (mécanismes détaillés, définitions exactes, critères, seuils et repères).`
+      : "Rédige une fiche pédagogique ciblée qui répond exactement à la difficulté ou question de l'étudiant.";
+
+    const aiPart = await callOllamaJson<{
+      sectionTitle?: string;
+      summaryText?: string;
+      keyPoints?: string[];
+      keyConcepts?: Array<{
+        term?: string;
+        definition?: string;
+        sourcePage?: number;
+      }>;
+      examPitfalls?: string[];
+    }>(
+      `Tu es Spix, professeur universitaire vétérinaire. ${scopeInstruction}
+${customContextBlock}
 Réponds STRICTEMENT en JSON :
 {
-  "overview": "Paragraphe de synthèse clair et structuré (4-6 lignes).",
-  "keyConcepts": [
-    { "term": "Concept clé", "definition": "Définition précise issue du cours" }
+  "sectionTitle": "Titre clair et structuré de cette partie",
+  "summaryText": "Explication complète, fluide et pédagogique de la logique, des mécanismes, des rôles et des valeurs clés de cette partie (8 à 12 lignes).",
+  "keyPoints": [
+    "Point essentiel détaillé 1 (avec repère/valeur exacte si présent)",
+    "Point essentiel détaillé 2",
+    "Point essentiel détaillé 3",
+    "Point essentiel détaillé 4",
+    "Point essentiel détaillé 5"
   ],
-  "examPitfalls": ["Piège fréquent ou point de vigilance au partiel"]
+  "keyConcepts": [
+    { "term": "Concept clé", "definition": "Explication détaillée, mécanisme et repères...", "sourcePage": 1 }
+  ],
+  "examPitfalls": ["Piège fréquent ou confusion à éviter en partiel"]
 }
 
 EXTRAITS :
-${contextText}`
-  );
+${segContext}`
+    );
 
-  const overview =
-    aiSummary?.overview ||
-    chunks
-      .slice(0, 3)
-      .map((c) => splitSentences(c.content)[0] || c.content.slice(0, 180))
-      .join(" ");
+    const hasAiContent = Boolean(
+      aiPart?.summaryText ||
+        (aiPart?.keyConcepts && aiPart.keyConcepts.length > 0) ||
+        (aiPart?.keyPoints && aiPart.keyPoints.length > 0)
+    );
 
-  const keyConcepts =
-    aiSummary?.keyConcepts && aiSummary.keyConcepts.length > 0
-      ? aiSummary.keyConcepts.slice(0, 6).map((kc, idx) => {
-          const src = chunks[idx % chunks.length];
-          return {
-            term: kc.term || `Notion ${idx + 1}`,
-            definition: kc.definition || "",
-            sourceLabel: `[${src.fileName.toUpperCase()} · P.${src.pageNumber}]`,
-            documentId: src.documentId,
-            pageNumber: src.pageNumber,
-            ueId: src.ueId,
-          };
-        })
-      : chunks.slice(0, 4).map((c) => ({
-          term: c.chapterTitle,
-          definition: splitSentences(c.content)[0] || c.content.slice(0, 180),
-          sourceLabel: `[${c.fileName.toUpperCase()} · P.${c.pageNumber}]`,
-          documentId: c.documentId,
-          pageNumber: c.pageNumber,
-          ueId: c.ueId,
-        }));
+    if (hasAiContent) {
+      anyAiUsed = true;
+      const sectionTitle =
+        aiPart?.sectionTitle?.trim() ||
+        (fullCourseMode
+          ? `Partie ${sIdx + 1} · ${segChunks[0]?.chapterTitle || "Cours"}`
+          : defaultTopic);
+      const summaryText =
+        aiPart?.summaryText?.trim() ||
+        segChunks
+          .slice(0, 3)
+          .map((c) => splitSentences(c.content)[0] || c.content.slice(0, 200))
+          .join(" ");
+      const keyPoints = Array.isArray(aiPart?.keyPoints)
+        ? aiPart!.keyPoints.map((k) => String(k).trim()).filter(Boolean)
+        : [];
 
-  const examPitfalls =
-    aiSummary?.examPitfalls && aiSummary.examPitfalls.length > 0
-      ? aiSummary.examPitfalls
-      : [
-          "Vérifier les définitions exactes et les seuils numériques dans les polycopiés officiels.",
-          "Relier chaque mécanisme aux schémas présentés en cours.",
-        ];
+      sections.push({
+        title: sectionTitle,
+        pageRange: pageSpan,
+        content: summaryText,
+        keyPoints,
+      });
+      overviewParts.push(
+        fullCourseMode
+          ? `[${sectionTitle} · ${pageSpan}] ${summaryText.split(/(?<=[.!?])\s+/)[0] || summaryText.slice(0, 180)}`
+          : summaryText
+      );
 
+      for (let idx = 0; idx < (aiPart?.keyConcepts || []).length; idx += 1) {
+        const kc = aiPart!.keyConcepts![idx];
+        const term = (kc.term || "").trim();
+        const def = (kc.definition || "").trim();
+        if (!term || !def) continue;
+        const tKey = term.toLowerCase();
+        if (seenTerms.has(tKey)) continue;
+        seenTerms.add(tKey);
+
+        const src = resolveSourceChunkByPage(segChunks, kc.sourcePage, idx);
+        allConcepts.push({
+          term,
+          definition: def,
+          sourceLabel: `[${src.fileName.toUpperCase()} · P.${src.pageNumber}]`,
+          documentId: src.documentId,
+          pageNumber: src.pageNumber,
+          ueId: src.ueId,
+        });
+      }
+
+      for (const p of aiPart?.examPitfalls || []) {
+        const cleanP = String(p).trim();
+        if (!cleanP) continue;
+        const pKey = cleanP.toLowerCase().slice(0, 50);
+        if (!seenPitfalls.has(pKey)) {
+          seenPitfalls.add(pKey);
+          allPitfalls.push(cleanP);
+        }
+      }
+    } else {
+      const fallbackText = segChunks
+        .slice(0, 3)
+        .map((c) => splitSentences(c.content)[0] || c.content.slice(0, 200))
+        .join(" ");
+      sections.push({
+        title: fullCourseMode
+          ? `Partie ${sIdx + 1} · ${segChunks[0]?.chapterTitle || "Section"}`
+          : defaultTopic,
+        pageRange: pageSpan,
+        content: fallbackText,
+        keyPoints: segChunks
+          .slice(0, 4)
+          .map((c) => splitSentences(c.content)[0] || c.content.slice(0, 140))
+          .filter(Boolean),
+      });
+      overviewParts.push(fallbackText);
+    }
+  }
+
+  const maxConcepts = fullCourseMode ? 24 : 7;
+  const maxPitfalls = fullCourseMode ? 12 : 5;
+
+  if (allConcepts.length === 0) {
+    for (const c of orderedChunks.slice(0, 4)) {
+      allConcepts.push({
+        term: c.chapterTitle,
+        definition: splitSentences(c.content)[0] || c.content.slice(0, 180),
+        sourceLabel: `[${c.fileName.toUpperCase()} · P.${c.pageNumber}]`,
+        documentId: c.documentId,
+        pageNumber: c.pageNumber,
+        ueId: c.ueId,
+      });
+    }
+  }
+
+  if (allPitfalls.length === 0) {
+    allPitfalls.push(
+      "Vérifier les définitions exactes et les seuils numériques dans les polycopiés officiels.",
+      "Relier chaque mécanisme aux schémas présentés en cours."
+    );
+  }
+
+  onProgress?.(100, "Fiche de révision complète générée");
   return {
     title,
+    usedAi: anyAiUsed,
     content: {
       kind: "SUMMARY",
-      overview,
-      keyConcepts,
-      examPitfalls,
+      overview: overviewParts.join(" "),
+      sections,
+      keyConcepts: allConcepts.slice(0, maxConcepts),
+      examPitfalls: allPitfalls.slice(0, maxPitfalls),
       sources,
     },
   };
 }
 
-export async function autoGenerateDocumentStudyPack(params: {
-  userId: string;
-  ueId: string;
-  documentId: string;
-  documentTitle: string;
-  isPublic?: boolean;
-}): Promise<Array<{ id: string; kind: StudioArtifactKind; title: string }>> {
+export async function hasExistingPublicArtifact(
+  documentId: string | null | undefined,
+  kind: StudioArtifactKind
+): Promise<boolean> {
+  if (!documentId) return false;
   await ensureStudioSchema();
-
-  const chunks = await gatherStudioSourceChunks({
-    ueId: params.ueId,
-    documentIds: [params.documentId],
+  const existing = await prisma.studyArtifact.findFirst({
+    where: {
+      documentId,
+      kind,
+      isPublic: true,
+    },
+    select: { id: true },
   });
+  return Boolean(existing);
+}
 
-  if (chunks.length === 0) {
-    return [];
+export interface IndexingQueueItem {
+  documentId: string;
+  chapterId: string;
+  title: string;
+  fileName: string;
+  ueCode: string;
+  chapterTitle: string;
+  pageCount: number;
+  totalChunks: number;
+  embeddedChunks: number;
+  status: "PENDING" | "RUNNING";
+}
+
+export interface AiQueueItem {
+  id: string;
+  documentId: string;
+  chapterId: string;
+  documentTitle: string;
+  fileName: string;
+  ueCode: string;
+  chapterTitle: string;
+  kind: "SUMMARY" | "FLASHCARDS" | "QUIZ";
+  label: string;
+  status: "PENDING" | "RUNNING";
+}
+
+export interface BackgroundQueueSnapshot {
+  worker: {
+    isRunning: boolean;
+    stopRequested: boolean;
+    mode: "IDLE" | "NIGHTLY_AUTO" | "ADMIN_MANUAL";
+    currentPhase: "IDLE" | "INDEXING" | "AI_GENERATION";
+    currentTaskLabel: string | null;
+    currentItemProgressPercent: number;
+    overallProgressPercent: number;
+    completedItemsInRun: number;
+    totalItemsInRun: number;
+    startedAt: string | null;
+    lastRunAt: string | null;
+    lastRunSummary: string | null;
+    nextNightlyWindowLabel: string;
+  };
+  eta: {
+    indexingEtaSeconds: number;
+    aiEtaSeconds: number;
+    totalEtaSeconds: number;
+    avgMsPerChunk: number;
+    avgMsPerAiArtifact: number;
+  };
+  indexingQueue: IndexingQueueItem[];
+  aiContentQueue: AiQueueItem[];
+  counts: {
+    totalDocuments: number;
+    indexedDocuments: number;
+    unindexedDocuments: number;
+    pendingIndexingChunks: number;
+    totalExpectedAiArtifacts: number;
+    completedPublicAiArtifacts: number;
+    pendingAiArtifacts: number;
+  };
+}
+
+interface InternalBackgroundQueueState {
+  isRunning: boolean;
+  stopRequested: boolean;
+  mode: "IDLE" | "NIGHTLY_AUTO" | "ADMIN_MANUAL";
+  currentPhase: "IDLE" | "INDEXING" | "AI_GENERATION";
+  currentDocumentId: string | null;
+  currentAiKind: "SUMMARY" | "FLASHCARDS" | "QUIZ" | null;
+  currentTaskLabel: string | null;
+  currentItemProgressPercent: number;
+  currentItemStartedAtMs: number | null;
+  completedItemsInRun: number;
+  totalItemsInRun: number;
+  startedAt: string | null;
+  lastRunAt: string | null;
+  lastRunSummary: string | null;
+  avgMsPerChunk: number;
+  avgMsPerAiArtifact: number;
+}
+
+const globalForQueue = globalThis as typeof globalThis & {
+  __araBackgroundQueueState?: InternalBackgroundQueueState;
+};
+
+function getQueueState(): InternalBackgroundQueueState {
+  if (!globalForQueue.__araBackgroundQueueState) {
+    globalForQueue.__araBackgroundQueueState = {
+      isRunning: false,
+      stopRequested: false,
+      mode: "IDLE",
+      currentPhase: "IDLE",
+      currentDocumentId: null,
+      currentAiKind: null,
+      currentTaskLabel: null,
+      currentItemProgressPercent: 0,
+      currentItemStartedAtMs: null,
+      completedItemsInRun: 0,
+      totalItemsInRun: 0,
+      startedAt: null,
+      lastRunAt: null,
+      lastRunSummary: null,
+      avgMsPerChunk: 450,
+      avgMsPerAiArtifact: 95000,
+    };
+  }
+  return globalForQueue.__araBackgroundQueueState;
+}
+
+const TARGET_NIGHTLY_KINDS: Array<{
+  kind: "SUMMARY" | "FLASHCARDS" | "QUIZ";
+  label: string;
+}> = [
+  { kind: "SUMMARY", label: "Fiche de révision" },
+  { kind: "FLASHCARDS", label: "Flashcards" },
+  { kind: "QUIZ", label: "Quiz compréhension" },
+];
+
+export function requestStopBackgroundQueue(): void {
+  const state = getQueueState();
+  if (state.isRunning) {
+    state.stopRequested = true;
+  }
+}
+
+export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnapshot> {
+  await ensureStudioSchema();
+  const state = getQueueState();
+
+  const [docs, chunkStatsRows, publicArtifactRows] = await Promise.all([
+    prisma.document.findMany({
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        title: true,
+        fileName: true,
+        pageCount: true,
+        isIndexed: true,
+        chapter: {
+          select: {
+            id: true,
+            title: true,
+            ue: { select: { code: true } },
+          },
+        },
+      },
+    }),
+    prisma.$queryRaw<
+      Array<{ documentId: string; totalChunks: number; embeddedChunks: number }>
+    >`
+      SELECT "documentId",
+             COUNT(*)::int AS "totalChunks",
+             COUNT("embedding")::int AS "embeddedChunks"
+      FROM "DocumentChunk"
+      GROUP BY "documentId"
+    `,
+    prisma.studyArtifact.findMany({
+      where: {
+        documentId: { not: null },
+        isPublic: true,
+        kind: { in: ["SUMMARY", "FLASHCARDS", "QUIZ"] },
+      },
+      select: {
+        documentId: true,
+        kind: true,
+      },
+    }),
+  ]);
+
+  const chunkStatsMap = new Map<
+    string,
+    { totalChunks: number; embeddedChunks: number }
+  >();
+  for (const row of chunkStatsRows) {
+    chunkStatsMap.set(row.documentId, {
+      totalChunks: Number(row.totalChunks || 0),
+      embeddedChunks: Number(row.embeddedChunks || 0),
+    });
   }
 
-  const specs: Array<{ kind: StudioArtifactKind; title: string }> = [
-    { kind: "SUMMARY", title: `Fiche de révision — ${params.documentTitle}` },
-    { kind: "FLASHCARDS", title: `Flashcards — ${params.documentTitle}` },
-    { kind: "QUIZ", title: `Quiz — ${params.documentTitle}` },
-  ];
+  const publicSet = new Set<string>();
+  for (const row of publicArtifactRows) {
+    if (row.documentId) {
+      publicSet.add(`${row.documentId}:${row.kind}`);
+    }
+  }
 
-  const generatedList = await Promise.all(
-    specs.map(async (spec) => {
-      const generated = await generateStudioArtifact({
-        kind: spec.kind,
-        chunks,
-        title: spec.title,
+  const indexingQueue: IndexingQueueItem[] = [];
+  const aiContentQueue: AiQueueItem[] = [];
+  let indexedDocuments = 0;
+  let pendingIndexingChunks = 0;
+  let completedPublicAiArtifacts = 0;
+  let totalExpectedAiArtifacts = 0;
+
+  for (const doc of docs) {
+    const cStats = chunkStatsMap.get(doc.id) || {
+      totalChunks: 0,
+      embeddedChunks: 0,
+    };
+
+    if (doc.isIndexed) {
+      indexedDocuments += 1;
+    } else {
+      const effectiveTotalChunks =
+        cStats.totalChunks > 0 ? cStats.totalChunks : Math.max(1, doc.pageCount);
+      const remainingChunks =
+        cStats.totalChunks > 0
+          ? Math.max(0, cStats.totalChunks - cStats.embeddedChunks)
+          : Math.max(1, doc.pageCount);
+      pendingIndexingChunks += remainingChunks;
+
+      const isThisRunning =
+        state.isRunning &&
+        state.currentPhase === "INDEXING" &&
+        state.currentDocumentId === doc.id;
+
+      indexingQueue.push({
+        documentId: doc.id,
+        chapterId: doc.chapter.id,
+        title: doc.title,
+        fileName: doc.fileName,
+        ueCode: doc.chapter.ue.code,
+        chapterTitle: doc.chapter.title,
+        pageCount: doc.pageCount,
+        totalChunks: effectiveTotalChunks,
+        embeddedChunks: cStats.embeddedChunks,
+        status: isThisRunning ? "RUNNING" : "PENDING",
       });
-      const artifact = await prisma.studyArtifact.create({
-        data: {
-          userId: params.userId,
-          ueId: params.ueId,
-          documentId: params.documentId,
-          kind: spec.kind,
-          title: generated.title,
-          contentJson: JSON.stringify(generated.content),
-          isPublic: params.isPublic ?? true,
+    }
+
+    const canGenerateAi = cStats.totalChunks > 0 || !doc.isIndexed;
+    if (canGenerateAi) {
+      for (const spec of TARGET_NIGHTLY_KINDS) {
+        totalExpectedAiArtifacts += 1;
+        if (publicSet.has(`${doc.id}:${spec.kind}`)) {
+          completedPublicAiArtifacts += 1;
+        } else {
+          const isThisRunning =
+            state.isRunning &&
+            state.currentPhase === "AI_GENERATION" &&
+            state.currentDocumentId === doc.id &&
+            state.currentAiKind === spec.kind;
+
+          aiContentQueue.push({
+            id: `${doc.id}:${spec.kind}`,
+            documentId: doc.id,
+            chapterId: doc.chapter.id,
+            documentTitle: doc.title,
+            fileName: doc.fileName,
+            ueCode: doc.chapter.ue.code,
+            chapterTitle: doc.chapter.title,
+            kind: spec.kind,
+            label: spec.label,
+            status: isThisRunning ? "RUNNING" : "PENDING",
+          });
+        }
+      }
+    }
+  }
+
+  let currentItemProgressPercent = state.currentItemProgressPercent;
+  if (
+    state.isRunning &&
+    state.currentPhase === "AI_GENERATION" &&
+    state.currentItemStartedAtMs
+  ) {
+    const elapsed = Math.max(0, Date.now() - state.currentItemStartedAtMs);
+    currentItemProgressPercent = Math.max(
+      state.currentItemProgressPercent,
+      8,
+      Math.min(92, Math.round((elapsed / Math.max(5000, state.avgMsPerAiArtifact)) * 90))
+    );
+  }
+
+  const indexingEtaSeconds = Math.ceil(
+    (pendingIndexingChunks * state.avgMsPerChunk) / 1000
+  );
+
+  let aiRemainingMs = aiContentQueue.length * state.avgMsPerAiArtifact;
+  if (
+    state.isRunning &&
+    state.currentPhase === "AI_GENERATION" &&
+    state.currentItemStartedAtMs &&
+    aiContentQueue.length > 0
+  ) {
+    const elapsedCurrent = Math.max(0, Date.now() - state.currentItemStartedAtMs);
+    const savedOnCurrent = Math.min(state.avgMsPerAiArtifact * 0.85, elapsedCurrent);
+    aiRemainingMs = Math.max(2000, aiRemainingMs - savedOnCurrent);
+  }
+  const aiEtaSeconds = Math.ceil(aiRemainingMs / 1000);
+  const totalEtaSeconds = indexingEtaSeconds + aiEtaSeconds;
+
+  let overallProgressPercent = 0;
+  if (state.isRunning && state.totalItemsInRun > 0) {
+    overallProgressPercent = Math.min(
+      99,
+      Math.round(
+        ((state.completedItemsInRun + currentItemProgressPercent / 100) /
+          state.totalItemsInRun) *
+          100
+      )
+    );
+  } else {
+    const totalTasksAll = docs.length + totalExpectedAiArtifacts;
+    const doneTasksAll = indexedDocuments + completedPublicAiArtifacts;
+    overallProgressPercent =
+      totalTasksAll > 0 ? Math.round((doneTasksAll / totalTasksAll) * 100) : 100;
+  }
+
+  const nowHour = new Date().getHours();
+  const nextNightlyWindowLabel =
+    nowHour >= 0 && nowHour < 7
+      ? "FENÊTRE HEURES CREUSES ACTIVE (00H00–07H00)"
+      : "PROCHAINE FENÊTRE AUTO : 00H00–07H00";
+
+  return {
+    worker: {
+      isRunning: state.isRunning,
+      stopRequested: state.stopRequested,
+      mode: state.mode,
+      currentPhase: state.currentPhase,
+      currentTaskLabel: state.currentTaskLabel,
+      currentItemProgressPercent,
+      overallProgressPercent,
+      completedItemsInRun: state.completedItemsInRun,
+      totalItemsInRun: state.totalItemsInRun,
+      startedAt: state.startedAt,
+      lastRunAt: state.lastRunAt,
+      lastRunSummary: state.lastRunSummary,
+      nextNightlyWindowLabel,
+    },
+    eta: {
+      indexingEtaSeconds,
+      aiEtaSeconds,
+      totalEtaSeconds,
+      avgMsPerChunk: Math.round(state.avgMsPerChunk),
+      avgMsPerAiArtifact: Math.round(state.avgMsPerAiArtifact),
+    },
+    indexingQueue,
+    aiContentQueue,
+    counts: {
+      totalDocuments: docs.length,
+      indexedDocuments,
+      unindexedDocuments: indexingQueue.length,
+      pendingIndexingChunks,
+      totalExpectedAiArtifacts,
+      completedPublicAiArtifacts,
+      pendingAiArtifacts: aiContentQueue.length,
+    },
+  };
+}
+
+function isWithinOffPeakWindow(): boolean {
+  const h = new Date().getHours();
+  return h >= 0 && h < 7;
+}
+
+export async function runNightlyOffPeakStudyGeneration(options?: {
+  force?: boolean;
+  maxItems?: number;
+  mode?: "NIGHTLY_AUTO" | "ADMIN_MANUAL";
+  scope?: "ALL" | "INDEXING_ONLY" | "AI_ONLY";
+  chapterId?: string;
+  documentId?: string;
+}): Promise<{
+  skipped: boolean;
+  reason?: string;
+  indexedCount: number;
+  generatedCount: number;
+}> {
+  const state = getQueueState();
+  if (state.isRunning) {
+    return {
+      skipped: true,
+      reason: "already-running",
+      indexedCount: 0,
+      generatedCount: 0,
+    };
+  }
+
+  const mode = options?.mode || (options?.force ? "ADMIN_MANUAL" : "NIGHTLY_AUTO");
+  const scope = options?.scope || "ALL";
+  const targetChapterId = options?.chapterId?.trim() || undefined;
+  const targetDocumentId = options?.documentId?.trim() || undefined;
+
+  if (!options?.force && !isWithinOffPeakWindow()) {
+    return {
+      skipped: true,
+      reason: "outside-off-peak-hours",
+      indexedCount: 0,
+      generatedCount: 0,
+    };
+  }
+
+  const health = await checkOllamaHealth();
+  if (!health.online) {
+    return {
+      skipped: true,
+      reason: "ollama-offline",
+      indexedCount: 0,
+      generatedCount: 0,
+    };
+  }
+
+  await ensureStudioSchema();
+  const initialSnapshot = await getBackgroundQueueSnapshot();
+
+  const matchesTarget = (item: { chapterId: string; documentId: string }) =>
+    (!targetChapterId || item.chapterId === targetChapterId) &&
+    (!targetDocumentId || item.documentId === targetDocumentId);
+
+  const totalIdxPlanned =
+    scope === "ALL" || scope === "INDEXING_ONLY"
+      ? initialSnapshot.indexingQueue.filter(matchesTarget).length
+      : 0;
+  const totalAiPlanned =
+    scope === "ALL" || scope === "AI_ONLY"
+      ? initialSnapshot.aiContentQueue.filter(matchesTarget).length
+      : 0;
+
+  if (totalIdxPlanned === 0 && totalAiPlanned === 0) {
+    state.lastRunAt = new Date().toISOString();
+    state.lastRunSummary = "Aucun document ni contenu IA en attente.";
+    return {
+      skipped: false,
+      reason: "nothing-pending",
+      indexedCount: 0,
+      generatedCount: 0,
+    };
+  }
+
+  state.isRunning = true;
+  state.stopRequested = false;
+  state.mode = mode;
+  state.currentPhase = "IDLE";
+  state.currentDocumentId = null;
+  state.currentAiKind = null;
+  state.currentTaskLabel = "Initialisation de la file...";
+  state.currentItemProgressPercent = 0;
+  state.currentItemStartedAtMs = Date.now();
+  state.completedItemsInRun = 0;
+  state.totalItemsInRun = totalIdxPlanned + totalAiPlanned;
+  state.startedAt = new Date().toISOString();
+
+  let indexedCount = 0;
+  let generatedCount = 0;
+  const maxItems = Math.max(1, options?.maxItems || 100);
+
+  const shouldAbort = () =>
+    state.stopRequested || (mode === "NIGHTLY_AUTO" && !isWithinOffPeakWindow());
+
+  try {
+    // Phase 1: Index unindexed documents sequentially
+    if (scope === "ALL" || scope === "INDEXING_ONLY") {
+      const unindexedDocs = await prisma.document.findMany({
+        where: {
+          isIndexed: false,
+          ...(targetChapterId ? { chapterId: targetChapterId } : {}),
+          ...(targetDocumentId ? { id: targetDocumentId } : {}),
         },
+        orderBy: { createdAt: "desc" },
         select: {
           id: true,
           title: true,
+          localPath: true,
+          _count: { select: { chunks: true } },
         },
       });
-      return {
-        id: artifact.id,
-        kind: spec.kind,
-        title: artifact.title,
-      };
-    })
-  );
 
-  return generatedList;
+      for (const doc of unindexedDocs) {
+        if (shouldAbort()) break;
+
+        state.currentPhase = "INDEXING";
+        state.currentDocumentId = doc.id;
+        state.currentAiKind = null;
+        state.currentTaskLabel = `Indexation RAG : ${doc.title}`;
+        state.currentItemProgressPercent = 0;
+        state.currentItemStartedAtMs = Date.now();
+
+        try {
+          if (doc._count.chunks === 0) {
+            const resolvedPath = resolveDocumentFilePath(doc.localPath);
+            const buffer = await fsp.readFile(resolvedPath);
+            const extracted = await extractPdfPages(buffer);
+
+            await prisma.document.update({
+              where: { id: doc.id },
+              data: { pageCount: extracted.pageCount },
+            });
+
+            const stored = await storeDocumentChunksUnindexed(
+              doc.id,
+              extracted.pages
+            );
+            if (stored.chunkCount === 0) {
+              state.completedItemsInRun += 1;
+              continue;
+            }
+          }
+
+          const res = await embedExistingDocumentChunks(doc.id, {
+            shouldStop: shouldAbort,
+            onProgress: (done, total, chunkMs) => {
+              state.currentItemProgressPercent = Math.round(
+                (done / Math.max(1, total)) * 100
+              );
+              if (chunkMs > 20 && chunkMs < 60000) {
+                state.avgMsPerChunk = Math.round(
+                  state.avgMsPerChunk * 0.75 + chunkMs * 0.25
+                );
+              }
+            },
+          });
+
+          if (res.indexed) {
+            indexedCount += 1;
+          }
+          if (!res.stopped) {
+            state.completedItemsInRun += 1;
+          }
+        } catch (err) {
+          console.error(`[NightlyIndex] Failed for doc ${doc.id}:`, err);
+          state.completedItemsInRun += 1;
+        }
+      }
+    }
+
+    // Phase 2: Sequential solo AI generation for missing public Studio artifacts
+    if ((scope === "ALL" || scope === "AI_ONLY") && !shouldAbort()) {
+      const docs = await prisma.document.findMany({
+        where: {
+          chunks: { some: {} },
+          ...(targetChapterId ? { chapterId: targetChapterId } : {}),
+          ...(targetDocumentId ? { id: targetDocumentId } : {}),
+        },
+        orderBy: { createdAt: "desc" },
+        select: {
+          id: true,
+          title: true,
+          authorId: true,
+          chapter: { select: { ueId: true } },
+        },
+      });
+
+      for (const doc of docs) {
+        if (shouldAbort() || generatedCount >= maxItems) break;
+
+        for (const spec of TARGET_NIGHTLY_KINDS) {
+          if (shouldAbort() || generatedCount >= maxItems) break;
+
+          const alreadyPublic = await hasExistingPublicArtifact(
+            doc.id,
+            spec.kind
+          );
+          if (alreadyPublic) {
+            continue;
+          }
+
+          const chunks = await gatherStudioSourceChunks({
+            ueId: doc.chapter.ueId,
+            documentIds: [doc.id],
+            fullDocument: true,
+          });
+          if (chunks.length === 0) {
+            state.completedItemsInRun += 1;
+            continue;
+          }
+
+          state.currentPhase = "AI_GENERATION";
+          state.currentDocumentId = doc.id;
+          state.currentAiKind = spec.kind;
+          state.currentTaskLabel = `${spec.label} (95%) : ${doc.title}`;
+          state.currentItemProgressPercent = 5;
+          state.currentItemStartedAtMs = Date.now();
+
+          const t0 = Date.now();
+          const generated = await generateStudioArtifact({
+            kind: spec.kind,
+            chunks,
+            isPublic: true,
+            title: `${spec.label} — ${doc.title}`,
+            shouldStop: shouldAbort,
+            onProgress: (pct, detail) => {
+              state.currentItemProgressPercent = Math.max(
+                state.currentItemProgressPercent,
+                Math.min(99, pct)
+              );
+              state.currentTaskLabel = `${detail} — ${doc.title}`;
+            },
+          });
+          const elapsedMs = Date.now() - t0;
+
+          if (generated.usedAi) {
+            if (elapsedMs > 2000 && elapsedMs < 900000) {
+              state.avgMsPerAiArtifact = Math.round(
+                state.avgMsPerAiArtifact * 0.7 + elapsedMs * 0.3
+              );
+            }
+
+            await prisma.studyArtifact.create({
+              data: {
+                userId: doc.authorId,
+                ueId: doc.chapter.ueId,
+                documentId: doc.id,
+                kind: spec.kind,
+                title: generated.title,
+                contentJson: JSON.stringify(generated.content),
+                isPublic: true,
+              },
+            });
+            generatedCount += 1;
+          }
+
+          state.completedItemsInRun += 1;
+        }
+      }
+    }
+
+    const stoppedReason = state.stopRequested ? " (arrêt demandé)" : "";
+    state.lastRunAt = new Date().toISOString();
+    state.lastRunSummary = `${indexedCount} PDF indexé(s) · ${generatedCount} contenu(x) IA généré(s)${stoppedReason}.`;
+    return {
+      skipped: false,
+      indexedCount,
+      generatedCount,
+    };
+  } catch (err) {
+    console.error("[NightlyStudio] Error during off-peak generation:", err);
+    state.lastRunAt = new Date().toISOString();
+    state.lastRunSummary = `Interrompu avec erreur (${indexedCount} indexés, ${generatedCount} IA).`;
+    return {
+      skipped: false,
+      reason: "error",
+      indexedCount,
+      generatedCount,
+    };
+  } finally {
+    state.isRunning = false;
+    state.stopRequested = false;
+    state.mode = "IDLE";
+    state.currentPhase = "IDLE";
+    state.currentDocumentId = null;
+    state.currentAiKind = null;
+    state.currentTaskLabel = null;
+    state.currentItemProgressPercent = 0;
+    state.currentItemStartedAtMs = null;
+  }
 }

@@ -56,9 +56,17 @@ interface NotebookStudioPanelProps {
 const KIND_LABELS: Record<StudioArtifactKind, string> = {
   SVG_DIAGRAM: "SCHÉMA .SVG",
   FLASHCARDS: "FLASHCARDS",
-  QUIZ: "QUIZ CIBLÉ",
-  SUMMARY: "FICHE SYNTHÈSE",
+  QUIZ: "QUIZ COMPRÉHENSION",
+  SUMMARY: "FICHE RÉVISION",
 };
+
+const CONTEXT_CHIPS = [
+  "Vérifier ma compréhension des mécanismes et liens cause-effet",
+  "Cas pratiques, mises en situation et raisonnement clinique",
+  "Pièges de partiel et confusions fréquentes entre notions",
+  "Comparer et différencier les concepts clés du cours",
+  "Valeurs clés, seuils et définitions essentielles",
+];
 
 export function NotebookStudioPanel({
   ueId,
@@ -72,11 +80,19 @@ export function NotebookStudioPanel({
     documents.map((d) => d.id)
   );
   const [prompt, setPrompt] = useState("");
+  const [wantPublic, setWantPublic] = useState(false);
   const [generatingKind, setGeneratingKind] =
     useState<StudioArtifactKind | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [autoPublishNotice, setAutoPublishNotice] = useState<string | null>(
+    null
+  );
+  const [aiNotice, setAiNotice] = useState<string | null>(null);
 
   const [artifacts, setArtifacts] = useState<StudioArtifactRow[]>([]);
+  const [publicCoverage, setPublicCoverage] = useState<
+    Array<{ documentId: string; kind: string }>
+  >([]);
   const [activeArtifact, setActiveArtifact] =
     useState<StudioArtifactRow | null>(null);
   const [loadingList, setLoadingList] = useState(true);
@@ -98,9 +114,13 @@ export function NotebookStudioPanel({
         { cache: "no-store" }
       );
       if (!res.ok) return;
-      const data = (await res.json()) as { artifacts?: StudioArtifactRow[] };
+      const data = (await res.json()) as {
+        artifacts?: StudioArtifactRow[];
+        publicCoverage?: Array<{ documentId: string; kind: string }>;
+      };
       const list = data.artifacts || [];
       setArtifacts(list);
+      setPublicCoverage(data.publicCoverage || []);
       setActiveArtifact((prev) => {
         if (focusDocumentId) {
           const match = list.find((a) => a.documentId === focusDocumentId);
@@ -125,14 +145,39 @@ export function NotebookStudioPanel({
     );
   }
 
+  function appendContextChip(chip: string) {
+    setPrompt((prev) => {
+      const current = prev.trim();
+      if (current.toLowerCase().includes(chip.toLowerCase())) {
+        return prev;
+      }
+      return current ? `${current}\n• ${chip}` : `• ${chip}`;
+    });
+  }
+
+  function hasPublicKindForDoc(
+    docId: string,
+    kind: StudioArtifactKind
+  ): boolean {
+    return publicCoverage.some(
+      (c) => c.documentId === docId && c.kind === kind
+    );
+  }
+
+  function selectionMissingPublicKind(kind: StudioArtifactKind): boolean {
+    return selectedDocIds.some((docId) => !hasPublicKindForDoc(docId, kind));
+  }
+
   async function handleGenerate(kind: StudioArtifactKind) {
     if (generatingKind) return;
     setGeneratingKind(kind);
     setError(null);
+    setAutoPublishNotice(null);
+    setAiNotice(null);
 
     try {
       const pageImagesBase64: PageImageInput[] = [];
-      if (selectedDocIds.length > 0) {
+      if (kind === "SVG_DIAGRAM" && selectedDocIds.length > 0) {
         const firstDoc = documents.find((d) => d.id === selectedDocIds[0]);
         if (firstDoc) {
           const dataUrl = await renderPdfPageToDataUrl(firstDoc.id, 1, 900);
@@ -154,16 +199,29 @@ export function NotebookStudioPanel({
           ueId,
           documentIds: selectedDocIds,
           prompt: prompt.trim() || undefined,
+          isPublic: wantPublic,
           pageImagesBase64,
         }),
       });
       const data = (await res.json().catch(() => ({}))) as {
         artifact?: StudioArtifactRow;
+        autoPublishedFirst?: boolean;
+        usedAi?: boolean;
         error?: string;
       };
       if (!res.ok || !data.artifact) {
         setError(data.error || "Erreur lors de la génération.");
         return;
+      }
+      if (data.autoPublishedFirst) {
+        setAutoPublishNotice(
+          `Premier contenu « ${KIND_LABELS[kind]} » créé sur ce cours : automatiquement publié en PUBLIC pour toute la promo !`
+        );
+      }
+      if (data.usedAi === false) {
+        setAiNotice(
+          "Ollama n'était pas joignable à l'instant : une version de secours extraite du texte a été générée."
+        );
       }
       setActiveArtifact(data.artifact);
       await fetchArtifacts();
@@ -237,10 +295,13 @@ export function NotebookStudioPanel({
             <div className="max-h-60 divide-y divide-border overflow-y-auto">
               {documents.map((doc) => {
                 const checked = selectedDocIds.includes(doc.id);
+                const hasSummary = hasPublicKindForDoc(doc.id, "SUMMARY");
+                const hasCards = hasPublicKindForDoc(doc.id, "FLASHCARDS");
+                const hasQuiz = hasPublicKindForDoc(doc.id, "QUIZ");
                 return (
                   <label
                     key={doc.id}
-                    className={`flex cursor-pointer items-start gap-2.5 px-3.5 py-2.5 text-xs ${
+                    className={`flex cursor-pointer items-start gap-2.5 px-3.5 py-2.5 text-xs transition-colors ${
                       checked ? "bg-pinned" : "bg-card hover:bg-paper"
                     }`}
                   >
@@ -257,6 +318,35 @@ export function NotebookStudioPanel({
                       <p className="font-mono text-[10px] uppercase text-stone">
                         {doc.fileName} · {doc.pageCount} P.
                       </p>
+                      <div className="mt-1 flex flex-wrap gap-1 font-mono text-[9px] uppercase tracking-wider">
+                        <span
+                          className={`border px-1.5 py-0.5 ${
+                            hasSummary
+                              ? "border-forest/40 bg-forest/10 text-forest"
+                              : "border-border bg-paper text-stone"
+                          }`}
+                        >
+                          FICHE {hasSummary ? "✓" : "· NUIT"}
+                        </span>
+                        <span
+                          className={`border px-1.5 py-0.5 ${
+                            hasCards
+                              ? "border-forest/40 bg-forest/10 text-forest"
+                              : "border-border bg-paper text-stone"
+                          }`}
+                        >
+                          CARTES {hasCards ? "✓" : "· NUIT"}
+                        </span>
+                        <span
+                          className={`border px-1.5 py-0.5 ${
+                            hasQuiz
+                              ? "border-forest/40 bg-forest/10 text-forest"
+                              : "border-border bg-paper text-stone"
+                          }`}
+                        >
+                          QUIZ {hasQuiz ? "✓" : "· NUIT"}
+                        </span>
+                      </div>
                     </div>
                   </label>
                 );
@@ -355,10 +445,17 @@ export function NotebookStudioPanel({
           className="border border-border bg-card p-4"
           style={{ borderTop: "3px solid #3B7A57" }}
         >
-          <div className="mb-3 flex items-center gap-2">
-            <Sparkles className="h-4 w-4 text-ink" />
-            <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
-              STUDIO NOTEBOOK · GÉNÉRER À PARTIR DES SOURCES SÉLECTIONNÉES
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-ink" />
+              <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                STUDIO IA · GÉNÉRATION ORIENTÉE COMPRÉHENSION
+              </span>
+            </div>
+            <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+              {selectedDocIds.length} SOURCE
+              {selectedDocIds.length > 1 ? "S" : ""} SÉLECTIONNÉE
+              {selectedDocIds.length > 1 ? "S" : ""}
             </span>
           </div>
 
@@ -368,69 +465,192 @@ export function NotebookStudioPanel({
             </div>
           )}
 
-          <input
-            type="text"
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="Thème ciblé (optionnel) — ex : Cycle de Krebs, mécanismes d'action, anatomie du membre..."
-            className="mb-3 w-full border border-border bg-paper px-3 py-2 text-sm text-ink placeholder:text-stone focus:border-ink focus:outline-none"
-          />
+          {autoPublishNotice && (
+            <div
+              className="ara-animate-in mb-3 border border-forest bg-forest/10 px-3 py-2 font-mono text-xs text-forest"
+              style={{ borderLeft: "3px solid #3B7A57" }}
+            >
+              {autoPublishNotice}
+            </div>
+          )}
+
+          {aiNotice && (
+            <div className="mb-3 border border-amber/60 bg-amber/10 px-3 py-2 font-mono text-xs text-ink">
+              {aiNotice}
+            </div>
+          )}
+
+          <div className="mb-3 space-y-2 border border-border bg-paper p-3">
+            <label className="block font-mono text-[10px] font-bold uppercase tracking-wider text-ink">
+              CONTEXTE &amp; CE QUE JE VEUX COMPRENDRE (MODE CUSTOM · OPTIONNEL)
+            </label>
+            <textarea
+              rows={3}
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="Décrivez précisément ce que vous voulez travailler ou ne comprenez pas encore — ex : « Je bloque sur les mécanismes de compensation acido-basique », « Pièges entre l'anatomie du carpe et du tarse », « Cas pratiques de posologie »..."
+              className="w-full border border-border bg-card px-3 py-2 text-sm text-ink placeholder:text-stone focus:border-ink focus:outline-none"
+            />
+            <div className="flex flex-wrap gap-1.5">
+              {CONTEXT_CHIPS.map((chip) => (
+                <button
+                  key={chip}
+                  type="button"
+                  onClick={() => appendContextChip(chip)}
+                  className="border border-border bg-card px-2 py-1 font-mono text-[9px] uppercase tracking-wider text-stone transition-colors hover:border-ink hover:bg-pinned hover:text-ink"
+                >
+                  + {chip}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-3">
+            <label className="flex cursor-pointer items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-ink">
+              <input
+                type="checkbox"
+                checked={wantPublic}
+                onChange={(e) => setWantPublic(e.target.checked)}
+                className="h-3.5 w-3.5 accent-ink"
+              />
+              <span>PARTAGER AVEC LA PROMO ({ueCode})</span>
+            </label>
+            <span className="font-mono text-[10px] text-stone">
+              <strong className="text-ink">PUBLIC</strong> = 95% du cours (30 Q
+              / 60 cartes / fiche complète) ·{" "}
+              <strong className="text-ink">PRIVÉ</strong> = 5% ultra-ciblé.
+            </span>
+          </div>
+
+          {generatingKind &&
+            (wantPublic || selectionMissingPublicKind(generatingKind)) && (
+              <div className="mb-3 border border-amber/60 bg-pinned px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-ink">
+                GÉNÉRATION COMPLÈTE EN COURS SUR L&apos;ENSEMBLE DES PAGES (PAR
+                LOTS SÉQUENTIELS POUR GARANTIR 95% DU COURS)...
+              </div>
+            )}
 
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             <button
               type="button"
-              disabled={Boolean(generatingKind) || documents.length === 0}
-              onClick={() => handleGenerate("SVG_DIAGRAM")}
-              className="flex items-center justify-center gap-1.5 border border-ink bg-ink px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
-            >
-              {generatingKind === "SVG_DIAGRAM" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <FileCode2 className="h-3.5 w-3.5" />
-              )}
-              <span>SCHÉMA .SVG</span>
-            </button>
-
-            <button
-              type="button"
-              disabled={Boolean(generatingKind) || documents.length === 0}
-              onClick={() => handleGenerate("FLASHCARDS")}
-              className="flex items-center justify-center gap-1.5 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
-            >
-              {generatingKind === "FLASHCARDS" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Layers className="h-3.5 w-3.5" />
-              )}
-              <span>FLASHCARDS</span>
-            </button>
-
-            <button
-              type="button"
-              disabled={Boolean(generatingKind) || documents.length === 0}
+              disabled={Boolean(generatingKind) || selectedDocIds.length === 0}
               onClick={() => handleGenerate("QUIZ")}
-              className="flex items-center justify-center gap-1.5 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
+              className="flex flex-col items-center justify-center gap-1 border border-ink bg-ink px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
             >
-              {generatingKind === "QUIZ" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <ListChecks className="h-3.5 w-3.5" />
-              )}
-              <span>QUIZ CIBLÉ</span>
+              <span className="inline-flex items-center gap-1.5">
+                {generatingKind === "QUIZ" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <ListChecks className="h-3.5 w-3.5" />
+                )}
+                <span>
+                  {wantPublic || selectionMissingPublicKind("QUIZ")
+                    ? "QUIZ COMPLET (30 Q)"
+                    : "QUIZ CIBLÉ (6 Q)"}
+                </span>
+              </span>
+              <span className="text-[8px] opacity-80">
+                {selectionMissingPublicKind("QUIZ")
+                  ? "AUTO-PUBLIC"
+                  : wantPublic
+                  ? "PUBLIC"
+                  : "PRIVÉ 5%"}
+              </span>
             </button>
 
             <button
               type="button"
-              disabled={Boolean(generatingKind) || documents.length === 0}
-              onClick={() => handleGenerate("SUMMARY")}
-              className="flex items-center justify-center gap-1.5 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
+              disabled={Boolean(generatingKind) || selectedDocIds.length === 0}
+              onClick={() => handleGenerate("FLASHCARDS")}
+              className="flex flex-col items-center justify-center gap-1 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
             >
-              {generatingKind === "SUMMARY" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <BookOpen className="h-3.5 w-3.5" />
-              )}
-              <span>SYNTHÈSE</span>
+              <span className="inline-flex items-center gap-1.5">
+                {generatingKind === "FLASHCARDS" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Layers className="h-3.5 w-3.5" />
+                )}
+                <span>
+                  {wantPublic || selectionMissingPublicKind("FLASHCARDS")
+                    ? "60 FLASHCARDS"
+                    : "10 FLASHCARDS"}
+                </span>
+              </span>
+              <span
+                className={`text-[8px] ${
+                  selectionMissingPublicKind("FLASHCARDS")
+                    ? "text-forest"
+                    : "text-stone"
+                }`}
+              >
+                {selectionMissingPublicKind("FLASHCARDS")
+                  ? "AUTO-PUBLIC"
+                  : wantPublic
+                  ? "PUBLIC"
+                  : "PRIVÉ 5%"}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={Boolean(generatingKind) || selectedDocIds.length === 0}
+              onClick={() => handleGenerate("SUMMARY")}
+              className="flex flex-col items-center justify-center gap-1 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                {generatingKind === "SUMMARY" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <BookOpen className="h-3.5 w-3.5" />
+                )}
+                <span>
+                  {wantPublic || selectionMissingPublicKind("SUMMARY")
+                    ? "FICHE COURS (95%)"
+                    : "FICHE CIBLÉE (5%)"}
+                </span>
+              </span>
+              <span
+                className={`text-[8px] ${
+                  selectionMissingPublicKind("SUMMARY")
+                    ? "text-forest"
+                    : "text-stone"
+                }`}
+              >
+                {selectionMissingPublicKind("SUMMARY")
+                  ? "AUTO-PUBLIC"
+                  : wantPublic
+                  ? "PUBLIC"
+                  : "PRIVÉ 5%"}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={Boolean(generatingKind) || selectedDocIds.length === 0}
+              onClick={() => handleGenerate("SVG_DIAGRAM")}
+              className="flex flex-col items-center justify-center gap-1 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                {generatingKind === "SVG_DIAGRAM" ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <FileCode2 className="h-3.5 w-3.5" />
+                )}
+                <span>SCHÉMA .SVG</span>
+              </span>
+              <span
+                className={`text-[8px] ${
+                  selectionMissingPublicKind("SVG_DIAGRAM")
+                    ? "text-forest"
+                    : "text-stone"
+                }`}
+              >
+                {selectionMissingPublicKind("SVG_DIAGRAM")
+                  ? "AUTO-PUBLIC"
+                  : wantPublic
+                  ? "PUBLIC"
+                  : "PRIVÉ"}
+              </span>
             </button>
           </div>
         </div>

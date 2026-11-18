@@ -6,6 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { signOut, useSession } from "next-auth/react";
 import {
   BookOpen,
+  Compass,
   Flame,
   LogOut,
   PenTool,
@@ -14,6 +15,7 @@ import {
   User as UserIcon,
 } from "lucide-react";
 import { GlobalSearchModal } from "@/components/GlobalSearchModal";
+import { OnboardingModal } from "@/components/OnboardingModal";
 import { SpixWidget } from "@/components/SpixWidget";
 
 export function AppShell({ children }: { children: ReactNode }) {
@@ -21,6 +23,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
   const [searchOpen, setSearchOpen] = useState(false);
+  const [onboardingOpen, setOnboardingOpen] = useState(false);
 
   useEffect(() => {
     if (status === "unauthenticated") {
@@ -55,6 +58,32 @@ export function AppShell({ children }: { children: ReactNode }) {
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
   }, []);
+
+  useEffect(() => {
+    if (status !== "authenticated" || !session?.user?.id) return;
+    const storageKey = `ara_onboarding_seen_v1_${session.user.id}`;
+    try {
+      if (!window.localStorage.getItem(storageKey)) {
+        setOnboardingOpen(true);
+      }
+    } catch {
+      // Ignore storage access errors in restricted contexts
+    }
+  }, [status, session?.user?.id]);
+
+  function handleDismissOnboarding() {
+    if (session?.user?.id) {
+      try {
+        window.localStorage.setItem(
+          `ara_onboarding_seen_v1_${session.user.id}`,
+          "1"
+        );
+      } catch {
+        // Ignore storage errors
+      }
+    }
+    setOnboardingOpen(false);
+  }
 
   if (status === "loading" || status === "unauthenticated") {
     return (
@@ -123,13 +152,23 @@ export function AppShell({ children }: { children: ReactNode }) {
                 PROMO WORKSPACE
               </span>
               <span className="border border-border bg-paper px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-stone">
-                AUTO-HÉBERGÉ · LOCALHOST
+                ONIRIS · 100% LOCAL &amp; ÉCO-HÉBERGÉ
               </span>
             </div>
           </Link>
 
           {/* Right Controls */}
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setOnboardingOpen(true)}
+              className="inline-flex items-center gap-1.5 border border-border bg-paper px-2.5 py-1 font-mono text-[11px] uppercase tracking-wider text-stone transition-colors hover:border-ink hover:text-ink"
+              title="Découvrir ARA & nos engagements Oniris"
+            >
+              <Compass className="h-3.5 w-3.5 text-forest" />
+              <span className="hidden md:inline">GUIDE ONIRIS</span>
+            </button>
+
             <button
               type="button"
               onClick={() => setSearchOpen(true)}
@@ -222,6 +261,15 @@ export function AppShell({ children }: { children: ReactNode }) {
       <GlobalSearchModal
         isOpen={searchOpen}
         onClose={() => setSearchOpen(false)}
+      />
+
+      {/* First-Login Oniris Onboarding Modal */}
+      <OnboardingModal
+        isOpen={onboardingOpen}
+        userName={user?.name}
+        classLevel={user?.classLevel}
+        onComplete={handleDismissOnboarding}
+        onClose={handleDismissOnboarding}
       />
 
       {/* Floating Context-Aware Spix Square */}

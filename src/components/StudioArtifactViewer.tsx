@@ -47,6 +47,7 @@ export function StudioArtifactViewer({
 
   // Flashcards SRS state
   const [cardIndex, setCardIndex] = useState(0);
+  const [cardFilter, setCardFilter] = useState<"ALL" | "REVIEW">("ALL");
   const [flipped, setFlipped] = useState(false);
   const [masteredIds, setMasteredIds] = useState<Record<string, boolean>>({});
   const [srsRatings, setSrsRatings] = useState<
@@ -149,11 +150,16 @@ export function StudioArtifactViewer({
 
   if (content.kind === "FLASHCARDS") {
     const cards = content.cards || [];
-    const safeIdx = Math.min(cardIndex, Math.max(0, cards.length - 1));
-    const currentCard = cards[safeIdx];
-    const masteredCount = cards.filter((c) => masteredIds[c.id]).length;
+    const unmasteredCards = cards.filter((c) => !masteredIds[c.id]);
+    const visibleCards =
+      cardFilter === "REVIEW" && unmasteredCards.length > 0
+        ? unmasteredCards
+        : cards;
+    const safeIdx = Math.min(cardIndex, Math.max(0, visibleCards.length - 1));
+    const currentCard = visibleCards[safeIdx];
+    const masteredCount = cards.length - unmasteredCards.length;
 
-    if (!currentCard) {
+    if (cards.length === 0 || !currentCard) {
       return (
         <div className="border border-border bg-paper p-4 font-mono text-xs text-stone">
           AUCUNE FLASHCARD GÉNÉRÉE.
@@ -161,12 +167,20 @@ export function StudioArtifactViewer({
       );
     }
 
+    const batchRanges: Array<{ start: number; end: number; label: string }> = [];
+    if (visibleCards.length > 10) {
+      for (let i = 0; i < visibleCards.length; i += 10) {
+        const end = Math.min(i + 10, visibleCards.length);
+        batchRanges.push({ start: i, end, label: `${i + 1}–${end}` });
+      }
+    }
+
     return (
       <div className="border border-ink bg-card">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-3 py-2 font-mono text-[10px] uppercase tracking-wider">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <span className="font-bold text-ink">
-              FLASHCARDS SRS · CARTE {safeIdx + 1} / {cards.length}
+              FLASHCARDS SRS · CARTE {safeIdx + 1} / {visibleCards.length}
             </span>
             {srsRatings[currentCard.id] && (
               <span className="border border-border bg-card px-1.5 py-0.5 text-[9px] text-stone">
@@ -180,12 +194,74 @@ export function StudioArtifactViewer({
               </span>
             )}
           </div>
-          <span className="text-forest">
-            MAÎTRISÉES : {masteredCount} / {cards.length}
-          </span>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setCardFilter("ALL");
+                setCardIndex(0);
+                setFlipped(false);
+              }}
+              className={`border px-2 py-0.5 text-[9px] ${
+                cardFilter === "ALL"
+                  ? "border-ink bg-ink text-card"
+                  : "border-border bg-card text-stone hover:text-ink"
+              }`}
+            >
+              TOUTES ({cards.length})
+            </button>
+            <button
+              type="button"
+              disabled={unmasteredCards.length === 0}
+              onClick={() => {
+                setCardFilter("REVIEW");
+                setCardIndex(0);
+                setFlipped(false);
+              }}
+              className={`border px-2 py-0.5 text-[9px] disabled:opacity-40 ${
+                cardFilter === "REVIEW"
+                  ? "border-ink bg-ink text-card"
+                  : "border-border bg-card text-stone hover:text-ink"
+              }`}
+            >
+              À REVOIR ({unmasteredCards.length})
+            </button>
+            <span className="text-forest">
+              MAÎTRISÉES : {masteredCount}/{cards.length}
+            </span>
+          </div>
         </div>
 
         <div className="p-4">
+          {batchRanges.length > 0 && (
+            <div className="mb-3 flex flex-wrap items-center gap-1">
+              <span className="mr-1 font-mono text-[9px] uppercase text-stone">
+                LOTS :
+              </span>
+              {batchRanges.map((b) => {
+                const activeBatch = safeIdx >= b.start && safeIdx < b.end;
+                return (
+                  <button
+                    key={b.label}
+                    type="button"
+                    onClick={() => {
+                      setFlipped(false);
+                      setCardIndex(b.start);
+                    }}
+                    className={`border px-2 py-0.5 font-mono text-[9px] uppercase ${
+                      activeBatch
+                        ? "border-ink bg-ink font-bold text-card"
+                        : "border-border bg-paper text-stone hover:border-ink hover:text-ink"
+                    }`}
+                  >
+                    {b.label}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+
           <button
             type="button"
             onClick={() => setFlipped((p) => !p)}
@@ -232,9 +308,9 @@ export function StudioArtifactViewer({
                 type="button"
                 onClick={() => {
                   setFlipped(false);
-                  setCardIndex((i) => Math.min(cards.length - 1, i + 1));
+                  setCardIndex((i) => Math.min(visibleCards.length - 1, i + 1));
                 }}
-                disabled={safeIdx >= cards.length - 1}
+                disabled={safeIdx >= visibleCards.length - 1}
                 className="border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase text-ink hover:border-ink disabled:opacity-40"
               >
                 <ChevronRight className="h-3.5 w-3.5" />
@@ -263,7 +339,7 @@ export function StudioArtifactViewer({
                       [currentCard.id]: btn.id,
                     }));
                     setFlipped(false);
-                    if (safeIdx < cards.length - 1) setCardIndex(safeIdx + 1);
+                    if (safeIdx < visibleCards.length - 1) setCardIndex(safeIdx + 1);
                   }}
                   className={`inline-flex items-center gap-1 border px-2 py-1 font-mono text-[10px] uppercase tracking-wider transition-colors ${btn.cls}`}
                 >
@@ -288,6 +364,29 @@ export function StudioArtifactViewer({
         const e = q.correctAnswer ? normalizeTextForMatch(q.correctAnswer) : "";
         return Boolean(e && g === e);
       }
+      if (q.type === "QROC") {
+        const given = typeof ans === "string" ? normalizeTextForMatch(ans) : "";
+        if (given.length < 2) return false;
+        const expected = q.correctAnswer
+          ? normalizeTextForMatch(q.correctAnswer)
+          : "";
+        const matchesMain = Boolean(
+          expected &&
+            (given === expected ||
+              (expected.length >= 3 && given.includes(expected)) ||
+              (given.length >= 4 && expected.includes(given)))
+        );
+        const keywords = (q.acceptedKeywords || [])
+          .map((k) => normalizeTextForMatch(k))
+          .filter((k) => k.length >= 3);
+        const matchesKeyword = keywords.some(
+          (kw) =>
+            given === kw ||
+            given.includes(kw) ||
+            (given.length >= 4 && kw.includes(given))
+        );
+        return matchesMain || matchesKeyword;
+      }
       const sel = Array.isArray(ans) ? [...ans].sort((a, b) => a - b) : [];
       const exp = [...(q.correctIndices || [])].sort((a, b) => a - b);
       return (
@@ -300,6 +399,12 @@ export function StudioArtifactViewer({
     const score = quizSubmitted
       ? questions.filter((q) => checkCorrect(q)).length
       : 0;
+    const answeredCount = questions.filter((q) => {
+      const a = quizAnswers[q.id];
+      return Array.isArray(a)
+        ? a.length > 0
+        : typeof a === "string" && a.trim().length > 0;
+    }).length;
 
     return (
       <div className="border border-ink bg-card">
@@ -307,11 +412,18 @@ export function StudioArtifactViewer({
           <span className="font-bold text-ink">
             QUIZ STUDIO ({questions.length} QUESTIONS)
           </span>
-          {quizSubmitted && (
-            <span className="bg-badge-bg px-2 py-0.5 font-bold text-badge-text">
-              SCORE : {score} / {questions.length}
-            </span>
-          )}
+          <div className="flex items-center gap-2">
+            {!quizSubmitted && (
+              <span className="text-stone">
+                RÉPONDUES : {answeredCount} / {questions.length}
+              </span>
+            )}
+            {quizSubmitted && (
+              <span className="bg-badge-bg px-2 py-0.5 font-bold text-badge-text">
+                SCORE : {score} / {questions.length}
+              </span>
+            )}
+          </div>
         </div>
 
         <div className="space-y-3 p-3.5">
@@ -375,6 +487,41 @@ export function StudioArtifactViewer({
                         </button>
                       );
                     })}
+                  </div>
+                )}
+
+                {q.type === "QROC" && (
+                  <div className="space-y-2">
+                    <textarea
+                      rows={2}
+                      disabled={quizSubmitted}
+                      value={
+                        typeof quizAnswers[q.id] === "string"
+                          ? (quizAnswers[q.id] as string)
+                          : ""
+                      }
+                      onChange={(e) =>
+                        setQuizAnswers((p) => ({
+                          ...p,
+                          [q.id]: e.target.value,
+                        }))
+                      }
+                      placeholder="Rédigez votre réponse courte pour montrer que vous avez compris..."
+                      className="w-full border border-border bg-card px-2.5 py-1.5 text-xs text-ink focus:border-ink focus:outline-none"
+                    />
+                    {quizSubmitted && q.correctAnswer && (
+                      <div className="border border-forest/40 bg-forest/10 p-2 text-[11px] text-ink">
+                        <p className="font-mono text-[10px] font-bold uppercase tracking-wider text-forest">
+                          RÉPONSE ATTENDUE : {q.correctAnswer}
+                        </p>
+                        {q.acceptedKeywords &&
+                          q.acceptedKeywords.length > 1 && (
+                            <p className="mt-0.5 font-mono text-[9px] uppercase tracking-wider text-stone">
+                              MOTS-CLÉS : {q.acceptedKeywords.join(" · ")}
+                            </p>
+                          )}
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -447,6 +594,43 @@ export function StudioArtifactViewer({
       </div>
       <div className="space-y-4 p-4">
         <p className="text-xs leading-relaxed text-ink">{content.overview}</p>
+
+        {content.sections && content.sections.length > 0 && (
+          <div className="space-y-3">
+            <p className="font-mono text-[10px] font-semibold uppercase tracking-wider text-stone">
+              DÉVELOPPEMENT STRUCTURÉ DU COURS ({content.sections.length} PARTIE
+              {content.sections.length > 1 ? "S" : ""}) :
+            </p>
+            <div className="space-y-3">
+              {content.sections.map((sec, idx) => (
+                <div
+                  key={`${sec.title}-${idx}`}
+                  className="border border-border bg-paper p-3.5"
+                  style={{ borderLeft: "3px solid #3D6B99" }}
+                >
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-1.5">
+                    <h4 className="text-xs font-bold uppercase tracking-tight text-ink">
+                      {idx + 1}. {sec.title}
+                    </h4>
+                    <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase text-badge-text">
+                      {sec.pageRange}
+                    </span>
+                  </div>
+                  <p className="text-xs leading-relaxed text-ink">
+                    {sec.content}
+                  </p>
+                  {sec.keyPoints && sec.keyPoints.length > 0 && (
+                    <ul className="mt-2.5 list-disc space-y-1 border-t border-border/70 pt-2 pl-4 text-xs text-ink">
+                      {sec.keyPoints.map((kp, kIdx) => (
+                        <li key={kIdx}>{kp}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {content.keyConcepts.length > 0 && (
           <div className="space-y-1.5">

@@ -130,9 +130,121 @@ export function formatVectorLiteral(embedding: number[]): string {
   return `[${safe.join(",")}]`;
 }
 
-export async function indexDocumentPages(
+export async function storeDocumentChunksUnindexed(
   documentId: string,
   pages: ExtractedPdfPage[]
+): Promise<{ chunkCount: number }> {
+  await prisma.documentChunk.deleteMany({
+    where: { documentId },
+  });
+
+  const rawChunks: Array<{ content: string; pageNumber: number }> = [];
+  for (const page of pages) {
+    const pieces = chunkPageText(page.text, 800, 100);
+    for (const piece of pieces) {
+      rawChunks.push({
+        content: piece,
+        pageNumber: page.pageNumber,
+      });
+    }
+  }
+
+  if (rawChunks.length > 0) {
+    await prisma.documentChunk.createMany({
+      data: rawChunks.map((chunk) => ({
+        documentId,
+        content: chunk.content,
+        pageNumber: chunk.pageNumber,
+      })),
+    });
+  }
+
+  await prisma.document.update({
+    where: { id: documentId },
+    data: { isIndexed: false },
+  });
+
+  return { chunkCount: rawChunks.length };
+}
+
+export async function embedExistingDocumentChunks(
+  documentId: string,
+  options?: {
+    onProgress?: (
+      doneChunks: number,
+      totalChunks: number,
+      chunkMs: number
+    ) => void;
+    shouldStop?: () => boolean;
+  }
+): Promise<{
+  indexed: boolean;
+  chunkCount: number;
+  embeddedCount: number;
+  stopped: boolean;
+}> {
+  const rows = await prisma.$queryRaw<
+    Array<{ id: string; content: string; hasEmbedding: boolean }>
+  >`
+    SELECT "id", "content", ("embedding" IS NOT NULL) AS "hasEmbedding"
+    FROM "DocumentChunk"
+    WHERE "documentId" = ${documentId}
+    ORDER BY "pageNumber" ASC
+  `;
+
+  if (rows.length === 0) {
+    await prisma.document.update({
+      where: { id: documentId },
+      data: { isIndexed: false },
+    });
+    return { indexed: false, chunkCount: 0, embeddedCount: 0, stopped: false };
+  }
+
+  let embeddedCount = rows.filter((r) => Boolean(r.hasEmbedding)).length;
+  let stopped = false;
+
+  for (const row of rows) {
+    if (row.hasEmbedding) continue;
+    if (options?.shouldStop?.()) {
+      stopped = true;
+      break;
+    }
+
+    const t0 = Date.now();
+    const embedding = await generateEmbedding(row.content);
+    const elapsed = Date.now() - t0;
+
+    if (embedding) {
+      const vectorLiteral = formatVectorLiteral(embedding);
+      await prisma.$executeRaw`
+        UPDATE "DocumentChunk"
+        SET "embedding" = CAST(${vectorLiteral} AS vector(768))
+        WHERE "id" = ${row.id}
+      `;
+      embeddedCount += 1;
+    }
+
+    options?.onProgress?.(embeddedCount, rows.length, elapsed);
+  }
+
+  const isIndexed = embeddedCount === rows.length && rows.length > 0;
+  await prisma.document.update({
+    where: { id: documentId },
+    data: { isIndexed },
+  });
+
+  return {
+    indexed: isIndexed,
+    chunkCount: rows.length,
+    embeddedCount,
+    stopped,
+  };
+}
+
+export async function indexDocumentPages(
+  documentId: string,
+  pages: ExtractedPdfPage[],
+  onProgress?: (doneChunks: number, totalChunks: number) => void
 ): Promise<{ indexed: boolean; chunkCount: number }> {
   await prisma.documentChunk.deleteMany({
     where: { documentId },
@@ -175,7 +287,8 @@ export async function indexDocumentPages(
 
   let embeddedCount = 0;
 
-  for (const chunk of rawChunks) {
+  for (let i = 0; i < rawChunks.length; i += 1) {
+    const chunk = rawChunks[i];
     const embedding = await generateEmbedding(chunk.content);
     const id = crypto.randomUUID();
     if (embedding) {
@@ -195,6 +308,7 @@ export async function indexDocumentPages(
         },
       });
     }
+    onProgress?.(i + 1, rawChunks.length);
   }
 
   const isIndexed = embeddedCount > 0 && embeddedCount === rawChunks.length;

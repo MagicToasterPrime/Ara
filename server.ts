@@ -3,6 +3,7 @@ import next from "next";
 import { Server as SocketIOServer } from "socket.io";
 import { prisma } from "./src/lib/prisma";
 import type { WhiteboardCollaborator } from "./src/lib/socket-types";
+import { runNightlyOffPeakStudyGeneration } from "./src/lib/studio";
 import { getUserAccountMeta } from "./src/lib/user-schema";
 
 const dev = process.env.NODE_ENV !== "production";
@@ -11,6 +12,7 @@ const port = Number.parseInt(process.env.PORT || "3000", 10);
 
 const globalForSocket = globalThis as typeof globalThis & {
   __araSocketIo?: SocketIOServer;
+  __araNightlyWorkerStarted?: boolean;
 };
 
 const app = next({ dev, hostname, port });
@@ -242,5 +244,28 @@ app.prepare().then(() => {
 
   httpServer.listen(port, hostname, () => {
     console.log(`> Ara prêt sur http://localhost:${port}`);
+
+    if (!globalForSocket.__araNightlyWorkerStarted) {
+      globalForSocket.__araNightlyWorkerStarted = true;
+      setInterval(() => {
+        const hour = new Date().getHours();
+        if (hour >= 0 && hour < 7) {
+          void runNightlyOffPeakStudyGeneration({ mode: "NIGHTLY_AUTO" })
+            .then((res) => {
+              if (
+                !res.skipped &&
+                (res.indexedCount > 0 || res.generatedCount > 0)
+              ) {
+                console.log(
+                  `[NightlyStudio] Heures creuses : ${res.indexedCount} PDF indexé(s), ${res.generatedCount} ressource(s) IA générée(s).`
+                );
+              }
+            })
+            .catch((err) => {
+              console.warn("[NightlyStudio] Background tick warning:", err);
+            });
+        }
+      }, 30 * 60 * 1000);
+    }
   });
 });
