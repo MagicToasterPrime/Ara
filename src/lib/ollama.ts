@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import os from "node:os";
 import { prisma } from "@/lib/prisma";
 import type { ExtractedPdfPage } from "@/lib/pdf";
 
@@ -8,6 +9,15 @@ export function getOllamaConfig() {
     model: process.env.OLLAMA_MODEL || "qwen2.5:3b",
     embedModel: process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text",
   };
+}
+
+export function getOptimalOllamaThreads(): number {
+  const configured = Number.parseInt(process.env.OLLAMA_NUM_THREAD || "", 10);
+  if (Number.isFinite(configured) && configured >= 1) {
+    return configured;
+  }
+  const detected = os.cpus()?.length || 4;
+  return Math.max(2, Math.min(16, detected));
 }
 
 export function getParisHour(date = new Date()): number {
@@ -102,6 +112,9 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
       body: JSON.stringify({
         model: embedModel,
         prompt: text,
+        options: {
+          num_thread: getOptimalOllamaThreads(),
+        },
       }),
       signal: controller.signal,
     });

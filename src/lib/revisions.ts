@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import {
   checkOllamaHealth,
   getOllamaConfig,
+  getOptimalOllamaThreads,
   withOllamaLock,
 } from "@/lib/ollama";
 import { getAllUeMetaMap } from "@/lib/ue-meta";
@@ -545,15 +546,25 @@ export function extractCourseFacts(chunks: FactChunkLike[]): {
         }
       }
 
-      // 2. Quantitative facts with percentages, units, or key dates
+      // 2. Quantitative facts with percentages, units, or genuine historical dates (ignore bibliography/course headers)
+      const isBiblioOrHeader =
+        /\b(?:et al\.?|ed\.?|édition|press|wiley|elsevier|masson|saunders|springer|pearson|physiologie humaine|bibliographie|références)\b/i.test(
+          line
+        ) || /\b(?:ue\s*\d+|202[4-9])\b/i.test(line);
+
       const pctMatch = line.match(
         /((?:plus de|moins de|environ|près de|entre\s+\d+\s+et\s+)?\d+(?:[.,]\d+)?\s*%)/i
       );
-      const yearMatch = !pctMatch
-        ? line.match(/\b(1[6-9]\d{2}|20[0-2]\d)\b/)
-        : null;
+      const hasHistoricalContext =
+        /\b(?:créé|créée|fondé|fondée|découvert|découverte|institué|loi|décret|ordonnance|siècle|première|premier|école|révolution|naissance)\b/i.test(
+          line
+        );
+      const yearMatch =
+        !pctMatch && !isBiblioOrHeader && hasHistoricalContext
+          ? line.match(/\b(1[6-9]\d{2}|20[0-1]\d)\b/)
+          : null;
       const unitMatch =
-        !pctMatch && !yearMatch
+        !pctMatch && !yearMatch && !isBiblioOrHeader
           ? line.match(
               /(\d+(?:[.,]\d+)?(?:\s*(?:à|-|–)\s*\d+(?:[.,]\d+)?)?\s*(?:µm|um|mm|cm|ml|mg|kg|ans|jours|heures|semaines|mois|vétérinaires|espèces|catégories))\b/i
             )
@@ -1318,6 +1329,7 @@ Réponds STRICTEMENT en JSON :
             temperature: 0.35,
             num_ctx: 4096,
             num_predict: 1600,
+            num_thread: getOptimalOllamaThreads(),
           },
         }),
         signal: controller.signal,

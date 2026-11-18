@@ -166,30 +166,56 @@ function buildPrintableSummaryHtml(title: string, summary: SummaryPayload): stri
         </div>`
       : "";
 
+  const hasCleanOverview =
+    Boolean(summary.overview) &&
+    !summary.overview.trim().startsWith("[") &&
+    summary.overview.length <= 420;
+
+  const tocHtml =
+    summary.sections && summary.sections.length >= 2
+      ? `<div class="toc">
+          <div class="toc-title">Plan de la fiche</div>
+          <ol>${summary.sections
+            .map(
+              (s) =>
+                `<li><span>${escapeHtml(s.title)}</span> <span class="toc-page">${escapeHtml(
+                  s.pageRange
+                )}</span></li>`
+            )
+            .join("")}</ol>
+        </div>`
+      : "";
+
   return `<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="utf-8" />
 <title>${escapeHtml(title)}</title>
 <style>
-  @page { margin: 18mm 16mm; }
-  body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; color: #1e293b; line-height: 1.55; font-size: 11pt; margin: 0; padding: 0; }
-  .top-bar { border-bottom: 3px solid #4f46e5; padding-bottom: 8px; margin-bottom: 18px; display: flex; justify-content: space-between; font-size: 9pt; color: #64748b; }
-  h1 { font-size: 20pt; font-weight: 800; color: #0f172a; margin: 6px 0 14px; border-bottom: 1px solid #cbd5e1; padding-bottom: 10px; }
-  .overview { font-size: 10.5pt; color: #334155; margin-bottom: 18px; }
-  .chapter { border-top: 1px dashed #cbd5e1; padding-top: 14px; margin-top: 18px; page-break-inside: avoid; }
+  @page { margin: 16mm 15mm; }
+  body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; color: #1e293b; line-height: 1.5; font-size: 10.5pt; margin: 0; padding: 0; }
+  .top-bar { border-bottom: 3px solid #4f46e5; padding-bottom: 8px; margin-bottom: 14px; display: flex; justify-content: space-between; font-size: 9pt; color: #64748b; }
+  h1 { font-size: 19pt; font-weight: 800; color: #0f172a; margin: 6px 0 12px; border-bottom: 1px solid #cbd5e1; padding-bottom: 8px; }
+  .overview { font-size: 10pt; color: #475569; margin: 0 0 12px; }
+  .toc { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 4px; padding: 8px 14px; margin-bottom: 16px; font-size: 9.5pt; }
+  .toc-title { font-weight: 700; text-transform: uppercase; font-size: 8.5pt; letter-spacing: 0.05em; color: #64748b; margin-bottom: 4px; }
+  .toc ol { margin: 0 0 0 18px; padding: 0; }
+  .toc li { margin-bottom: 2px; }
+  .toc-page { color: #64748b; font-size: 8.5pt; margin-left: 4px; }
+  .chapter { border-top: 1px dashed #cbd5e1; padding-top: 12px; margin-top: 16px; }
   .chapter:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
-  h2 { font-size: 14pt; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; margin: 0 0 12px; }
-  .subsection { margin-bottom: 14px; }
-  h3 { font-size: 11.5pt; font-weight: 700; color: #3b5bdb; margin: 10px 0 8px; }
-  .callout { background: #fef9e7; border-left: 3px solid #d99b26; border-radius: 4px; padding: 10px 14px; margin: 10px 0; }
+  h2 { font-size: 13.5pt; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin: 0 0 10px; break-after: avoid; page-break-after: avoid; }
+  .subsection { margin-bottom: 12px; }
+  h3 { font-size: 11pt; font-weight: 700; color: #3b5bdb; margin: 10px 0 6px; break-after: avoid; page-break-after: avoid; }
+  .callout { background: #fef9e7; border-left: 3px solid #d99b26; border-radius: 4px; padding: 9px 12px; margin: 8px 0; break-inside: avoid; page-break-inside: avoid; }
   .callout-title { font-weight: 700; color: #0f172a; margin-bottom: 4px; }
-  ul, ol { margin: 6px 0 10px 20px; padding: 0; }
-  li { margin-bottom: 4px; }
-  table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 9.5pt; }
+  ul, ol { margin: 5px 0 8px 20px; padding: 0; }
+  li { margin-bottom: 3.5px; }
+  table { width: 100%; border-collapse: collapse; margin: 9px 0; font-size: 9.5pt; break-inside: avoid; page-break-inside: avoid; }
+  tr { break-inside: avoid; page-break-inside: avoid; }
   th { background: #f1f5f9; text-align: left; font-weight: 700; border-bottom: 1px solid #cbd5e1; padding: 6px 8px; }
   td { border-bottom: 1px solid #e2e8f0; padding: 6px 8px; }
-  .footer-end { margin-top: 24px; border-top: 1px solid #cbd5e1; padding-top: 10px; text-align: center; font-size: 9pt; color: #64748b; }
+  .footer-end { margin-top: 22px; border-top: 1px solid #cbd5e1; padding-top: 10px; text-align: center; font-size: 9pt; color: #64748b; }
 </style>
 </head>
 <body>
@@ -198,7 +224,8 @@ function buildPrintableSummaryHtml(title: string, summary: SummaryPayload): stri
     <span>Exporté le ${new Date().toLocaleDateString("fr-FR")}</span>
   </div>
   <h1>${escapeHtml(title)}</h1>
-  ${summary.overview ? `<p class="overview">${formatInlineToHtml(summary.overview)}</p>` : ""}
+  ${hasCleanOverview ? `<p class="overview">${formatInlineToHtml(summary.overview)}</p>` : ""}
+  ${tocHtml}
   ${sectionsHtml}
   ${pitfallsHtml}
   <div class="footer-end">— Fin — · Généré localement par ARA</div>
@@ -892,11 +919,13 @@ export function StudioArtifactViewer({
       </div>
 
       <div className="space-y-5 p-4 sm:p-6">
-        {content.overview && (
-          <p className="text-xs leading-relaxed text-stone">
-            {renderFormattedText(content.overview)}
-          </p>
-        )}
+        {content.overview &&
+          !content.overview.trim().startsWith("[") &&
+          content.overview.length <= 420 && (
+            <p className="text-xs leading-relaxed text-stone">
+              {renderFormattedText(content.overview)}
+            </p>
+          )}
 
         {content.sections && content.sections.length > 0 && (
           <div className="space-y-6">

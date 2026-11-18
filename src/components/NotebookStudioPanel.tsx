@@ -586,8 +586,9 @@ export function NotebookStudioPanel({
           {generatingKind &&
             (wantPublic || selectionMissingPublicKind(generatingKind)) && (
               <div className="mb-3 border border-amber/60 bg-pinned px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-ink">
-                GÉNÉRATION COMPLÈTE EN COURS SUR L&apos;ENSEMBLE DES PAGES (PAR
-                LOTS SÉQUENTIELS POUR GARANTIR 95% DU COURS)...
+                LECTURE DE TOUT LE POLYCOPIÉ PAR TRANCHES DE PAGES : SUR UN GROS
+                POLY CELA PEUT DURER PLUSIEURS DIZAINES DE MINUTES (TRAITEMENT
+                CÔTÉ SERVEUR, 100% LOCAL)...
               </div>
             )}
 
