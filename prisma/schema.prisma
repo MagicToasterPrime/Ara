@@ -298,3 +298,15 @@ model MockExamSession {
 
   @@index([userId, ueId])
 }
+
+model SharedDailyQuiz {
+  dateKey        String   @id
+  ueId           String?
+  ueCode         String?
+  ueTitle        String?
+  questionsJson  String
+  totalQuestions Int      @default(0)
+  generatedByAi  Boolean  @default(false)
+  generatedAt    DateTime @default(now())
+}
+
