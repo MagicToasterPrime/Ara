@@ -259,8 +259,8 @@ export default function HomePage() {
               {revisionSummary.revisionEnabled
                 ? revisionSummary.completedToday
                   ? "· SÉANCE DU JOUR VALIDÉE ✓"
-                  : "· QUIZ QUOTIDIEN CIBLÉ SUR VOS PARTIELS & CARNET D'ERREURS"
-                : "· ACTIVEZ LE MODE LONG TERME (QCM, QCU, TROUS, IMAGE, SRS)"}
+                  : "· QUIZ IA QUOTIDIEN · UE & COURS ALÉATOIRES (QCU, QCM, QROC, FLASHCARDS)"
+                : "· ACTIVEZ LE QUIZ IA QUOTIDIEN (QCU, QCM, QROC, FLASHCARDS)"}
             </span>
           </div>
 

@@ -15,6 +15,7 @@ import {
   Power,
   RefreshCw,
   RotateCcw,
+  Sparkles,
   Trophy,
   XCircle,
 } from "lucide-react";
@@ -114,6 +115,8 @@ interface RevisionsPayload {
 const TYPE_LABELS: Record<RevisionQuestion["type"], string> = {
   QCU: "QCU · CHOIX UNIQUE",
   QCM: "QCM · CHOIX MULTIPLES",
+  QROC: "QROC · RÉPONSE OUVERTE COURTE",
+  FLASHCARD: "FLASHCARD · RECTO / VERSO",
   FILL_BLANK: "PHRASE À TROU",
   IMAGE_POINT: "POINTAGE SUR IMAGE",
 };
@@ -132,6 +135,7 @@ export default function RevisionsPage() {
   const [gradingResults, setGradingResults] = useState<
     Record<string, boolean> | null
   >(null);
+  const [flippedCards, setFlippedCards] = useState<Record<string, boolean>>({});
   const [revealedErrorIds, setRevealedErrorIds] = useState<
     Record<string, boolean>
   >({});
@@ -150,6 +154,7 @@ export default function RevisionsPage() {
         setAnswers(json.todaySession.answers || {});
         if (!json.todaySession.completed) {
           setGradingResults(null);
+          setFlippedCards({});
         }
       }
     } catch {
@@ -185,6 +190,7 @@ export default function RevisionsPage() {
         setGradingResults(json.gradingResults);
       } else if (json.todaySession && !json.todaySession.completed) {
         setGradingResults(null);
+        setFlippedCards({});
       }
     } finally {
       setBusy(false);
@@ -210,7 +216,7 @@ export default function RevisionsPage() {
     });
   }
 
-  function handleFillBlank(questionId: string, val: string) {
+  function handleTextAnswer(questionId: string, val: string) {
     if (data?.todaySession?.completed) return;
     setAnswers((prev) => ({ ...prev, [questionId]: val }));
   }
@@ -227,6 +233,15 @@ export default function RevisionsPage() {
   const activeErrorItems = (errorBook?.items || []).filter(
     (item) => !item.mastered
   );
+  const sessionUe = sessionData?.questions?.[0]
+    ? {
+        code: sessionData.questions[0].ueCode,
+        title: sessionData.questions[0].ueTitle,
+      }
+    : null;
+  const sessionGeneratedByAi = Boolean(
+    sessionData?.questions?.some((q) => q.generatedByAi)
+  );
 
   return (
     <AppShell>
@@ -238,7 +253,7 @@ export default function RevisionsPage() {
               RÉVISIONS JOURNALIÈRES &amp; CLASSEMENT DE STREAK
             </h1>
             <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
-              [ ENTRAÎNEMENT LONG TERME AUX PARTIELS · QCM · QCU · TEXTES À TROUS · POINTAGE IMAGE ]
+              [ QUIZ IA SUR UE &amp; COURS ALÉATOIRES · QCU · QCM · QROC · FLASHCARDS ]
             </p>
           </div>
 
@@ -368,10 +383,10 @@ export default function RevisionsPage() {
                   </h2>
                   <p className="mt-2 text-sm leading-relaxed text-stone">
                     Activez les révisions journalières pour qu&apos;Ara génère
-                    chaque jour une séance de quiz tirée aléatoirement parmi
-                    les chapitres de vos UE (QCU, QCM, phrases à trou et
-                    pointage direct sur vos polycopiés) et maintenez votre
-                    streak dans le classement de la promotion.
+                    chaque jour par IA une séance composée de QCU, QCM, QROC et
+                    Flashcards sur des cours tirés aléatoirement dans une UE
+                    aléatoire, et maintenez votre streak dans le classement de
+                    la promotion.
                   </p>
                   <button
                     type="button"
@@ -425,13 +440,24 @@ export default function RevisionsPage() {
                 <div className="space-y-4">
                   {/* Session Status Header */}
                   <div className="flex flex-wrap items-center justify-between gap-3 border border-border bg-card px-4 py-3">
-                    <div>
+                    <div className="flex flex-wrap items-center gap-2">
                       <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
                         SÉANCE DU {sessionData.dateKey} ·{" "}
                         {sessionData.questions.length} QUESTIONS
                       </span>
+                      {sessionUe && (
+                        <span className="border border-border bg-paper px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink">
+                          UE ALÉATOIRE : {sessionUe.code} — {sessionUe.title}
+                        </span>
+                      )}
+                      {sessionGeneratedByAi && (
+                        <span className="inline-flex items-center gap-1 border border-forest/40 bg-forest/10 px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-forest">
+                          <Sparkles className="h-3 w-3" />
+                          <span>GÉNÉRÉ PAR IA SPIX</span>
+                        </span>
+                      )}
                       {sessionData.completed && (
-                        <span className="ml-3 bg-badge-bg px-2 py-0.5 font-mono text-[11px] font-bold uppercase tracking-wider text-badge-text">
+                        <span className="bg-badge-bg px-2 py-0.5 font-mono text-[11px] font-bold uppercase tracking-wider text-badge-text">
                           SCORE : {sessionData.score} /{" "}
                           {sessionData.totalQuestions}
                         </span>
@@ -555,6 +581,134 @@ export default function RevisionsPage() {
                           </div>
                         )}
 
+                        {/* QROC */}
+                        {q.type === "QROC" && (
+                          <div className="space-y-3">
+                            <textarea
+                              rows={3}
+                              disabled={isGraded}
+                              value={
+                                typeof answers[q.id] === "string"
+                                  ? (answers[q.id] as string)
+                                  : ""
+                              }
+                              onChange={(e) =>
+                                handleTextAnswer(q.id, e.target.value)
+                              }
+                              placeholder="Rédigez votre réponse courte (mot-clé, définition, mécanisme)..."
+                              className="w-full border border-border bg-paper px-3 py-2.5 text-sm text-ink placeholder:text-stone focus:border-ink focus:outline-none disabled:opacity-75"
+                            />
+
+                            {isGraded && q.correctAnswer && (
+                              <div className="border border-forest/40 bg-forest/10 p-3 text-xs text-ink">
+                                <p className="font-mono text-[10px] font-bold uppercase tracking-wider text-forest">
+                                  RÉPONSE ATTENDUE : {q.correctAnswer}
+                                </p>
+                                {q.acceptedKeywords &&
+                                  q.acceptedKeywords.length > 1 && (
+                                    <p className="mt-1 font-mono text-[10px] uppercase tracking-wider text-stone">
+                                      MOTS-CLÉS ACCEPTÉS :{" "}
+                                      {q.acceptedKeywords.join(" · ")}
+                                    </p>
+                                  )}
+                              </div>
+                            )}
+                          </div>
+                        )}
+
+                        {/* FLASHCARD */}
+                        {q.type === "FLASHCARD" && (
+                          <div className="space-y-3">
+                            {!flippedCards[q.id] && !isGraded ? (
+                              <div className="border border-border bg-paper p-5 text-center">
+                                <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                                  RECTO · FORMULEZ MENTALEMENT LA RÉPONSE PUIS
+                                  RETOURNEZ LA CARTE
+                                </p>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setFlippedCards((prev) => ({
+                                      ...prev,
+                                      [q.id]: true,
+                                    }))
+                                  }
+                                  className="mt-3 inline-flex items-center gap-2 border border-ink bg-ink px-4 py-2 font-mono text-xs uppercase tracking-wider text-card hover:bg-ink/90"
+                                >
+                                  <RotateCcw className="h-3.5 w-3.5" />
+                                  <span>
+                                    RETOURNER LA FLASHCARD (VOIR LE VERSO)
+                                  </span>
+                                </button>
+                              </div>
+                            ) : (
+                              <div className="space-y-3">
+                                <div
+                                  className="border border-border bg-paper p-4"
+                                  style={{ borderLeft: "3px solid #3D6B99" }}
+                                >
+                                  <div className="mb-1.5 flex items-center justify-between gap-2">
+                                    <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-slate">
+                                      VERSO · RÉPONSE DU COURS
+                                    </span>
+                                    {!isGraded && (
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          setFlippedCards((prev) => ({
+                                            ...prev,
+                                            [q.id]: false,
+                                          }))
+                                        }
+                                        className="font-mono text-[10px] uppercase tracking-wider text-stone hover:text-ink"
+                                      >
+                                        MASQUER LE VERSO
+                                      </button>
+                                    )}
+                                  </div>
+                                  <p className="text-sm leading-relaxed text-ink">
+                                    {q.flashcardBack || q.explanation}
+                                  </p>
+                                </div>
+
+                                <div className="flex flex-wrap gap-2">
+                                  <button
+                                    type="button"
+                                    disabled={isGraded}
+                                    onClick={() =>
+                                      handleTextAnswer(q.id, "KNOWN")
+                                    }
+                                    className={`inline-flex flex-1 items-center justify-center gap-1.5 border px-3 py-2.5 font-mono text-xs font-semibold uppercase tracking-wider transition-colors ${
+                                      answers[q.id] === "KNOWN"
+                                        ? "border-forest bg-forest text-card"
+                                        : "border-forest/50 bg-forest/10 text-forest hover:bg-forest/20"
+                                    } disabled:opacity-80`}
+                                  >
+                                    <Check className="h-3.5 w-3.5" />
+                                    <span>JE SAVAIS (MAÎTRISÉ)</span>
+                                  </button>
+
+                                  <button
+                                    type="button"
+                                    disabled={isGraded}
+                                    onClick={() =>
+                                      handleTextAnswer(q.id, "REVIEW")
+                                    }
+                                    className={`inline-flex flex-1 items-center justify-center gap-1.5 border px-3 py-2.5 font-mono text-xs font-semibold uppercase tracking-wider transition-colors ${
+                                      answers[q.id] === "REVIEW"
+                                        ? "border-carmine bg-carmine text-card"
+                                        : "border-carmine/50 bg-carmine/10 text-carmine hover:bg-carmine/20"
+                                    } disabled:opacity-80`}
+                                  >
+                                    <XCircle className="h-3.5 w-3.5" />
+                                    <span>À REVOIR (CARNET SRS)</span>
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+
                         {/* FILL_BLANK */}
                         {q.type === "FILL_BLANK" && (
                           <div className="space-y-3">
@@ -571,7 +725,7 @@ export default function RevisionsPage() {
                                   : ""
                               }
                               onChange={(e) =>
-                                handleFillBlank(q.id, e.target.value)
+                                handleTextAnswer(q.id, e.target.value)
                               }
                               placeholder="Tapez le terme exact ou sélectionnez-le ci-dessous..."
                               className="w-full border border-border bg-paper px-3 py-2 font-mono text-xs text-ink focus:border-ink focus:outline-none disabled:opacity-75"
@@ -589,7 +743,9 @@ export default function RevisionsPage() {
                                       key={term}
                                       type="button"
                                       disabled={isGraded}
-                                      onClick={() => handleFillBlank(q.id, term)}
+                                      onClick={() =>
+                                        handleTextAnswer(q.id, term)
+                                      }
                                       className={`border px-2.5 py-1 font-mono text-xs transition-colors ${
                                         selected
                                           ? "border-ink bg-ink text-card"
@@ -881,7 +1037,15 @@ export default function RevisionsPage() {
                               )}
                               {q.correctAnswer && (
                                 <p className="font-semibold">
-                                  Mot-clé attendu : {q.correctAnswer}
+                                  {q.type === "QROC"
+                                    ? "Réponse attendue : "
+                                    : "Mot-clé attendu : "}
+                                  {q.correctAnswer}
+                                </p>
+                              )}
+                              {q.flashcardBack && (
+                                <p className="font-semibold">
+                                  Verso : {q.flashcardBack}
                                 </p>
                               )}
                               <p className="mt-1 text-stone">{q.explanation}</p>

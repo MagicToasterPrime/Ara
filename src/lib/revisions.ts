@@ -1,12 +1,16 @@
 import crypto from "node:crypto";
 import { prisma } from "@/lib/prisma";
-import { formatExamBadge } from "@/lib/class-levels";
-import { getUserErrorBook } from "@/lib/error-book";
 import { checkOllamaHealth, getOllamaConfig } from "@/lib/ollama";
 import { getAllUeMetaMap } from "@/lib/ue-meta";
 import { getUserAccountMeta } from "@/lib/user-schema";
 
-export type QuestionType = "QCU" | "QCM" | "FILL_BLANK" | "IMAGE_POINT";
+export type QuestionType =
+  | "QCU"
+  | "QCM"
+  | "QROC"
+  | "FLASHCARD"
+  | "FILL_BLANK"
+  | "IMAGE_POINT";
 
 export interface RevisionQuestion {
   id: string;
@@ -22,13 +26,17 @@ export interface RevisionQuestion {
   pageNumber: number;
   prompt: string;
   explanation: string;
+  generatedByAi?: boolean;
   // QCU / QCM
   options?: string[];
   correctIndices?: number[];
-  // FILL_BLANK
+  // QROC & FILL_BLANK
   sentenceWithBlank?: string;
   correctAnswer?: string;
+  acceptedKeywords?: string[];
   wordBank?: string[];
+  // FLASHCARD
+  flashcardBack?: string;
   // IMAGE_POINT
   targetPhrase?: string;
   fallbackZones?: Array<{
@@ -49,7 +57,7 @@ export interface ImagePointAnswer {
 
 export type RevisionAnswerValue =
   | number[] // QCU / QCM
-  | string // FILL_BLANK
+  | string // QROC / FLASHCARD ("KNOWN" | "REVIEW") / FILL_BLANK
   | ImagePointAnswer; // IMAGE_POINT
 
 let schemaEnsured = false;
@@ -267,6 +275,7 @@ function buildFallbackQCU(
     options: tagged.map((t) => t.text),
     correctIndices: [correctIndex >= 0 ? correctIndex : 0],
     explanation: `Passage exact issu de ${chunk.documentTitle} (page ${chunk.pageNumber}) : « ${correctSentence} ».`,
+    generatedByAi: false,
   };
 }
 
@@ -326,54 +335,41 @@ function buildFallbackQCM(
     options: tagged.map((t) => t.text),
     correctIndices,
     explanation: `Les deux énoncés exacts proviennent de ${chunk.documentTitle} (page ${chunk.pageNumber}).`,
+    generatedByAi: false,
   };
 }
 
-function buildFallbackFillBlank(
-  chunk: SampledChunk,
-  otherChunks: SampledChunk[]
-): RevisionQuestion {
+function buildFallbackQROC(chunk: SampledChunk): RevisionQuestion {
   const sentences = splitSentences(chunk.content);
   const chosenSentence =
     sentences.find((s) => extractCandidateTerms(s).length > 0) ||
     sentences[0] ||
-    chunk.content.slice(0, 200);
+    chunk.content.slice(0, 220).trim();
 
-  const terms = extractCandidateTerms(chosenSentence);
-  const targetTerm =
-    terms.sort((a, b) => b.length - a.length)[0] ||
-    extractCandidateTerms(chunk.content)[0] ||
-    chunk.ueCode;
+  const sortedTerms = [
+    ...extractCandidateTerms(chosenSentence),
+    ...extractCandidateTerms(chunk.content),
+  ].sort((a, b) => b.length - a.length);
+
+  const uniqueTerms = Array.from(new Set(sortedTerms));
+  const targetTerm = uniqueTerms[0] || chunk.chapterTitle;
+  const acceptedKeywords =
+    uniqueTerms.length > 0 ? uniqueTerms.slice(0, 5) : [targetTerm];
 
   const escaped = targetTerm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const blanked = chosenSentence.replace(
+  const maskedContext = chosenSentence.replace(
     new RegExp(`\\b${escaped}\\b`, "i"),
-    "[ ______ ]"
+    "[ ... ]"
   );
 
-  const sentenceWithBlank =
-    blanked !== chosenSentence
-      ? blanked
-      : `${chosenSentence} (Mot-clé principal : [ ______ ])`;
-
-  const allOtherTerms = shuffle(
-    otherChunks.flatMap((c) => extractCandidateTerms(c.content))
-  ).filter(
-    (t) => normalizeTextForMatch(t) !== normalizeTextForMatch(targetTerm)
-  );
-
-  const bankSet = new Set<string>([targetTerm]);
-  for (const t of allOtherTerms) {
-    if (bankSet.size >= 4) break;
-    bankSet.add(t);
-  }
-  while (bankSet.size < 4) {
-    bankSet.add(`Terme_${bankSet.size + 1}`);
-  }
+  const prompt =
+    maskedContext !== chosenSentence
+      ? `Question ouverte (QROC) — Dans « ${chunk.chapterTitle} » (${chunk.ueCode}), quel terme clé complète exactement l'énoncé : « ${maskedContext} » ?`
+      : `Question ouverte (QROC) — Citez un terme ou mécanisme essentiel de « ${chunk.chapterTitle} » abordé dans « ${chunk.documentTitle} » (page ${chunk.pageNumber}).`;
 
   return {
     id: `q-${crypto.randomUUID().slice(0, 8)}`,
-    type: "FILL_BLANK",
+    type: "QROC",
     ueId: chunk.ueId,
     ueCode: chunk.ueCode,
     ueTitle: chunk.ueTitle,
@@ -383,32 +379,26 @@ function buildFallbackFillBlank(
     documentTitle: chunk.documentTitle,
     fileName: chunk.fileName,
     pageNumber: chunk.pageNumber,
-    prompt: `Complétez l'extrait du cours « ${chunk.documentTitle} » (${chunk.ueCode}) :`,
-    sentenceWithBlank,
+    prompt,
     correctAnswer: targetTerm,
-    wordBank: shuffle(Array.from(bankSet)),
-    explanation: `Le terme exact dans le cours (page ${chunk.pageNumber}) est « ${targetTerm} ».`,
+    acceptedKeywords,
+    explanation: `Réponse attendue : « ${targetTerm} ». Passage de ${chunk.documentTitle} (page ${chunk.pageNumber}) : « ${chosenSentence} ».`,
+    generatedByAi: false,
   };
 }
 
-function buildImagePointQuestion(chunk: SampledChunk): RevisionQuestion {
+function buildFallbackFlashcard(chunk: SampledChunk): RevisionQuestion {
+  const sentences = splitSentences(chunk.content);
   const terms = extractCandidateTerms(chunk.content).sort(
     (a, b) => b.length - a.length
   );
-  const targetPhrase = terms[0] || chunk.content.split(/\s+/).slice(0, 3).join(" ");
-
-  const fallbackZones = [
-    { id: "Z1", label: "A", xPercent: 28, yPercent: 28 },
-    { id: "Z2", label: "B", xPercent: 72, yPercent: 28 },
-    { id: "Z3", label: "C", xPercent: 28, yPercent: 70 },
-    { id: "Z4", label: "D", xPercent: 72, yPercent: 70 },
-  ];
-
-  const correctZone = fallbackZones[Math.floor(Math.random() * fallbackZones.length)];
+  const topTerm = terms[0] || chunk.chapterTitle;
+  const summary =
+    sentences.slice(0, 2).join(" ") || chunk.content.slice(0, 280).trim();
 
   return {
     id: `q-${crypto.randomUUID().slice(0, 8)}`,
-    type: "IMAGE_POINT",
+    type: "FLASHCARD",
     ueId: chunk.ueId,
     ueCode: chunk.ueCode,
     ueTitle: chunk.ueTitle,
@@ -418,61 +408,84 @@ function buildImagePointQuestion(chunk: SampledChunk): RevisionQuestion {
     documentTitle: chunk.documentTitle,
     fileName: chunk.fileName,
     pageNumber: chunk.pageNumber,
-    prompt: `Pointez directement sur l'image du cours (${chunk.fileName}, p.${chunk.pageNumber}) l'emplacement correspondant à la notion : « ${targetPhrase} »`,
-    targetPhrase,
-    fallbackZones,
-    correctZoneId: correctZone.id,
-    explanation: `La notion « ${targetPhrase} » apparaît sur la page ${chunk.pageNumber} de ${chunk.documentTitle}.`,
+    prompt: `Que faut-il retenir à propos de « ${topTerm} » dans « ${chunk.chapterTitle} » (${chunk.ueCode}) ?`,
+    flashcardBack: summary,
+    explanation: `Synthèse issue de ${chunk.documentTitle} (page ${chunk.pageNumber}).`,
+    generatedByAi: false,
   };
+}
+
+function parseOllamaJson<T>(raw: string): T | null {
+  const trimmed = raw.trim();
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    const match = trimmed.match(/\{[\s\S]*\}/);
+    if (!match) return null;
+    try {
+      return JSON.parse(match[0]) as T;
+    } catch {
+      return null;
+    }
+  }
 }
 
 async function tryOllamaQuizEnrichment(
   qcuChunk: SampledChunk,
   qcmChunk: SampledChunk,
-  fillChunk: SampledChunk
+  qrocChunk: SampledChunk,
+  flashcardChunk: SampledChunk
 ): Promise<{
   qcu?: Partial<RevisionQuestion>;
   qcm?: Partial<RevisionQuestion>;
-  fillBlank?: Partial<RevisionQuestion>;
+  qroc?: Partial<RevisionQuestion>;
+  flashcard?: Partial<RevisionQuestion>;
 } | null> {
   const health = await checkOllamaHealth();
   if (!health.online) return null;
 
   const { host, model } = getOllamaConfig();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 14000);
+  const timer = setTimeout(() => controller.abort(), 25000);
 
-  const prompt = `Génère strictement un JSON valide avec 3 questions de révision universitaire en français basées uniquement sur ces 3 extraits de cours :
+  const prompt = `Tu es Spix, assistant pédagogique universitaire vétérinaire. Génère strictement un objet JSON valide avec 4 exercices de révision en français basés EXCLUSIVEMENT sur ces 4 extraits de cours :
 
-EXTRAIT 1 (pour QCU - 1 seule bonne réponse parmi 4) [${qcuChunk.ueCode} - ${qcuChunk.chapterTitle}]:
-${qcuChunk.content}
+EXTRAIT 1 (pour QCU — 1 seule bonne réponse parmi 4) [${qcuChunk.ueCode} - ${qcuChunk.chapterTitle} - ${qcuChunk.documentTitle}]:
+${qcuChunk.content.slice(0, 900)}
 
-EXTRAIT 2 (pour QCM - exactement 2 bonnes réponses parmi 4) [${qcmChunk.ueCode} - ${qcmChunk.chapterTitle}]:
-${qcmChunk.content}
+EXTRAIT 2 (pour QCM — 2 ou 3 bonnes réponses parmi 4) [${qcmChunk.ueCode} - ${qcmChunk.chapterTitle} - ${qcmChunk.documentTitle}]:
+${qcmChunk.content.slice(0, 900)}
 
-EXTRAIT 3 (pour FILL_BLANK - phrase à trou avec [ ______ ]) [${fillChunk.ueCode} - ${fillChunk.chapterTitle}]:
-${fillChunk.content}
+EXTRAIT 3 (pour QROC — Question à Réponse Ouverte et Courte, réponse précise en 1 à 5 mots) [${qrocChunk.ueCode} - ${qrocChunk.chapterTitle} - ${qrocChunk.documentTitle}]:
+${qrocChunk.content.slice(0, 900)}
 
-Format JSON exact attendu :
+EXTRAIT 4 (pour FLASHCARD — carte Recto question / Verso synthèse claire) [${flashcardChunk.ueCode} - ${flashcardChunk.chapterTitle} - ${flashcardChunk.documentTitle}]:
+${flashcardChunk.content.slice(0, 900)}
+
+Format JSON strict attendu :
 {
   "qcu": {
-    "prompt": "Question précise ?",
+    "prompt": "Question précise à choix unique ?",
     "options": ["Option A", "Option B", "Option C", "Option D"],
     "correctIndices": [0],
-    "explanation": "Explication courte."
+    "explanation": "Explication courte tirée du cours."
   },
   "qcm": {
     "prompt": "Question à choix multiples ?",
     "options": ["Option 1", "Option 2", "Option 3", "Option 4"],
     "correctIndices": [0, 2],
-    "explanation": "Explication courte."
+    "explanation": "Explication courte tirée du cours."
   },
-  "fillBlank": {
-    "prompt": "Complétez la notion clé :",
-    "sentenceWithBlank": "Phrase du cours avec [ ______ ] à la place du terme clé.",
-    "correctAnswer": "mot",
-    "distractors": ["faux1", "faux2", "faux3"],
-    "explanation": "Explication courte."
+  "qroc": {
+    "prompt": "Question ouverte courte appelant une notion précise ?",
+    "correctAnswer": "Réponse courte attendue",
+    "acceptedKeywords": ["motcle1", "motcle2"],
+    "explanation": "Explication courte tirée du cours."
+  },
+  "flashcard": {
+    "prompt": "Question ou concept clé à restituer (Recto) ?",
+    "flashcardBack": "Réponse synthétique et structurée tirée du cours (Verso, 1 à 3 phrases).",
+    "explanation": "Point clé à mémoriser."
   }
 }`;
 
@@ -493,7 +506,7 @@ Format JSON exact attendu :
     const data = (await res.json()) as { response?: string };
     if (!data.response) return null;
 
-    const parsed = JSON.parse(data.response) as {
+    const parsed = parseOllamaJson<{
       qcu?: {
         prompt?: string;
         options?: string[];
@@ -506,19 +519,26 @@ Format JSON exact attendu :
         correctIndices?: number[];
         explanation?: string;
       };
-      fillBlank?: {
+      qroc?: {
         prompt?: string;
-        sentenceWithBlank?: string;
         correctAnswer?: string;
-        distractors?: string[];
+        acceptedKeywords?: string[];
         explanation?: string;
       };
-    };
+      flashcard?: {
+        prompt?: string;
+        flashcardBack?: string;
+        explanation?: string;
+      };
+    }>(data.response);
+
+    if (!parsed) return null;
 
     const result: {
       qcu?: Partial<RevisionQuestion>;
       qcm?: Partial<RevisionQuestion>;
-      fillBlank?: Partial<RevisionQuestion>;
+      qroc?: Partial<RevisionQuestion>;
+      flashcard?: Partial<RevisionQuestion>;
     } = {};
 
     if (
@@ -526,13 +546,16 @@ Format JSON exact attendu :
       Array.isArray(parsed.qcu.options) &&
       parsed.qcu.options.length === 4 &&
       Array.isArray(parsed.qcu.correctIndices) &&
-      parsed.qcu.correctIndices.length === 1
+      parsed.qcu.correctIndices.length === 1 &&
+      parsed.qcu.correctIndices[0] >= 0 &&
+      parsed.qcu.correctIndices[0] < 4
     ) {
       result.qcu = {
-        prompt: parsed.qcu.prompt,
-        options: parsed.qcu.options,
+        prompt: parsed.qcu.prompt.trim(),
+        options: parsed.qcu.options.map((o) => String(o).trim()),
         correctIndices: parsed.qcu.correctIndices,
-        explanation: parsed.qcu.explanation || "",
+        explanation: (parsed.qcu.explanation || "").trim(),
+        generatedByAi: true,
       };
     }
 
@@ -540,34 +563,59 @@ Format JSON exact attendu :
       parsed.qcm?.prompt &&
       Array.isArray(parsed.qcm.options) &&
       parsed.qcm.options.length === 4 &&
-      Array.isArray(parsed.qcm.correctIndices) &&
-      parsed.qcm.correctIndices.length >= 2
+      Array.isArray(parsed.qcm.correctIndices)
     ) {
-      result.qcm = {
-        prompt: parsed.qcm.prompt,
-        options: parsed.qcm.options,
-        correctIndices: parsed.qcm.correctIndices,
-        explanation: parsed.qcm.explanation || "",
+      const validIndices = Array.from(
+        new Set(
+          parsed.qcm.correctIndices.filter(
+            (i) => typeof i === "number" && i >= 0 && i < 4
+          )
+        )
+      ).sort((a, b) => a - b);
+
+      if (validIndices.length >= 2) {
+        result.qcm = {
+          prompt: parsed.qcm.prompt.trim(),
+          options: parsed.qcm.options.map((o) => String(o).trim()),
+          correctIndices: validIndices,
+          explanation: (parsed.qcm.explanation || "").trim(),
+          generatedByAi: true,
+        };
+      }
+    }
+
+    if (
+      parsed.qroc?.prompt &&
+      typeof parsed.qroc.correctAnswer === "string" &&
+      parsed.qroc.correctAnswer.trim().length > 0
+    ) {
+      const mainAnswer = parsed.qroc.correctAnswer.trim();
+      const rawKeywords = Array.isArray(parsed.qroc.acceptedKeywords)
+        ? parsed.qroc.acceptedKeywords
+            .map((k) => String(k).trim())
+            .filter((k) => k.length > 0)
+        : [];
+      const keywordSet = Array.from(new Set([mainAnswer, ...rawKeywords]));
+
+      result.qroc = {
+        prompt: parsed.qroc.prompt.trim(),
+        correctAnswer: mainAnswer,
+        acceptedKeywords: keywordSet,
+        explanation: (parsed.qroc.explanation || "").trim(),
+        generatedByAi: true,
       };
     }
 
     if (
-      parsed.fillBlank?.sentenceWithBlank &&
-      parsed.fillBlank.sentenceWithBlank.includes("______") &&
-      parsed.fillBlank.correctAnswer
+      parsed.flashcard?.prompt &&
+      typeof parsed.flashcard.flashcardBack === "string" &&
+      parsed.flashcard.flashcardBack.trim().length > 0
     ) {
-      const distractors = Array.isArray(parsed.fillBlank.distractors)
-        ? parsed.fillBlank.distractors.slice(0, 3)
-        : [];
-      result.fillBlank = {
-        prompt: parsed.fillBlank.prompt || "Complétez la phrase du cours :",
-        sentenceWithBlank: parsed.fillBlank.sentenceWithBlank,
-        correctAnswer: parsed.fillBlank.correctAnswer.trim(),
-        wordBank: shuffle([
-          parsed.fillBlank.correctAnswer.trim(),
-          ...distractors,
-        ]),
-        explanation: parsed.fillBlank.explanation || "",
+      result.flashcard = {
+        prompt: parsed.flashcard.prompt.trim(),
+        flashcardBack: parsed.flashcard.flashcardBack.trim(),
+        explanation: (parsed.flashcard.explanation || "").trim(),
+        generatedByAi: true,
       };
     }
 
@@ -585,17 +633,97 @@ export async function generateQuizQuestions(options?: {
   count?: number;
 }): Promise<RevisionQuestion[]> {
   const requestedCount = Math.max(4, Math.min(20, options?.count || 4));
-  const rawChunks = await prisma.documentChunk.findMany({
-    where: options?.ueId
-      ? {
-          document: {
-            chapter: {
-              ueId: options.ueId,
+
+  let targetUeId = options?.ueId?.trim() || "";
+
+  if (!targetUeId) {
+    const uesWithChunks = await prisma.uE.findMany({
+      where: {
+        chapters: {
+          some: {
+            documents: {
+              some: {
+                chunks: { some: {} },
+              },
             },
           },
+        },
+      },
+      select: { id: true },
+    });
+
+    if (uesWithChunks.length === 0) {
+      return [];
+    }
+
+    let candidateUeIds = uesWithChunks.map((u) => u.id);
+
+    if (options?.userId) {
+      try {
+        const [userMeta, ueMetaMap] = await Promise.all([
+          getUserAccountMeta(options.userId),
+          getAllUeMetaMap(),
+        ]);
+        const classMatched = candidateUeIds.filter(
+          (id) => ueMetaMap.get(id)?.classLevel === userMeta.classLevel
+        );
+        if (classMatched.length > 0) {
+          candidateUeIds = classMatched;
         }
-      : undefined,
-    take: 140,
+      } catch {
+        // Fallback safely across all available UEs
+      }
+    }
+
+    targetUeId =
+      candidateUeIds[Math.floor(Math.random() * candidateUeIds.length)];
+  }
+
+  // Pick random chunks distributed evenly across randomly shuffled courses inside the chosen UE
+  const chunkRefs = await prisma.documentChunk.findMany({
+    where: {
+      document: {
+        chapter: {
+          ueId: targetUeId,
+        },
+      },
+    },
+    select: { id: true, documentId: true },
+  });
+
+  if (chunkRefs.length === 0) {
+    return [];
+  }
+
+  const byDoc = new Map<string, string[]>();
+  for (const ref of chunkRefs) {
+    const existing = byDoc.get(ref.documentId);
+    if (existing) existing.push(ref.id);
+    else byDoc.set(ref.documentId, [ref.id]);
+  }
+
+  const shuffledDocQueues = shuffle(
+    Array.from(byDoc.values()).map((ids) => shuffle(ids))
+  );
+
+  const pickedIds: string[] = [];
+  const maxSample = 48;
+  let depth = 0;
+  while (pickedIds.length < maxSample) {
+    let added = false;
+    for (const queue of shuffledDocQueues) {
+      if (depth < queue.length) {
+        pickedIds.push(queue[depth]);
+        added = true;
+        if (pickedIds.length >= maxSample) break;
+      }
+    }
+    if (!added) break;
+    depth += 1;
+  }
+
+  const rawChunks = await prisma.documentChunk.findMany({
+    where: { id: { in: pickedIds } },
     include: {
       document: {
         select: {
@@ -653,69 +781,29 @@ export async function generateQuizQuestions(options?: {
           ueTitle: c.document.chapter.ue.title,
         }));
 
-  // Priority scoring: user's classLevel + upcoming exams + errorBook weak chapters
-  let priorityClass: string | null = null;
-  const weakChapterKeys = new Set<string>();
-  const urgentUeIds = new Set<string>();
+  const pool = shuffle(baseList);
 
-  if (!options?.ueId && options?.userId) {
-    try {
-      const [userMeta, errorBook, ueMetaMap] = await Promise.all([
-        getUserAccountMeta(options.userId),
-        getUserErrorBook(options.userId),
-        getAllUeMetaMap(),
-      ]);
-      priorityClass = userMeta.classLevel;
-      for (const wc of errorBook.weakChapters) {
-        if (wc.activeItems > 0) {
-          weakChapterKeys.add(`${wc.ueId}::${wc.chapterTitle}`);
-        }
-      }
-      ueMetaMap.forEach((meta, id) => {
-        const badge = formatExamBadge(meta.examType, meta.examDate);
-        if (
-          badge.daysRemaining !== null &&
-          badge.daysRemaining >= 0 &&
-          badge.daysRemaining <= 21
-        ) {
-          urgentUeIds.add(id);
-        }
-      });
-
-      const classFiltered = baseList.filter(
-        (c) => ueMetaMap.get(c.ueId)?.classLevel === priorityClass
-      );
-      if (classFiltered.length >= 2) {
-        baseList.splice(0, baseList.length, ...classFiltered);
-      }
-    } catch {
-      // Fallback safely to baseList
-    }
-  }
-
-  // Sort with randomized jitter + priority boost for weak chapters and approaching exams
-  const pool = baseList
-    .map((chunk) => {
-      const isWeak = weakChapterKeys.has(
-        `${chunk.ueId}::${chunk.chapterTitle}`
-      );
-      const isUrgent = urgentUeIds.has(chunk.ueId);
-      const weight =
-        Math.random() * 10 + (isWeak ? 8 : 0) + (isUrgent ? 5 : 0);
-      return { chunk, weight };
-    })
-    .sort((a, b) => b.weight - a.weight)
-    .map((item) => item.chunk);
-
-  // Prefer distinct chapters across UEs up to requestedCount
+  // Pick chunks from varied random documents & chapters within the selected UE
   const selected: SampledChunk[] = [];
+  const usedDocs = new Set<string>();
   const usedChapters = new Set<string>();
+
   for (const item of pool) {
-    if (!usedChapters.has(item.chapterId)) {
+    if (!usedDocs.has(item.documentId) && !usedChapters.has(item.chapterId)) {
+      usedDocs.add(item.documentId);
       usedChapters.add(item.chapterId);
       selected.push(item);
     }
     if (selected.length >= requestedCount) break;
+  }
+  if (selected.length < requestedCount) {
+    for (const item of pool) {
+      if (!usedDocs.has(item.documentId)) {
+        usedDocs.add(item.documentId);
+        selected.push(item);
+      }
+      if (selected.length >= requestedCount) break;
+    }
   }
   let fallbackCursor = 0;
   while (selected.length < requestedCount) {
@@ -734,39 +822,25 @@ export async function generateQuizQuestions(options?: {
 
     const fallbackQcu = buildFallbackQCU(c1, pool);
     const fallbackQcm = buildFallbackQCM(c2, pool);
-    const fallbackFill = buildFallbackFillBlank(c3, pool);
-    const imagePointQ = buildImagePointQuestion(c4);
+    const fallbackQroc = buildFallbackQROC(c3);
+    const fallbackFlashcard = buildFallbackFlashcard(c4);
 
-    if (b === 0) {
-      const aiEnriched = await tryOllamaQuizEnrichment(c1, c2, c3);
-      questions.push(
-        aiEnriched?.qcu ? { ...fallbackQcu, ...aiEnriched.qcu } : fallbackQcu,
-        aiEnriched?.qcm
-          ? { ...fallbackQcm, ...aiEnriched.qcm }
-          : fallbackQCMQuestionFix(fallbackQcm),
-        aiEnriched?.fillBlank
-          ? {
-              ...fallbackFill,
-              ...aiEnriched.fillBlank,
-              wordBank:
-                aiEnriched.fillBlank.wordBank &&
-                aiEnriched.fillBlank.wordBank.length >= 2
-                  ? aiEnriched.fillBlank.wordBank
-                  : fallbackFill.wordBank,
-            }
-          : fallbackFill,
-        imagePointQ
-      );
-    } else {
-      questions.push(fallbackQcu, fallbackQcm, fallbackFill, imagePointQ);
-    }
+    const aiEnriched =
+      b < 2 ? await tryOllamaQuizEnrichment(c1, c2, c3, c4) : null;
+
+    questions.push(
+      aiEnriched?.qcu ? { ...fallbackQcu, ...aiEnriched.qcu } : fallbackQcu,
+      aiEnriched?.qcm ? { ...fallbackQcm, ...aiEnriched.qcm } : fallbackQcm,
+      aiEnriched?.qroc
+        ? { ...fallbackQroc, ...aiEnriched.qroc }
+        : fallbackQroc,
+      aiEnriched?.flashcard
+        ? { ...fallbackFlashcard, ...aiEnriched.flashcard }
+        : fallbackFlashcard
+    );
   }
 
   return questions.slice(0, requestedCount);
-}
-
-function fallbackQCMQuestionFix(q: RevisionQuestion): RevisionQuestion {
-  return q;
 }
 
 export function gradeRevisionAnswers(
@@ -789,6 +863,31 @@ export function gradeRevisionAnswers(
         expected.length > 0 &&
         selected.length === expected.length &&
         selected.every((v, idx) => v === expected[idx]);
+    } else if (q.type === "QROC") {
+      const given = typeof ans === "string" ? normalizeTextForMatch(ans) : "";
+      if (given.length >= 2) {
+        const expected = q.correctAnswer
+          ? normalizeTextForMatch(q.correctAnswer)
+          : "";
+        const matchesMain = Boolean(
+          expected &&
+            (given === expected ||
+              (expected.length >= 3 && given.includes(expected)) ||
+              (given.length >= 4 && expected.includes(given)))
+        );
+        const keywords = (q.acceptedKeywords || [])
+          .map((k) => normalizeTextForMatch(k))
+          .filter((k) => k.length >= 3);
+        const matchesKeyword = keywords.some(
+          (kw) =>
+            given === kw ||
+            given.includes(kw) ||
+            (given.length >= 4 && kw.includes(given))
+        );
+        correct = matchesMain || matchesKeyword;
+      }
+    } else if (q.type === "FLASHCARD") {
+      correct = ans === "KNOWN";
     } else if (q.type === "FILL_BLANK") {
       const given = typeof ans === "string" ? normalizeTextForMatch(ans) : "";
       const expected = q.correctAnswer

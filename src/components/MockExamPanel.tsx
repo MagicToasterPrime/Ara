@@ -9,6 +9,7 @@ import {
   History,
   Loader2,
   Play,
+  RotateCcw,
   Send,
   Timer,
   XCircle,
@@ -98,6 +99,7 @@ export function MockExamPanel({
   );
   const [secondsLeft, setSecondsLeft] = useState<number>(0);
   const [result, setResult] = useState<GradedExamResult | null>(null);
+  const [flippedCards, setFlippedCards] = useState<Record<string, boolean>>({});
 
   const answersRef = useRef(answers);
   answersRef.current = answers;
@@ -195,6 +197,7 @@ export function MockExamPanel({
         return;
       }
       setAnswers({});
+      setFlippedCards({});
       setSecondsLeft(data.exam.durationMinutes * 60);
       setActiveExam(data.exam);
     } finally {
@@ -336,6 +339,78 @@ export function MockExamPanel({
                       </button>
                     );
                   })}
+                </div>
+              )}
+
+              {q.type === "QROC" && (
+                <textarea
+                  rows={3}
+                  value={
+                    typeof answers[q.id] === "string"
+                      ? (answers[q.id] as string)
+                      : ""
+                  }
+                  onChange={(e) =>
+                    setAnswers((p) => ({ ...p, [q.id]: e.target.value }))
+                  }
+                  placeholder="Rédigez votre réponse courte..."
+                  className="w-full border border-border bg-paper px-3 py-2 text-sm text-ink focus:border-ink focus:outline-none"
+                />
+              )}
+
+              {q.type === "FLASHCARD" && (
+                <div className="space-y-3">
+                  {!flippedCards[q.id] ? (
+                    <div className="border border-border bg-paper p-4 text-center">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setFlippedCards((p) => ({ ...p, [q.id]: true }))
+                        }
+                        className="inline-flex items-center gap-2 border border-ink bg-ink px-4 py-2 font-mono text-xs uppercase tracking-wider text-card hover:bg-ink/90"
+                      >
+                        <RotateCcw className="h-3.5 w-3.5" />
+                        <span>RETOURNER LA FLASHCARD (VERSO)</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div
+                        className="border border-border bg-paper p-3.5 text-sm text-ink"
+                        style={{ borderLeft: "3px solid #3D6B99" }}
+                      >
+                        {q.flashcardBack || q.explanation}
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setAnswers((p) => ({ ...p, [q.id]: "KNOWN" }))
+                          }
+                          className={`flex-1 border px-3 py-2 font-mono text-xs font-semibold uppercase tracking-wider ${
+                            answers[q.id] === "KNOWN"
+                              ? "border-forest bg-forest text-card"
+                              : "border-forest/50 bg-forest/10 text-forest hover:bg-forest/20"
+                          }`}
+                        >
+                          ✓ JE SAVAIS
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setAnswers((p) => ({ ...p, [q.id]: "REVIEW" }))
+                          }
+                          className={`flex-1 border px-3 py-2 font-mono text-xs font-semibold uppercase tracking-wider ${
+                            answers[q.id] === "REVIEW"
+                              ? "border-carmine bg-carmine text-card"
+                              : "border-carmine/50 bg-carmine/10 text-carmine hover:bg-carmine/20"
+                          }`}
+                        >
+                          ✗ À REVOIR
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -548,6 +623,11 @@ export function MockExamPanel({
                   {q.correctAnswer && (
                     <p className="mt-2 font-mono text-xs text-forest">
                       Réponse attendue : {q.correctAnswer}
+                    </p>
+                  )}
+                  {q.flashcardBack && (
+                    <p className="mt-2 text-xs font-semibold text-forest">
+                      Verso flashcard : {q.flashcardBack}
                     </p>
                   )}
                   <p className="mt-1.5 text-xs text-stone">{q.explanation}</p>
