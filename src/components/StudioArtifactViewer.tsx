@@ -1,22 +1,26 @@
 "use client";
 
-import { useState } from "react";
+import { Fragment, useCallback, useEffect, useState, type ReactNode } from "react";
 import {
+  ArrowLeft,
+  ArrowRight,
   Check,
-  ChevronLeft,
-  ChevronRight,
   Copy,
   Download,
   FileText,
   Maximize2,
   Minimize2,
-  RotateCw,
+  Printer,
+  X,
 } from "lucide-react";
 import type { RevisionQuestion } from "@/lib/revisions";
 import type {
   StudioArtifactContent,
   StudioSourceRef,
+  SummaryPayload,
 } from "@/lib/studio";
+
+const OPTION_LETTERS = ["A", "B", "C", "D"];
 
 function normalizeTextForMatch(input: string): string {
   return input
@@ -26,6 +30,180 @@ function normalizeTextForMatch(input: string): string {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9\s-]/g, "")
     .replace(/\s+/g, " ");
+}
+
+function escapeHtml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function formatInlineToHtml(raw: string): string {
+  const escaped = escapeHtml(raw);
+  return escaped
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+}
+
+function renderFormattedText(text: string): ReactNode {
+  const parts = text.split(/(\*\*[^*]+\*\*|\*[^*]+\*)/g);
+  return parts.map((part, idx) => {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return (
+        <strong key={idx} className="font-bold text-ink">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
+      return (
+        <em key={idx} className="italic">
+          {part.slice(1, -1)}
+        </em>
+      );
+    }
+    return <Fragment key={idx}>{part}</Fragment>;
+  });
+}
+
+function buildPrintableSummaryHtml(title: string, summary: SummaryPayload): string {
+  const sectionsHtml = (summary.sections || [])
+    .map((sec, sIdx) => {
+      const subsHtml = (sec.subsections || [])
+        .map((sub) => {
+          const calloutsHtml = (sub.callouts || [])
+            .map((c) => {
+              const itemsHtml =
+                c.items && c.items.length > 0
+                  ? `<ol>${c.items
+                      .map((it) => `<li>${formatInlineToHtml(it)}</li>`)
+                      .join("")}</ol>`
+                  : "";
+              const textHtml = c.text
+                ? `<p>${formatInlineToHtml(c.text)}</p>`
+                : "";
+              return `<div class="callout">
+                <div class="callout-title">${escapeHtml(c.icon || "💡")} ${escapeHtml(
+                c.title
+              )} :</div>
+                ${textHtml}
+                ${itemsHtml}
+              </div>`;
+            })
+            .join("");
+
+          const bulletsHtml =
+            sub.bullets && sub.bullets.length > 0
+              ? `<ul>${sub.bullets
+                  .map((b) => {
+                    const subList =
+                      b.subItems && b.subItems.length > 0
+                        ? `<ul>${b.subItems
+                            .map((si) => `<li>${formatInlineToHtml(si)}</li>`)
+                            .join("")}</ul>`
+                        : "";
+                    const lead = b.lead
+                      ? `<strong>${escapeHtml(b.lead)}</strong> : `
+                      : "";
+                    return `<li>${lead}${formatInlineToHtml(b.text)}${subList}</li>`;
+                  })
+                  .join("")}</ul>`
+              : "";
+
+          const tableHtml =
+            sub.table && sub.table.headers.length > 0 && sub.table.rows.length > 0
+              ? `<table>
+                  <thead><tr>${sub.table.headers
+                    .map((h) => `<th>${escapeHtml(h)}</th>`)
+                    .join("")}</tr></thead>
+                  <tbody>${sub.table.rows
+                    .map(
+                      (row) =>
+                        `<tr>${row
+                          .map((cell) => `<td>${formatInlineToHtml(cell)}</td>`)
+                          .join("")}</tr>`
+                    )
+                    .join("")}</tbody>
+                </table>`
+              : "";
+
+          return `<div class="subsection">
+            <h3>${escapeHtml(sub.icon || "📌")} ${escapeHtml(sub.title)}</h3>
+            ${sub.intro ? `<p class="intro">${formatInlineToHtml(sub.intro)}</p>` : ""}
+            ${calloutsHtml}
+            ${bulletsHtml}
+            ${tableHtml}
+          </div>`;
+        })
+        .join("");
+
+      const fallbackPointsHtml =
+        (!sec.subsections || sec.subsections.length === 0) &&
+        sec.keyPoints &&
+        sec.keyPoints.length > 0
+          ? `<p>${formatInlineToHtml(sec.content)}</p><ul>${sec.keyPoints
+              .map((kp) => `<li>${formatInlineToHtml(kp)}</li>`)
+              .join("")}</ul>`
+          : "";
+
+      return `<section class="chapter">
+        <h2>${sIdx + 1}. ${escapeHtml(sec.title)}</h2>
+        ${subsHtml || fallbackPointsHtml}
+      </section>`;
+    })
+    .join("");
+
+  const pitfallsHtml =
+    summary.examPitfalls.length > 0
+      ? `<div class="callout">
+          <div class="callout-title">⚠️ Points de vigilance &amp; pièges fréquents en partiel :</div>
+          <ul>${summary.examPitfalls
+            .map((p) => `<li>${formatInlineToHtml(p)}</li>`)
+            .join("")}</ul>
+        </div>`
+      : "";
+
+  return `<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<title>${escapeHtml(title)}</title>
+<style>
+  @page { margin: 18mm 16mm; }
+  body { font-family: "Segoe UI", system-ui, -apple-system, sans-serif; color: #1e293b; line-height: 1.55; font-size: 11pt; margin: 0; padding: 0; }
+  .top-bar { border-bottom: 3px solid #4f46e5; padding-bottom: 8px; margin-bottom: 18px; display: flex; justify-content: space-between; font-size: 9pt; color: #64748b; }
+  h1 { font-size: 20pt; font-weight: 800; color: #0f172a; margin: 6px 0 14px; border-bottom: 1px solid #cbd5e1; padding-bottom: 10px; }
+  .overview { font-size: 10.5pt; color: #334155; margin-bottom: 18px; }
+  .chapter { border-top: 1px dashed #cbd5e1; padding-top: 14px; margin-top: 18px; page-break-inside: avoid; }
+  .chapter:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
+  h2 { font-size: 14pt; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; margin: 0 0 12px; }
+  .subsection { margin-bottom: 14px; }
+  h3 { font-size: 11.5pt; font-weight: 700; color: #3b5bdb; margin: 10px 0 8px; }
+  .callout { background: #fef9e7; border-left: 3px solid #d99b26; border-radius: 4px; padding: 10px 14px; margin: 10px 0; }
+  .callout-title { font-weight: 700; color: #0f172a; margin-bottom: 4px; }
+  ul, ol { margin: 6px 0 10px 20px; padding: 0; }
+  li { margin-bottom: 4px; }
+  table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 9.5pt; }
+  th { background: #f1f5f9; text-align: left; font-weight: 700; border-bottom: 1px solid #cbd5e1; padding: 6px 8px; }
+  td { border-bottom: 1px solid #e2e8f0; padding: 6px 8px; }
+  .footer-end { margin-top: 24px; border-top: 1px solid #cbd5e1; padding-top: 10px; text-align: center; font-size: 9pt; color: #64748b; }
+</style>
+</head>
+<body>
+  <div class="top-bar">
+    <span><strong>ARA</strong> · Oniris Vétérinaire</span>
+    <span>Exporté le ${new Date().toLocaleDateString("fr-FR")}</span>
+  </div>
+  <h1>${escapeHtml(title)}</h1>
+  ${summary.overview ? `<p class="overview">${formatInlineToHtml(summary.overview)}</p>` : ""}
+  ${sectionsHtml}
+  ${pitfallsHtml}
+  <div class="footer-end">— Fin — · Généré localement par ARA</div>
+</body>
+</html>`;
 }
 
 interface StudioArtifactViewerProps {
@@ -60,6 +238,60 @@ export function StudioArtifactViewer({
   >({});
   const [quizSubmitted, setQuizSubmitted] = useState(false);
 
+  const isFlashcards = content.kind === "FLASHCARDS";
+  const allCards = isFlashcards ? content.cards || [] : [];
+  const unmasteredCards = allCards.filter((c) => !masteredIds[c.id]);
+  const visibleCards =
+    cardFilter === "REVIEW" && unmasteredCards.length > 0
+      ? unmasteredCards
+      : allCards;
+  const safeCardIdx = Math.min(
+    cardIndex,
+    Math.max(0, visibleCards.length - 1)
+  );
+
+  const handlePrevCard = useCallback(() => {
+    setFlipped(false);
+    setCardIndex((i) => Math.max(0, i - 1));
+  }, []);
+
+  const handleNextCard = useCallback(() => {
+    setFlipped(false);
+    setCardIndex((i) =>
+      Math.min(Math.max(0, visibleCards.length - 1), i + 1)
+    );
+  }, [visibleCards.length]);
+
+  // Keyboard shortcuts ("Space" to flip, "←/→" to navigate) for Flashcards
+  useEffect(() => {
+    if (!isFlashcards || visibleCards.length === 0) return;
+
+    function onKeyDown(e: KeyboardEvent) {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      if (e.code === "Space") {
+        e.preventDefault();
+        setFlipped((p) => !p);
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        handlePrevCard();
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        handleNextCard();
+      }
+    }
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isFlashcards, visibleCards.length, handlePrevCard, handleNextCard]);
+
   function handleDownloadSvg(svgMarkup: string) {
     const blob = new Blob([svgMarkup], {
       type: "image/svg+xml;charset=utf-8",
@@ -87,6 +319,33 @@ export function StudioArtifactViewer({
     } catch {
       // Clipboard unavailable
     }
+  }
+
+  function handlePrintSummaryPdf(summaryPayload: SummaryPayload) {
+    const html = buildPrintableSummaryHtml(title, summaryPayload);
+    const iframe = document.createElement("iframe");
+    iframe.style.position = "fixed";
+    iframe.style.right = "0";
+    iframe.style.bottom = "0";
+    iframe.style.width = "0";
+    iframe.style.height = "0";
+    iframe.style.border = "0";
+    document.body.appendChild(iframe);
+
+    const doc = iframe.contentWindow?.document;
+    if (!doc) {
+      iframe.remove();
+      return;
+    }
+    doc.open();
+    doc.write(html);
+    doc.close();
+
+    setTimeout(() => {
+      iframe.contentWindow?.focus();
+      iframe.contentWindow?.print();
+      setTimeout(() => iframe.remove(), 1500);
+    }, 200);
   }
 
   if (content.kind === "SVG_DIAGRAM") {
@@ -149,17 +408,13 @@ export function StudioArtifactViewer({
   }
 
   if (content.kind === "FLASHCARDS") {
-    const cards = content.cards || [];
-    const unmasteredCards = cards.filter((c) => !masteredIds[c.id]);
-    const visibleCards =
-      cardFilter === "REVIEW" && unmasteredCards.length > 0
-        ? unmasteredCards
-        : cards;
-    const safeIdx = Math.min(cardIndex, Math.max(0, visibleCards.length - 1));
-    const currentCard = visibleCards[safeIdx];
-    const masteredCount = cards.length - unmasteredCards.length;
+    const currentCard = visibleCards[safeCardIdx];
+    const masteredCount = allCards.length - unmasteredCards.length;
+    const reviewCount = Object.values(srsRatings).filter(
+      (r) => r === "AGAIN" || r === "HARD"
+    ).length;
 
-    if (cards.length === 0 || !currentCard) {
+    if (allCards.length === 0 || !currentCard) {
       return (
         <div className="border border-border bg-paper p-4 font-mono text-xs text-stone">
           AUCUNE FLASHCARD GÉNÉRÉE.
@@ -175,24 +430,32 @@ export function StudioArtifactViewer({
       }
     }
 
+    const gradeCard = (
+      rating: "AGAIN" | "HARD" | "GOOD" | "EASY",
+      mastered: boolean
+    ) => {
+      setMasteredIds((prev) => ({
+        ...prev,
+        [currentCard.id]: mastered,
+      }));
+      setSrsRatings((prev) => ({
+        ...prev,
+        [currentCard.id]: rating,
+      }));
+      setFlipped(false);
+      if (safeCardIdx < visibleCards.length - 1) {
+        setCardIndex(safeCardIdx + 1);
+      }
+    };
+
     return (
       <div className="border border-ink bg-card">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-3 py-2 font-mono text-[10px] uppercase tracking-wider">
           <div className="flex flex-wrap items-center gap-2">
-            <span className="font-bold text-ink">
-              FLASHCARDS SRS · CARTE {safeIdx + 1} / {visibleCards.length}
+            <span className="font-bold text-ink">{title}</span>
+            <span className="text-stone">
+              · {safeCardIdx + 1}/{visibleCards.length}
             </span>
-            {srsRatings[currentCard.id] && (
-              <span className="border border-border bg-card px-1.5 py-0.5 text-[9px] text-stone">
-                {srsRatings[currentCard.id] === "AGAIN"
-                  ? "À REVOIR"
-                  : srsRatings[currentCard.id] === "HARD"
-                  ? "1J"
-                  : srsRatings[currentCard.id] === "GOOD"
-                  ? "3J"
-                  : "7J · ACQUIS"}
-              </span>
-            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -209,7 +472,7 @@ export function StudioArtifactViewer({
                   : "border-border bg-card text-stone hover:text-ink"
               }`}
             >
-              TOUTES ({cards.length})
+              TOUTES ({allCards.length})
             </button>
             <button
               type="button"
@@ -227,20 +490,17 @@ export function StudioArtifactViewer({
             >
               À REVOIR ({unmasteredCards.length})
             </button>
-            <span className="text-forest">
-              MAÎTRISÉES : {masteredCount}/{cards.length}
-            </span>
           </div>
         </div>
 
-        <div className="p-4">
+        <div className="p-4 sm:p-5">
           {batchRanges.length > 0 && (
             <div className="mb-3 flex flex-wrap items-center gap-1">
               <span className="mr-1 font-mono text-[9px] uppercase text-stone">
                 LOTS :
               </span>
               {batchRanges.map((b) => {
-                const activeBatch = safeIdx >= b.start && safeIdx < b.end;
+                const activeBatch = safeCardIdx >= b.start && safeCardIdx < b.end;
                 return (
                   <button
                     key={b.label}
@@ -262,93 +522,97 @@ export function StudioArtifactViewer({
             </div>
           )}
 
-          <button
-            type="button"
+          {/* Keyboard hint modeled after NotebookLM Capture 2 */}
+          <p className="mb-3 text-center font-mono text-[10px] text-stone">
+            Appuyer sur &quot;Espace&quot; pour retourner, &quot;←/→&quot; pour
+            naviguer
+          </p>
+
+          {/* Interactive Flashcard */}
+          <div
+            role="button"
+            tabIndex={0}
             onClick={() => setFlipped((p) => !p)}
-            className={`flex w-full flex-col justify-between border border-ink p-5 text-left transition-colors ${
-              compact ? "min-h-[150px]" : "min-h-[200px]"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                setFlipped((p) => !p);
+              }
+            }}
+            className={`mx-auto flex w-full max-w-xl cursor-pointer flex-col justify-between border border-ink p-5 text-left transition-colors focus:outline-none ${
+              compact ? "min-h-[180px]" : "min-h-[240px]"
             } ${flipped ? "bg-pinned" : "bg-paper"}`}
           >
-            <div className="flex items-center justify-between gap-2">
-              <span className="bg-badge-bg px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-badge-text">
-                {flipped ? "VERSO · RÉPONSE" : "RECTO · QUESTION"}
+            <div className="flex items-center justify-between gap-2 font-mono text-[10px] text-stone">
+              <span className="font-bold text-ink">
+                {safeCardIdx + 1}/{visibleCards.length}
               </span>
-              <span className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-stone">
-                <RotateCw className="h-3 w-3" />
-                <span>CLIQUER POUR RETOURNER</span>
-              </span>
-            </div>
-
-            <p className="my-4 text-sm font-semibold leading-relaxed text-ink">
-              {flipped ? currentCard.back : currentCard.front}
-            </p>
-
-            <div className="flex items-center justify-between border-t border-border pt-2 font-mono text-[10px] uppercase tracking-wider text-stone">
-              <span>{currentCard.tag}</span>
-              <span>
-                {currentCard.fileName} · P.{currentCard.pageNumber}
+              <span className="uppercase">
+                {currentCard.tag} · {currentCard.fileName} (P.
+                {currentCard.pageNumber})
               </span>
             </div>
-          </button>
 
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => {
-                  setFlipped(false);
-                  setCardIndex((i) => Math.max(0, i - 1));
-                }}
-                disabled={safeIdx === 0}
-                className="border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase text-ink hover:border-ink disabled:opacity-40"
+            <div className="my-5 flex flex-1 items-center justify-center text-center">
+              <p
+                className={`leading-relaxed text-ink ${
+                  flipped
+                    ? "text-sm font-medium sm:text-base"
+                    : "text-base font-bold sm:text-xl"
+                }`}
               >
-                <ChevronLeft className="h-3.5 w-3.5" />
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setFlipped(false);
-                  setCardIndex((i) => Math.min(visibleCards.length - 1, i + 1));
-                }}
-                disabled={safeIdx >= visibleCards.length - 1}
-                className="border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase text-ink hover:border-ink disabled:opacity-40"
-              >
-                <ChevronRight className="h-3.5 w-3.5" />
-              </button>
+                {flipped
+                  ? renderFormattedText(currentCard.back)
+                  : currentCard.front}
+              </p>
             </div>
 
-            <div className="flex flex-wrap items-center gap-1.5">
-              {(
-                [
-                  { id: "AGAIN", label: "À REVOIR", sub: "<1M", mastered: false, cls: "border-carmine/40 bg-carmine/10 text-carmine hover:bg-carmine hover:text-card" },
-                  { id: "HARD", label: "DIFFICILE", sub: "1J", mastered: false, cls: "border-amber/60 bg-amber/15 text-ink hover:bg-amber hover:text-card" },
-                  { id: "GOOD", label: "BIEN", sub: "3J", mastered: true, cls: "border-badge-text/40 bg-badge-bg text-badge-text hover:bg-badge-text hover:text-card" },
-                  { id: "EASY", label: "FACILE", sub: "7J", mastered: true, cls: "border-forest bg-forest/10 text-forest hover:bg-forest hover:text-card" },
-                ] as const
-              ).map((btn) => (
-                <button
-                  key={btn.id}
-                  type="button"
-                  onClick={() => {
-                    setMasteredIds((prev) => ({
-                      ...prev,
-                      [currentCard.id]: btn.mastered,
-                    }));
-                    setSrsRatings((prev) => ({
-                      ...prev,
-                      [currentCard.id]: btn.id,
-                    }));
-                    setFlipped(false);
-                    if (safeIdx < visibleCards.length - 1) setCardIndex(safeIdx + 1);
-                  }}
-                  className={`inline-flex items-center gap-1 border px-2 py-1 font-mono text-[10px] uppercase tracking-wider transition-colors ${btn.cls}`}
-                >
-                  {btn.id === "EASY" && <Check className="h-3 w-3" />}
-                  <span>{btn.label}</span>
-                  <span className="opacity-70">({btn.sub})</span>
-                </button>
-              ))}
+            <div className="text-center font-mono text-[11px] text-stone">
+              {flipped ? "Afficher la question" : "Afficher la réponse"}
             </div>
+          </div>
+
+          {/* NotebookLM Control Bar: ← | ✗ N | M ✓ | → */}
+          <div className="mx-auto mt-4 flex max-w-xl items-center justify-center gap-3">
+            <button
+              type="button"
+              onClick={handlePrevCard}
+              disabled={safeCardIdx === 0}
+              aria-label="Carte précédente"
+              className="inline-flex h-10 w-10 items-center justify-center border border-border bg-paper text-ink hover:border-ink disabled:opacity-35"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => gradeCard("AGAIN", false)}
+              className="inline-flex h-10 min-w-[74px] items-center justify-center gap-1.5 border border-carmine/40 bg-carmine/10 px-3 font-mono text-xs font-bold text-carmine hover:bg-carmine hover:text-card"
+              title="À revoir"
+            >
+              <X className="h-3.5 w-3.5" />
+              <span>{reviewCount}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => gradeCard("EASY", true)}
+              className="inline-flex h-10 min-w-[74px] items-center justify-center gap-1.5 border border-forest/50 bg-forest/10 px-3 font-mono text-xs font-bold text-forest hover:bg-forest hover:text-card"
+              title="Maîtrisée"
+            >
+              <span>{masteredCount}</span>
+              <Check className="h-3.5 w-3.5" />
+            </button>
+
+            <button
+              type="button"
+              onClick={handleNextCard}
+              disabled={safeCardIdx >= visibleCards.length - 1}
+              aria-label="Carte suivante"
+              className="inline-flex h-10 w-10 items-center justify-center border border-ink bg-ink text-card hover:bg-ink/90 disabled:opacity-35"
+            >
+              <ArrowRight className="h-4 w-4" />
+            </button>
           </div>
         </div>
       </div>
@@ -408,7 +672,7 @@ export function StudioArtifactViewer({
 
     return (
       <div className="border border-ink bg-card">
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-3 py-2 font-mono text-[10px] uppercase tracking-wider">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-3.5 py-2.5 font-mono text-[10px] uppercase tracking-wider">
           <span className="font-bold text-ink">
             QUIZ STUDIO ({questions.length} QUESTIONS)
           </span>
@@ -426,13 +690,13 @@ export function StudioArtifactViewer({
           </div>
         </div>
 
-        <div className="space-y-3 p-3.5">
+        <div className="space-y-4 p-4">
           {questions.map((q, idx) => {
             const isOk = quizSubmitted ? checkCorrect(q) : undefined;
             return (
               <div
                 key={q.id}
-                className={`border p-3 ${
+                className={`border p-3.5 ${
                   quizSubmitted && isOk === true
                     ? "border-forest bg-forest/5"
                     : quizSubmitted && isOk === false
@@ -440,21 +704,29 @@ export function StudioArtifactViewer({
                     : "border-border bg-paper"
                 }`}
               >
-                <p className="mb-2 font-mono text-[10px] uppercase tracking-wider text-stone">
-                  Q{idx + 1} · {q.type} · {q.fileName} (P.{q.pageNumber})
-                </p>
-                <p className="mb-2.5 text-xs font-semibold text-ink">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2 font-mono text-[10px] uppercase tracking-wider text-stone">
+                  <span>
+                    QUESTION {idx + 1} · {q.type}
+                  </span>
+                  <span>
+                    {q.fileName} (P.{q.pageNumber})
+                  </span>
+                </div>
+
+                <p className="mb-3 text-sm font-semibold leading-snug text-ink">
                   {q.prompt}
                 </p>
 
                 {(q.type === "QCU" || q.type === "QCM") && q.options && (
-                  <div className="space-y-1.5">
+                  <div className="space-y-2">
                     {q.options.map((opt, optIdx) => {
                       const sel = Array.isArray(quizAnswers[q.id])
                         ? (quizAnswers[q.id] as number[])
                         : [];
                       const active = sel.includes(optIdx);
                       const expected = q.correctIndices?.includes(optIdx);
+                      const letter = OPTION_LETTERS[optIdx] || String(optIdx + 1);
+
                       return (
                         <button
                           key={optIdx}
@@ -462,7 +734,10 @@ export function StudioArtifactViewer({
                           disabled={quizSubmitted}
                           onClick={() => {
                             if (q.type === "QCU") {
-                              setQuizAnswers((p) => ({ ...p, [q.id]: [optIdx] }));
+                              setQuizAnswers((p) => ({
+                                ...p,
+                                [q.id]: [optIdx],
+                              }));
                             } else {
                               const next = active
                                 ? sel.filter((i) => i !== optIdx)
@@ -470,20 +745,26 @@ export function StudioArtifactViewer({
                               setQuizAnswers((p) => ({ ...p, [q.id]: next }));
                             }
                           }}
-                          className={`flex w-full items-start gap-2 border px-2.5 py-1.5 text-left text-xs ${
+                          className={`flex w-full items-center gap-3 border px-3 py-2.5 text-left text-xs transition-colors ${
                             quizSubmitted && expected
-                              ? "border-forest bg-forest/10"
+                              ? "border-forest bg-forest/10 font-semibold text-ink"
                               : quizSubmitted && active && !expected
-                              ? "border-carmine bg-carmine/10"
+                              ? "border-carmine bg-carmine/10 text-carmine"
                               : active
-                              ? "border-ink bg-pinned"
-                              : "border-border bg-card"
+                              ? "border-ink bg-pinned font-semibold text-ink"
+                              : "border-border bg-card text-ink hover:border-ink/60"
                           }`}
                         >
-                          <span className="font-mono text-[10px] font-bold">
-                            {active ? "[✓]" : "[ ]"}
+                          <span
+                            className={`inline-flex h-5 w-5 shrink-0 items-center justify-center border font-mono text-[10px] font-bold ${
+                              active
+                                ? "border-ink bg-ink text-card"
+                                : "border-border bg-paper text-stone"
+                            }`}
+                          >
+                            {letter}
                           </span>
-                          <span>{opt}</span>
+                          <span className="flex-1">{opt}</span>
                         </button>
                       );
                     })}
@@ -506,20 +787,19 @@ export function StudioArtifactViewer({
                           [q.id]: e.target.value,
                         }))
                       }
-                      placeholder="Rédigez votre réponse courte pour montrer que vous avez compris..."
-                      className="w-full border border-border bg-card px-2.5 py-1.5 text-xs text-ink focus:border-ink focus:outline-none"
+                      placeholder="Votre réponse courte (1 à 5 mots clés)..."
+                      className="w-full border border-border bg-card px-2.5 py-2 text-xs text-ink focus:border-ink focus:outline-none"
                     />
                     {quizSubmitted && q.correctAnswer && (
                       <div className="border border-forest/40 bg-forest/10 p-2 text-[11px] text-ink">
                         <p className="font-mono text-[10px] font-bold uppercase tracking-wider text-forest">
                           RÉPONSE ATTENDUE : {q.correctAnswer}
                         </p>
-                        {q.acceptedKeywords &&
-                          q.acceptedKeywords.length > 1 && (
-                            <p className="mt-0.5 font-mono text-[9px] uppercase tracking-wider text-stone">
-                              MOTS-CLÉS : {q.acceptedKeywords.join(" · ")}
-                            </p>
-                          )}
+                        {q.acceptedKeywords && q.acceptedKeywords.length > 1 && (
+                          <p className="mt-0.5 font-mono text-[9px] uppercase tracking-wider text-stone">
+                            MOTS-CLÉS : {q.acceptedKeywords.join(" · ")}
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>
@@ -551,8 +831,8 @@ export function StudioArtifactViewer({
                 )}
 
                 {quizSubmitted && (
-                  <p className="mt-2 border-t border-border pt-1.5 text-[11px] text-stone">
-                    {q.explanation}
+                  <p className="mt-2.5 border-t border-border pt-2 text-xs text-stone">
+                    {renderFormattedText(q.explanation)}
                   </p>
                 )}
               </div>
@@ -575,7 +855,7 @@ export function StudioArtifactViewer({
               <button
                 type="button"
                 onClick={() => setQuizSubmitted(true)}
-                className="border border-ink bg-ink px-4 py-1.5 font-mono text-[10px] uppercase tracking-wider text-card hover:bg-ink/90"
+                className="border border-ink bg-ink px-4 py-2 font-mono text-[11px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90"
               >
                 CORRIGER LE QUIZ
               </button>
@@ -586,56 +866,188 @@ export function StudioArtifactViewer({
     );
   }
 
-  // SUMMARY
+  // SUMMARY ("Fiche de Révision Ultime" modeled after attached 7-page PDF)
   return (
-    <div className="border border-ink bg-card">
-      <div className="border-b border-border bg-paper px-3 py-2 font-mono text-[11px] font-bold uppercase tracking-wider text-ink">
-        FICHE SYNTHÈSE NOTEBOOK · {title}
+    <div
+      className="border border-ink bg-card"
+      style={{ borderTop: "3px solid #3D6B99" }}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-4 py-3">
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
+            ARA STUDIO · FICHE DE RÉVISION ULTIME
+          </p>
+          <h3 className="text-base font-bold tracking-tight text-ink">
+            {title}
+          </h3>
+        </div>
+        <button
+          type="button"
+          onClick={() => handlePrintSummaryPdf(content)}
+          className="inline-flex items-center gap-1.5 border border-ink bg-card px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:bg-pinned"
+        >
+          <Printer className="h-3.5 w-3.5" />
+          <span>IMPRIMER / PDF</span>
+        </button>
       </div>
-      <div className="space-y-4 p-4">
-        <p className="text-xs leading-relaxed text-ink">{content.overview}</p>
+
+      <div className="space-y-5 p-4 sm:p-6">
+        {content.overview && (
+          <p className="text-xs leading-relaxed text-stone">
+            {renderFormattedText(content.overview)}
+          </p>
+        )}
 
         {content.sections && content.sections.length > 0 && (
-          <div className="space-y-3">
-            <p className="font-mono text-[10px] font-semibold uppercase tracking-wider text-stone">
-              DÉVELOPPEMENT STRUCTURÉ DU COURS ({content.sections.length} PARTIE
-              {content.sections.length > 1 ? "S" : ""}) :
-            </p>
-            <div className="space-y-3">
-              {content.sections.map((sec, idx) => (
-                <div
-                  key={`${sec.title}-${idx}`}
-                  className="border border-border bg-paper p-3.5"
-                  style={{ borderLeft: "3px solid #3D6B99" }}
-                >
-                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-1.5">
-                    <h4 className="text-xs font-bold uppercase tracking-tight text-ink">
-                      {idx + 1}. {sec.title}
-                    </h4>
-                    <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase text-badge-text">
-                      {sec.pageRange}
-                    </span>
-                  </div>
-                  <p className="text-xs leading-relaxed text-ink">
-                    {sec.content}
-                  </p>
-                  {sec.keyPoints && sec.keyPoints.length > 0 && (
-                    <ul className="mt-2.5 list-disc space-y-1 border-t border-border/70 pt-2 pl-4 text-xs text-ink">
-                      {sec.keyPoints.map((kp, kIdx) => (
-                        <li key={kIdx}>{kp}</li>
-                      ))}
-                    </ul>
-                  )}
+          <div className="space-y-6">
+            {content.sections.map((sec, idx) => (
+              <section
+                key={`${sec.title}-${idx}`}
+                className={
+                  idx > 0 ? "border-t border-dashed border-border pt-5" : ""
+                }
+              >
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2">
+                  <h4 className="text-sm font-bold tracking-tight text-ink sm:text-base">
+                    {idx + 1}. {sec.title}
+                  </h4>
+                  <span className="bg-badge-bg px-2 py-0.5 font-mono text-[9px] font-semibold uppercase text-badge-text">
+                    {sec.pageRange}
+                  </span>
                 </div>
-              ))}
-            </div>
+
+                {sec.subsections && sec.subsections.length > 0 ? (
+                  <div className="space-y-4">
+                    {sec.subsections.map((sub, subIdx) => (
+                      <div key={`${sub.title}-${subIdx}`} className="space-y-2.5">
+                        <h5 className="flex items-center gap-1.5 text-xs font-bold tracking-tight text-[#3D6B99] sm:text-sm">
+                          <span>{sub.icon || "📌"}</span>
+                          <span>{sub.title}</span>
+                        </h5>
+
+                        {sub.intro && (
+                          <p className="text-xs leading-relaxed text-ink">
+                            {renderFormattedText(sub.intro)}
+                          </p>
+                        )}
+
+                        {sub.callouts &&
+                          sub.callouts.map((c, cIdx) => (
+                            <div
+                              key={cIdx}
+                              className="border border-amber/40 bg-[#FEF9E7] px-3.5 py-2.5 text-xs text-ink"
+                              style={{ borderLeft: "3px solid #D99B26" }}
+                            >
+                              <p className="mb-1 font-bold text-ink">
+                                {c.icon || "💡"} {c.title} :
+                              </p>
+                              {c.text && (
+                                <p className="leading-relaxed">
+                                  {renderFormattedText(c.text)}
+                                </p>
+                              )}
+                              {c.items && c.items.length > 0 && (
+                                <ol className="mt-1 list-decimal space-y-1 pl-4">
+                                  {c.items.map((it, itIdx) => (
+                                    <li key={itIdx} className="leading-relaxed">
+                                      {renderFormattedText(it)}
+                                    </li>
+                                  ))}
+                                </ol>
+                              )}
+                            </div>
+                          ))}
+
+                        {sub.bullets && sub.bullets.length > 0 && (
+                          <ul className="list-disc space-y-1.5 pl-5 text-xs text-ink">
+                            {sub.bullets.map((b, bIdx) => (
+                              <li key={bIdx} className="leading-relaxed">
+                                {b.lead && (
+                                  <strong className="font-bold text-ink">
+                                    {b.lead} :{" "}
+                                  </strong>
+                                )}
+                                <span>{renderFormattedText(b.text)}</span>
+                                {b.subItems && b.subItems.length > 0 && (
+                                  <ul className="mt-1 [list-style-type:circle] space-y-0.5 pl-4 text-stone">
+                                    {b.subItems.map((si, siIdx) => (
+                                      <li key={siIdx}>
+                                        {renderFormattedText(si)}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+
+                        {sub.table &&
+                          sub.table.headers.length > 0 &&
+                          sub.table.rows.length > 0 && (
+                            <div className="overflow-x-auto border border-border">
+                              {sub.table.title && (
+                                <div className="border-b border-border bg-paper px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink">
+                                  {sub.table.title}
+                                </div>
+                              )}
+                              <table className="w-full border-collapse text-left text-xs">
+                                <thead>
+                                  <tr className="border-b border-border bg-paper font-bold text-ink">
+                                    {sub.table.headers.map((h, hIdx) => (
+                                      <th key={hIdx} className="px-3 py-2">
+                                        {h}
+                                      </th>
+                                    ))}
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-border bg-card">
+                                  {sub.table.rows.map((row, rIdx) => (
+                                    <tr key={rIdx}>
+                                      {row.map((cell, cellIdx) => (
+                                        <td
+                                          key={cellIdx}
+                                          className={`px-3 py-2 ${
+                                            cellIdx === 0
+                                              ? "font-semibold text-ink"
+                                              : "text-stone"
+                                          }`}
+                                        >
+                                          {renderFormattedText(cell)}
+                                        </td>
+                                      ))}
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          )}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <p className="text-xs leading-relaxed text-ink">
+                      {renderFormattedText(sec.content)}
+                    </p>
+                    {sec.keyPoints && sec.keyPoints.length > 0 && (
+                      <ul className="list-disc space-y-1 pl-4 text-xs text-ink">
+                        {sec.keyPoints.map((kp, kIdx) => (
+                          <li key={kIdx}>{renderFormattedText(kp)}</li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </section>
+            ))}
           </div>
         )}
 
         {content.keyConcepts.length > 0 && (
-          <div className="space-y-1.5">
+          <div className="space-y-1.5 border-t border-dashed border-border pt-4">
             <p className="font-mono text-[10px] font-semibold uppercase tracking-wider text-stone">
-              NOTIONS CLÉS :
+              INDEX DES NOTIONS CLÉS :
             </p>
             <div className="divide-y divide-border border border-border">
               {content.keyConcepts.map((kc, idx) => (
@@ -669,7 +1081,9 @@ export function StudioArtifactViewer({
                       </span>
                     )}
                   </div>
-                  <p className="mt-1 text-xs text-stone">{kc.definition}</p>
+                  <p className="mt-1 text-xs text-stone">
+                    {renderFormattedText(kc.definition)}
+                  </p>
                 </div>
               ))}
             </div>
@@ -677,13 +1091,16 @@ export function StudioArtifactViewer({
         )}
 
         {content.examPitfalls.length > 0 && (
-          <div className="border border-border bg-pinned p-3">
-            <p className="mb-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink">
-              POINTS DE VIGILANCE PARTIELS :
+          <div
+            className="border border-amber/40 bg-[#FEF9E7] p-3.5"
+            style={{ borderLeft: "3px solid #D99B26" }}
+          >
+            <p className="mb-1.5 font-mono text-[10px] font-bold uppercase tracking-wider text-ink">
+              ⚠️ POINTS DE VIGILANCE PARTIELS :
             </p>
             <ul className="list-disc space-y-1 pl-4 text-xs text-ink">
               {content.examPitfalls.map((p, idx) => (
-                <li key={idx}>{p}</li>
+                <li key={idx}>{renderFormattedText(p)}</li>
               ))}
             </ul>
           </div>

@@ -11,6 +11,7 @@ import {
   ListChecks,
   Loader2,
   Lock,
+  RefreshCw,
   Sparkles,
   Trash2,
 } from "lucide-react";
@@ -83,6 +84,7 @@ export function NotebookStudioPanel({
   const [wantPublic, setWantPublic] = useState(false);
   const [generatingKind, setGeneratingKind] =
     useState<StudioArtifactKind | null>(null);
+  const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [autoPublishNotice, setAutoPublishNotice] = useState<string | null>(
     null
@@ -249,6 +251,47 @@ export function NotebookStudioPanel({
     }
   }
 
+  async function handleRegenerate(art: StudioArtifactRow) {
+    if (generatingKind || regeneratingId) return;
+    setRegeneratingId(art.id);
+    setError(null);
+    setAutoPublishNotice(null);
+    setAiNotice(null);
+
+    try {
+      const res = await fetch("/api/studio", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          replaceArtifactId: art.id,
+          kind: art.kind,
+          ueId,
+          documentIds: art.documentId ? [art.documentId] : selectedDocIds,
+          prompt: prompt.trim() || art.prompt || undefined,
+          isPublic: art.isPublic,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        artifact?: StudioArtifactRow;
+        usedAi?: boolean;
+        error?: string;
+      };
+      if (!res.ok || !data.artifact) {
+        setError(data.error || "Erreur lors de la régénération.");
+        return;
+      }
+      if (data.usedAi === false) {
+        setAiNotice(
+          "Ollama n'était pas joignable : version générée via l'extracteur structuré de notions et valeurs."
+        );
+      }
+      setActiveArtifact(data.artifact);
+      await fetchArtifacts();
+    } finally {
+      setRegeneratingId(null);
+    }
+  }
+
   let parsedContent: StudioArtifactContent | null = null;
   if (activeArtifact) {
     try {
@@ -404,7 +447,25 @@ export function NotebookStudioPanel({
                     </button>
 
                     {isMine && (
-                      <div className="mt-2 flex items-center gap-1.5">
+                      <div className="mt-2 flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          disabled={Boolean(generatingKind || regeneratingId)}
+                          onClick={() => handleRegenerate(art)}
+                          className="inline-flex items-center gap-1 border border-border bg-paper px-2 py-0.5 font-mono text-[9px] uppercase text-ink hover:border-ink disabled:opacity-50"
+                          title="Régénérer avec le nouveau moteur IA"
+                        >
+                          <RefreshCw
+                            className={`h-2.5 w-2.5 ${
+                              regeneratingId === art.id ? "animate-spin" : ""
+                            }`}
+                          />
+                          <span>
+                            {regeneratingId === art.id
+                              ? "GÉNÉRATION..."
+                              : "REGÉNÉRER"}
+                          </span>
+                        </button>
                         <button
                           type="button"
                           onClick={() => handleTogglePublic(art)}
@@ -657,12 +718,44 @@ export function NotebookStudioPanel({
 
         {/* Active Viewer */}
         {activeArtifact && parsedContent ? (
-          <StudioArtifactViewer
-            key={activeArtifact.id}
-            title={activeArtifact.title}
-            content={parsedContent}
-            onOpenSource={onOpenSource}
-          />
+          <div className="space-y-2">
+            {(activeArtifact.userId === session?.user?.id ||
+              session?.user?.globalRole === "YEAR_ADMIN") && (
+              <div className="flex flex-wrap items-center justify-between gap-2 border border-border bg-paper px-3 py-1.5">
+                <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                  {activeArtifact.isPublic
+                    ? "VERSION PUBLIQUE (PROMO)"
+                    : "VERSION PRIVÉE CUSTOM"}{" "}
+                  · PAR {activeArtifact.user.name}
+                </span>
+                <button
+                  type="button"
+                  disabled={Boolean(generatingKind || regeneratingId)}
+                  onClick={() => handleRegenerate(activeArtifact)}
+                  className="inline-flex items-center gap-1.5 border border-ink bg-card px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:bg-pinned disabled:opacity-50"
+                >
+                  <RefreshCw
+                    className={`h-3 w-3 ${
+                      regeneratingId === activeArtifact.id
+                        ? "animate-spin"
+                        : ""
+                    }`}
+                  />
+                  <span>
+                    {regeneratingId === activeArtifact.id
+                      ? "RÉGÉNÉRATION EN COURS..."
+                      : "REGÉNÉRER CE CONTENU"}
+                  </span>
+                </button>
+              </div>
+            )}
+            <StudioArtifactViewer
+              key={activeArtifact.id}
+              title={activeArtifact.title}
+              content={parsedContent}
+              onOpenSource={onOpenSource}
+            />
+          </div>
         ) : (
           <div className="border border-border bg-card p-10 text-center">
             <FileText className="mx-auto mb-3 h-6 w-6 text-stone" />

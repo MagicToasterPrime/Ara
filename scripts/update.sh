@@ -91,12 +91,26 @@ main() {
     exit 1
   fi
 
+  # Bascule automatique vers qwen2.5:3b (plus rapide et mieux calibré sur CPU)
+  if grep -qE '^OLLAMA_MODEL="?qwen2\.5:7b"?$' "${APP_DIR}/.env"; then
+    sed -i 's|^OLLAMA_MODEL=.*|OLLAMA_MODEL="qwen2.5:3b"|' "${APP_DIR}/.env"
+    log_ok "Modèle Ollama configuré sur qwen2.5:3b dans .env."
+  fi
+
   mkdir -p "${APP_DIR}/storage/uploads" "${APP_DIR}/storage/backups"
 
   set -a
   # shellcheck disable=SC1091
   source "${APP_DIR}/.env"
   set +a
+
+  if command -v ollama &>/dev/null && curl -sf http://127.0.0.1:11434/api/tags &>/dev/null; then
+    local TARGET_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
+    if ! ollama list 2>/dev/null | grep -qF "${TARGET_MODEL}"; then
+      log_info "Téléchargement du modèle Ollama ${TARGET_MODEL}..."
+      ollama pull "${TARGET_MODEL}" || log_warn "Échec du pull ${TARGET_MODEL}, conservation du modèle local."
+    fi
+  fi
 
   docker compose up -d
   local RETRIES=30
@@ -116,6 +130,7 @@ main() {
   log_info "4/5 — Installation NPM, synchronisation Prisma et compilation Next.js..."
   npm ci
   npx prisma generate
+  npx prisma migrate resolve --applied 20261116180000_community_quizzes >/dev/null 2>&1 || true
   npx prisma migrate deploy || true
   npx prisma db push --skip-generate
   npm run build

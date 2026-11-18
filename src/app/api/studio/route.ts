@@ -76,8 +76,31 @@ export async function POST(req: Request) {
       title?: string;
       prompt?: string;
       isPublic?: boolean;
+      replaceArtifactId?: string;
       pageImagesBase64?: PageImageInput[];
     };
+
+    const replaceArtifactId = body.replaceArtifactId?.trim() || "";
+    const existingToReplace = replaceArtifactId
+      ? await prisma.studyArtifact.findUnique({
+          where: { id: replaceArtifactId },
+        })
+      : null;
+
+    if (replaceArtifactId) {
+      if (!existingToReplace) {
+        return NextResponse.json(
+          { error: "Production à regénérer introuvable." },
+          { status: 404 }
+        );
+      }
+      if (
+        existingToReplace.userId !== user.id &&
+        user.globalRole !== "YEAR_ADMIN"
+      ) {
+        return NextResponse.json({ error: "Accès refusé." }, { status: 403 });
+      }
+    }
 
     const validKinds: StudioArtifactKind[] = [
       "SVG_DIAGRAM",
@@ -85,19 +108,35 @@ export async function POST(req: Request) {
       "QUIZ",
       "SUMMARY",
     ];
-    const kind = validKinds.includes(body.kind as StudioArtifactKind)
-      ? (body.kind as StudioArtifactKind)
+    const requestedKind = existingToReplace
+      ? (existingToReplace.kind as StudioArtifactKind)
+      : body.kind;
+    const kind = validKinds.includes(requestedKind as StudioArtifactKind)
+      ? (requestedKind as StudioArtifactKind)
       : "SUMMARY";
 
-    let primaryDocId: string | null =
+    const effectiveDocIds =
       Array.isArray(body.documentIds) && body.documentIds.length > 0
-        ? body.documentIds[0]
+        ? body.documentIds
+        : existingToReplace?.documentId
+        ? [existingToReplace.documentId]
+        : undefined;
+
+    const effectiveUeId = body.ueId || existingToReplace?.ueId || undefined;
+    const effectivePrompt =
+      body.prompt !== undefined
+        ? body.prompt
+        : existingToReplace?.prompt || undefined;
+
+    let primaryDocId: string | null =
+      effectiveDocIds && effectiveDocIds.length > 0
+        ? effectiveDocIds[0]
         : null;
 
     let alreadyHasPublic = false;
-    if (Array.isArray(body.documentIds) && body.documentIds.length > 0) {
+    if (effectiveDocIds && effectiveDocIds.length > 0 && !existingToReplace) {
       let uncoveredDocId: string | null = null;
-      for (const docId of body.documentIds) {
+      for (const docId of effectiveDocIds) {
         const hasPub = await hasExistingPublicArtifact(docId, kind);
         if (!hasPub) {
           uncoveredDocId = docId;
@@ -108,21 +147,25 @@ export async function POST(req: Request) {
         primaryDocId = uncoveredDocId;
         alreadyHasPublic = false;
       } else {
-        primaryDocId = body.documentIds[0];
+        primaryDocId = effectiveDocIds[0];
         alreadyHasPublic = true;
       }
     }
 
-    const preAutoPublishedFirst = Boolean(primaryDocId && !alreadyHasPublic);
-    const preResolvedIsPublic = preAutoPublishedFirst
+    const preAutoPublishedFirst = existingToReplace
+      ? false
+      : Boolean(primaryDocId && !alreadyHasPublic);
+    const preResolvedIsPublic = existingToReplace
+      ? Boolean(existingToReplace.isPublic || body.isPublic)
+      : preAutoPublishedFirst
       ? true
       : Boolean(body.isPublic);
 
     const chunks = await gatherStudioSourceChunks({
-      ueId: body.ueId,
-      documentIds: body.documentIds,
+      ueId: effectiveUeId,
+      documentIds: effectiveDocIds,
       pageNumber: body.pageNumber,
-      prompt: body.prompt,
+      prompt: effectivePrompt,
       fullDocument: preResolvedIsPublic,
     });
 
@@ -138,11 +181,17 @@ export async function POST(req: Request) {
 
     if (!primaryDocId && chunks[0]?.documentId) {
       primaryDocId = chunks[0].documentId;
-      alreadyHasPublic = await hasExistingPublicArtifact(primaryDocId, kind);
+      if (!existingToReplace) {
+        alreadyHasPublic = await hasExistingPublicArtifact(primaryDocId, kind);
+      }
     }
 
-    const autoPublishedFirst = Boolean(primaryDocId && !alreadyHasPublic);
-    const resolvedIsPublic = autoPublishedFirst
+    const autoPublishedFirst = existingToReplace
+      ? false
+      : Boolean(primaryDocId && !alreadyHasPublic);
+    const resolvedIsPublic = existingToReplace
+      ? Boolean(existingToReplace.isPublic || body.isPublic)
+      : autoPublishedFirst
       ? true
       : Boolean(body.isPublic);
 
@@ -150,37 +199,53 @@ export async function POST(req: Request) {
       kind,
       chunks,
       title: body.title,
-      prompt: body.prompt,
+      prompt: effectivePrompt,
       isPublic: resolvedIsPublic,
       pageImagesBase64: body.pageImagesBase64,
     });
 
-    const resolvedUeId = body.ueId || chunks[0]?.ueId || null;
+    const resolvedUeId = effectiveUeId || chunks[0]?.ueId || null;
 
-    const artifact = await prisma.studyArtifact.create({
-      data: {
-        userId: user.id,
-        ueId: resolvedUeId,
-        documentId: primaryDocId,
-        kind,
-        title: generated.title,
-        prompt: body.prompt?.trim() || null,
-        contentJson: JSON.stringify(generated.content),
-        isPublic: resolvedIsPublic,
-      },
-      include: {
-        user: { select: { id: true, name: true } },
-        ue: { select: { id: true, code: true, title: true } },
-      },
-    });
+    const artifact = existingToReplace
+      ? await prisma.studyArtifact.update({
+          where: { id: existingToReplace.id },
+          data: {
+            title: generated.title,
+            prompt: effectivePrompt?.trim() || null,
+            contentJson: JSON.stringify(generated.content),
+            isPublic: resolvedIsPublic,
+            createdAt: new Date(),
+          },
+          include: {
+            user: { select: { id: true, name: true } },
+            ue: { select: { id: true, code: true, title: true } },
+          },
+        })
+      : await prisma.studyArtifact.create({
+          data: {
+            userId: user.id,
+            ueId: resolvedUeId,
+            documentId: primaryDocId,
+            kind,
+            title: generated.title,
+            prompt: effectivePrompt?.trim() || null,
+            contentJson: JSON.stringify(generated.content),
+            isPublic: resolvedIsPublic,
+          },
+          include: {
+            user: { select: { id: true, name: true } },
+            ue: { select: { id: true, code: true, title: true } },
+          },
+        });
 
     return NextResponse.json(
       {
         artifact,
         autoPublishedFirst,
         usedAi: generated.usedAi,
+        replaced: Boolean(existingToReplace),
       },
-      { status: 201 }
+      { status: existingToReplace ? 200 : 201 }
     );
   } catch (error) {
     console.error("[Studio POST] Error:", error);

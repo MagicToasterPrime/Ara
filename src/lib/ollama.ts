@@ -5,7 +5,7 @@ import type { ExtractedPdfPage } from "@/lib/pdf";
 export function getOllamaConfig() {
   return {
     host: (process.env.OLLAMA_HOST || "http://127.0.0.1:11434").replace(/\/$/, ""),
-    model: process.env.OLLAMA_MODEL || "qwen2.5:7b",
+    model: process.env.OLLAMA_MODEL || "qwen2.5:3b",
     embedModel: process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text",
   };
 }

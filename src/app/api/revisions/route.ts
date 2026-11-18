@@ -7,6 +7,7 @@ import {
   reviewErrorBookItem,
   type SrsRating,
 } from "@/lib/error-book";
+import { checkOllamaHealth } from "@/lib/ollama";
 import {
   computeEffectiveStreak,
   ensureRevisionSchema,
@@ -14,6 +15,7 @@ import {
   getLocalDateKey,
   getYesterdayDateKey,
   gradeRevisionAnswers,
+  isLowQualityExcerptQuestion,
   type RevisionAnswerValue,
   type RevisionQuestion,
 } from "@/lib/revisions";
@@ -170,6 +172,33 @@ export async function GET() {
             },
           })
           .catch(() => null);
+      }
+    } else if (!existing.completed) {
+      const parsedExisting = parseJsonSafe<RevisionQuestion[]>(
+        existing.questionsJson,
+        []
+      );
+      const hasStaleCopyPaste = parsedExisting.some((q) =>
+        isLowQualityExcerptQuestion(q.prompt, q.options)
+      );
+      const needsAiUpgrade =
+        parsedExisting.length > 0 &&
+        parsedExisting.every((q) => !q.generatedByAi) &&
+        (await checkOllamaHealth()).online;
+
+      if (hasStaleCopyPaste || needsAiUpgrade) {
+        const freshQuestions = await generateQuizQuestions({ userId: user.id });
+        if (freshQuestions.length > 0) {
+          await prisma.dailyRevisionSession
+            .update({
+              where: { id: existing.id },
+              data: {
+                questionsJson: JSON.stringify(freshQuestions),
+                totalQuestions: freshQuestions.length,
+              },
+            })
+            .catch(() => null);
+        }
       }
     }
   }

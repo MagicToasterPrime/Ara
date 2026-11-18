@@ -11,7 +11,17 @@ import {
   storeDocumentChunksUnindexed,
 } from "@/lib/ollama";
 import { extractPdfPages } from "@/lib/pdf";
-import type { RevisionQuestion } from "@/lib/revisions";
+import {
+  buildFactFlashcardsFromChunks,
+  buildFactQuestionsFromChunks,
+  cleanChunkTextForAi,
+  extractCourseFacts,
+  isLowQualityExcerptQuestion,
+  parseOllamaJsonWithRecovery,
+  selectHighValueText,
+  shuffleOptionsWithIndices,
+  type RevisionQuestion,
+} from "@/lib/revisions";
 import { resolveDocumentFilePath } from "@/lib/storage";
 
 export type StudioArtifactKind =
@@ -78,11 +88,41 @@ export interface QuizPayload {
   sources: StudioSourceRef[];
 }
 
+export interface SummaryCallout {
+  type?: "DEFINITION" | "RULE" | "ALERT" | "KEY_DATE";
+  icon?: string;
+  title: string;
+  text?: string;
+  items?: string[];
+}
+
+export interface SummaryBullet {
+  lead?: string;
+  text: string;
+  subItems?: string[];
+}
+
+export interface SummaryTable {
+  title?: string;
+  headers: string[];
+  rows: string[][];
+}
+
+export interface SummarySubSection {
+  icon?: string;
+  title: string;
+  intro?: string;
+  callouts?: SummaryCallout[];
+  bullets?: SummaryBullet[];
+  table?: SummaryTable | null;
+}
+
 export interface SummarySection {
   title: string;
   pageRange: string;
   content: string;
   keyPoints: string[];
+  subsections?: SummarySubSection[];
 }
 
 export interface SummaryPayload {
@@ -167,7 +207,7 @@ export async function gatherStudioSourceChunks(params: {
       ? documentIds
       : undefined;
 
-  const targetLimit = fullDocument ? 60 : 12;
+  const targetLimit = fullDocument ? 84 : 14;
   const minSubstantialLen = fullDocument ? 60 : 80;
 
   const collected: SourceChunk[] = [];
@@ -723,25 +763,18 @@ function withOllamaLock<T>(task: () => Promise<T>): Promise<T> {
   return run;
 }
 
-function parseLooseJson<T>(raw: string): T | null {
-  const trimmed = raw.trim();
-  try {
-    return JSON.parse(trimmed) as T;
-  } catch {
-    const match = trimmed.match(/\{[\s\S]*\}/);
-    if (!match) return null;
-    try {
-      return JSON.parse(match[0]) as T;
-    } catch {
-      return null;
-    }
-  }
-}
-
 async function callOllamaJson<T>(
   prompt: string,
-  timeoutMs = 120000
+  options?: {
+    timeoutMs?: number;
+    arrayKeys?: string[];
+    numPredict?: number;
+  }
 ): Promise<T | null> {
+  const timeoutMs = options?.timeoutMs ?? 150000;
+  const arrayKeys = options?.arrayKeys ?? [];
+  const numPredict = options?.numPredict ?? 2600;
+
   return withOllamaLock(async () => {
     const health = await checkOllamaHealth();
     if (!health.online) return null;
@@ -760,8 +793,9 @@ async function callOllamaJson<T>(
           format: "json",
           stream: false,
           options: {
-            temperature: 0.4,
-            num_predict: 2800,
+            temperature: 0.25,
+            num_ctx: 8192,
+            num_predict: numPredict,
           },
         }),
         signal: controller.signal,
@@ -769,7 +803,7 @@ async function callOllamaJson<T>(
       if (!res.ok) return null;
       const data = (await res.json()) as { response?: string };
       if (!data.response) return null;
-      return parseLooseJson<T>(data.response);
+      return parseOllamaJsonWithRecovery<T>(data.response, arrayKeys);
     } catch {
       return null;
     } finally {
@@ -779,10 +813,23 @@ async function callOllamaJson<T>(
 }
 
 function splitSentences(text: string): string[] {
-  return text
+  return cleanChunkTextForAi(text)
+    .replace(/\n+/g, " ")
     .split(/(?<=[.!?])\s+/)
     .map((s) => s.trim())
     .filter((s) => s.length >= 25);
+}
+
+function stripOptionLetterPrefix(opt: string): string {
+  return opt.replace(/^[A-D]\s*[.)\]:-]\s+/i, "").trim();
+}
+
+function avoidHintFromList(avoidList: string): string {
+  if (!avoidList.trim()) return "";
+  return `\nÉVITE ABSOLUMENT de répéter les questions/notions déjà générées :\n${avoidList.slice(
+    0,
+    500
+  )}\n`;
 }
 
 function resolveSourceChunkByPage(
@@ -815,15 +862,15 @@ export interface PageImageInput {
 
 function formatChunksForPrompt(
   segmentChunks: SourceChunk[],
-  maxCharsPerChunk = 800,
-  maxChunks = 10
+  maxCharsPerChunk = 540,
+  maxChunks = 6
 ): string {
   return segmentChunks
     .slice(0, maxChunks)
     .map(
       (c) =>
-        `[${c.fileName} · P.${c.pageNumber}] (${c.ueCode} - ${c.chapterTitle})\n${c.content.slice(
-          0,
+        `[${c.fileName} · P.${c.pageNumber}] (${c.ueCode} - ${c.chapterTitle})\n${selectHighValueText(
+          c.content,
           maxCharsPerChunk
         )}`
     )
@@ -917,7 +964,7 @@ export async function generateStudioArtifact(params: {
   }
 
   const contextText =
-    visualContextNote + formatChunksForPrompt(orderedChunks, 850, 10);
+    visualContextNote + formatChunksForPrompt(orderedChunks, 560, 7);
 
   const defaultTopic =
     prompt?.trim().slice(0, 72) ||
@@ -1046,11 +1093,92 @@ ${contextText}`
 
     const segments = fullCourseMode
       ? partitionChunks(orderedChunks, 6)
-      : [orderedChunks.slice(0, 10)];
+      : [orderedChunks.slice(0, 8)];
 
     const cards: FlashcardItem[] = [];
     const seenFronts = new Set<string>();
     let anyAiUsed = false;
+
+    const runFlashcardPass = async (
+      segChunks: SourceChunk[],
+      passLabel: string,
+      desiredCount: number,
+      avoidHint = ""
+    ) => {
+      const segContext = formatChunksForPrompt(segChunks, 560, 8);
+      const aiCards = await callOllamaJson<{
+        cards?: Array<{
+          front?: string;
+          back?: string;
+          tag?: string;
+          sourcePage?: number;
+        }>;
+      }>(
+        `Tu es un créateur de flashcards pédagogiques de niveau NotebookLM pour des étudiants vétérinaires d'Oniris.
+Génère exactement ${desiredCount} flashcards de RÉVISION ACTIVE basées sur les VALEURS, DÉFINITIONS, MÉCANISMES et CRITÈRES extraits de ces extraits.
+${passLabel}
+${customContextBlock}${avoidHint}
+RÈGLES STRICTES :
+1. RECTO ("front") : Une QUESTION DIRECTE, COURTE et AUTONOME en une seule phrase (10 à 22 mots max), testant une valeur précise (taille, %, seuil, date, effectif), un mécanisme, un rôle ou une distinction.
+   EXEMPLE MODÈLE : "Quelle est la plage de taille caractéristique d'un érythrocyte chez les mammifères ?"
+   INTERDIT : "Notion clé page X : que faut-il retenir ?" ou recopier une phrase du texte.
+2. VERSO ("back") : Réponse exacte, nette et concise en 1 à 2 phrases. Mets la valeur ou le terme clé en gras au début (ex : "**6 à 8 µm** de diamètre en moyenne (cellule biconcave anucléée chez les mammifères).").
+3. Indique un "tag" court (ex : "VALEUR CLÉ", "DÉFINITION", "MÉCANISME", "ANATOMIE", "CLINIQUE") et "sourcePage".
+
+Réponds STRICTEMENT en JSON :
+{
+  "cards": [
+    {
+      "front": "Question courte et directe sur une valeur, notion ou mécanisme ?",
+      "back": "**Réponse clé** : explication concise et précise issue du cours.",
+      "tag": "VALEUR CLÉ",
+      "sourcePage": 1
+    }
+  ]
+}
+
+EXTRAITS :
+${segContext}`,
+        { arrayKeys: ["cards"], numPredict: 2400 }
+      );
+
+      if (
+        aiCards?.cards &&
+        Array.isArray(aiCards.cards) &&
+        aiCards.cards.length > 0
+      ) {
+        anyAiUsed = true;
+        for (let idx = 0; idx < aiCards.cards.length; idx += 1) {
+          if (cards.length >= targetCount) break;
+          const c = aiCards.cards[idx];
+          if (!c.front || !c.back) continue;
+          const cleanFront = String(c.front).trim();
+          const cleanBack = String(c.back).trim();
+          if (
+            cleanFront.length < 10 ||
+            cleanBack.length < 4 ||
+            isLowQualityExcerptQuestion(cleanFront)
+          ) {
+            continue;
+          }
+          const normKey = cleanFront.toLowerCase().slice(0, 60);
+          if (seenFronts.has(normKey)) continue;
+          seenFronts.add(normKey);
+
+          const src = resolveSourceChunkByPage(segChunks, c.sourcePage, idx);
+          cards.push({
+            id: `fc-${cards.length + 1}-${crypto.randomUUID().slice(0, 4)}`,
+            front: cleanFront,
+            back: cleanBack,
+            tag: String(c.tag || src?.ueCode || "NOTION CLÉ").trim(),
+            documentId: src?.documentId || "",
+            fileName: src?.fileName || "document.pdf",
+            pageNumber: src?.pageNumber || 1,
+            ueId: src?.ueId || "",
+          });
+        }
+      }
+    };
 
     for (let sIdx = 0; sIdx < segments.length; sIdx += 1) {
       if (shouldStop?.() || cards.length >= targetCount) break;
@@ -1062,104 +1190,48 @@ ${contextText}`
         `Flashcards (${pageSpan} · Lot ${sIdx + 1}/${segments.length})`
       );
 
-      const segContext = formatChunksForPrompt(segChunks, 820, 10);
-      const countForPass = fullCourseMode ? "10 à 12" : "10";
       const scopeHint = fullCourseMode
-        ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : couvre exhaustivement toutes les notions de ces pages (objectif global : 95 % du cours sur les ${segments.length} lots).`
-        : "Focus ciblé et pointu sur la difficulté ou notion demandée.";
+        ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : extrais toutes les valeurs, définitions et mécanismes de ces pages (objectif global : 95% du cours sur les ${segments.length} lots).`
+        : "Focus ciblé et exigeant sur la notion demandée par l'étudiant.";
 
-      const aiCards = await callOllamaJson<{
-        cards?: Array<{
-          front?: string;
-          back?: string;
-          tag?: string;
-          sourcePage?: number;
-        }>;
-      }>(
-        `Tu es Spix, professeur universitaire vétérinaire. Génère exactement ${countForPass} flashcards distinctes de RÉVISION ACTIVE et de COMPRÉHENSION en français basées sur ces extraits.
-${scopeHint}
-${customContextBlock}
-RÈGLES PÉDAGOGIQUES STRICTES :
-- Chaque RECTO ("front") pose une question précise testant un mécanisme, une cause/conséquence, un critère différentiel, un rôle ou un seuil clé.
-- Chaque VERSO ("back") donne une réponse complète, claire et rigoureuse (1 à 3 phrases) tirée du cours.
-- Aucun doublon avec les autres lots, et indique "sourcePage" (numéro de page de l'extrait).
-
-Réponds STRICTEMENT en JSON :
-{
-  "cards": [
-    {
-      "front": "Pourquoi / Comment / Quel mécanisme ... ?",
-      "back": "Explication claire, mécanisme précis et conséquence clé.",
-      "tag": "MÉCANISME",
-      "sourcePage": 1
-    }
-  ]
-}
-
-EXTRAITS :
-${segContext}`
+      await runFlashcardPass(
+        segChunks,
+        scopeHint,
+        fullCourseMode ? 10 : 10
       );
+    }
 
-      if (aiCards?.cards && Array.isArray(aiCards.cards) && aiCards.cards.length > 0) {
-        anyAiUsed = true;
-        for (let idx = 0; idx < aiCards.cards.length; idx += 1) {
-          const c = aiCards.cards[idx];
-          if (!c.front || !c.back) continue;
-          const cleanFront = String(c.front).trim();
-          const normKey = cleanFront.toLowerCase().slice(0, 60);
-          if (seenFronts.has(normKey)) continue;
-          seenFronts.add(normKey);
-
-          const src = resolveSourceChunkByPage(segChunks, c.sourcePage, idx);
-          cards.push({
-            id: `fc-${cards.length + 1}-${crypto.randomUUID().slice(0, 4)}`,
-            front: cleanFront,
-            back: String(c.back).trim(),
-            tag: String(c.tag || src?.ueCode || "COURS").trim(),
-            documentId: src?.documentId || "",
-            fileName: src?.fileName || "document.pdf",
-            pageNumber: src?.pageNumber || 1,
-            ueId: src?.ueId || "",
-          });
-          if (cards.length >= targetCount) break;
-        }
+    // AI top-up pass if Ollama is responsive and slightly below targetCount
+    if (anyAiUsed && cards.length < targetCount && !shouldStop?.()) {
+      for (let extra = 0; extra < 2 && cards.length < targetCount; extra += 1) {
+        const deficit = Math.min(10, targetCount - cards.length);
+        const topUpChunks = segments[extra % segments.length] || orderedChunks;
+        const avoidList = cards
+          .slice(-8)
+          .map((c) => c.front)
+          .join(" | ");
+        await runFlashcardPass(
+          topUpChunks,
+          `COMPLÉMENT (${deficit} nouvelles flashcards distinctes) : explore d'autres détails, chiffres ou exemples non encore traités.`,
+          deficit,
+          avoidHintFromList(avoidList)
+        );
       }
     }
 
-    // Complete remaining slots only if non-AI fallback or slight AI shortfall during interactive mode
+    // Emergency factual extractor fallback only if still incomplete (never raw poly chunks)
     if (cards.length < targetCount && (anyAiUsed || !shouldStop?.())) {
-      const sentencePool: Array<{ chunk: SourceChunk; sent: string }> = [];
-      for (const c of orderedChunks) {
-        const sents = splitSentences(c.content);
-        if (sents.length > 0) {
-          for (const s of sents) sentencePool.push({ chunk: c, sent: s });
-        } else if (c.content.trim().length > 20) {
-          sentencePool.push({ chunk: c, sent: c.content.trim().slice(0, 220) });
-        }
-      }
-      if (sentencePool.length > 0) {
-        let cursor = 0;
-        const maxFallbackFill = anyAiUsed
-          ? targetCount
-          : Math.min(targetCount, sentencePool.length);
-        while (cards.length < maxFallbackFill && cursor < targetCount * 2) {
-          const entry = sentencePool[cursor % sentencePool.length];
-          cursor += 1;
-          const frontText = `Notion clé (${entry.chunk.chapterTitle}, p.${entry.chunk.pageNumber} · #${cards.length + 1}) : quel élément faut-il maîtriser ?`;
-          const normKey = frontText.toLowerCase().slice(0, 60);
-          if (seenFronts.has(normKey)) continue;
-          seenFronts.add(normKey);
-          cards.push({
-            id: `fc-${cards.length + 1}`,
-            front: frontText,
-            back: entry.sent,
-            tag: entry.chunk.ueCode,
-            documentId: entry.chunk.documentId,
-            fileName: entry.chunk.fileName,
-            pageNumber: entry.chunk.pageNumber,
-            ueId: entry.chunk.ueId,
-          });
-        }
+      const factCards = buildFactFlashcardsFromChunks(
+        orderedChunks,
+        targetCount - cards.length,
+        seenFronts
+      );
+      for (const fc of factCards) {
+        if (cards.length >= targetCount) break;
+        cards.push({
+          id: `fc-${cards.length + 1}-${crypto.randomUUID().slice(0, 4)}`,
+          ...fc,
+        });
       }
     }
 
@@ -1185,28 +1257,19 @@ ${segContext}`
 
     const segments = fullCourseMode
       ? partitionChunks(orderedChunks, 6)
-      : [orderedChunks.slice(0, 10)];
+      : [orderedChunks.slice(0, 8)];
 
     const questions: RevisionQuestion[] = [];
     const seenPrompts = new Set<string>();
     let anyAiUsed = false;
 
-    for (let sIdx = 0; sIdx < segments.length; sIdx += 1) {
-      if (shouldStop?.() || questions.length >= targetCount) break;
-
-      const segChunks = segments[sIdx];
-      const pageSpan = computePageRangeLabel(segChunks);
-      onProgress?.(
-        Math.round((sIdx / segments.length) * 100),
-        `Quiz (${pageSpan} · Lot ${sIdx + 1}/${segments.length})`
-      );
-
-      const segContext = formatChunksForPrompt(segChunks, 820, 10);
-      const batchSize = fullCourseMode ? 5 : 6;
-      const scopeHint = fullCourseMode
-        ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : interroge en profondeur cette portion pour couvrir 95 % du cours sur les ${segments.length} lots.`
-        : "Focus ciblé et exigeant sur ce que l'étudiant cherche à comprendre.";
-
+    const runQuizPass = async (
+      segChunks: SourceChunk[],
+      passLabel: string,
+      batchSize: number,
+      avoidHint = ""
+    ) => {
+      const segContext = formatChunksForPrompt(segChunks, 560, 8);
       const aiQuiz = await callOllamaJson<{
         questions?: Array<{
           type?: "QCU" | "QCM" | "QROC" | "FILL_BLANK";
@@ -1221,50 +1284,58 @@ ${segContext}`
           sourcePage?: number;
         }>;
       }>(
-        `Tu es Spix, professeur universitaire vétérinaire. Génère un QUIZ ORIGINAL de ${batchSize} questions en français conçu pour vérifier que l'étudiant a COMPRIS les notions et mécanismes des extraits ci-dessous.
-${scopeHint}
-${customContextBlock}
-RÈGLES PÉDAGOGIQUES STRICTES :
-1. NE JAMAIS recopier une phrase brute en demandant « quelle phrase figure dans le cours ».
-2. Pose des questions de COMPRÉHENSION et de RAISONNEMENT : mécanismes, relations cause -> effet, scénarios ("Que se passe-t-il si... ?"), comparaisons, cas pratiques/cliniques, et pièges classiques.
-3. Varie les formats sur ces ${batchSize} questions : inclus des "QCU" (1 bonne réponse parmi 4), des "QCM" (2 ou 3 bonnes réponses parmi 4), et au moins 1 "QROC" (question ouverte courte dont la réponse tient en 1 à 5 mots).
-4. Chaque "explanation" doit justifier clairement pourquoi la bonne réponse est exacte et pourquoi les distracteurs sont faux.
+        `Tu es un concepteur d'examens de niveau NotebookLM pour étudiants vétérinaires d'Oniris.
+Génère un QUIZ ORIGINAL de ${batchSize} questions précises testant les VALEURS, SEUILS, DÉFINITIONS et MÉCANISMES extraits du cours ci-dessous.
+${passLabel}
+${customContextBlock}${avoidHint}
+RÈGLES ABSOLUES (NON NÉGOCIABLES) :
+1. INTERDIT de recopier des phrases du polycopié en options ou de demander « quelle phrase correspond au cours ».
+2. QCU (majoritaire) : pose une question directe et précise (ex : "Quel pourcentage approximatif de thymocytes subit la mort par apoptose lors du processus de sélection dans la corticale thymique ?").
+   Les 4 options ("options") DOIVENT être COURTES (1 à 8 mots maximum, homogènes entre elles), SANS préfixe "A./B.", comme : ["Moins de 5%", "Environ 10 à 15%", "Plus de 90%", "Exactement 50%"].
+3. QCM : question à 2 ou 3 bonnes réponses, avec 4 options courtes et claires (1 à 10 mots max par option).
+4. QROC : question ouverte courte dont la réponse attendue tient en 1 à 4 mots exacts (un terme, chiffre ou mécanisme).
+5. Varie la position de la bonne réponse et rédige une "explanation" concise.
 
 Réponds STRICTEMENT en JSON :
 {
   "questions": [
     {
       "type": "QCU",
-      "prompt": "Question originale de compréhension ou mise en situation ?",
-      "options": ["Proposition A", "Proposition B", "Proposition C", "Proposition D"],
-      "correctIndices": [0],
-      "explanation": "Justification pédagogique précise.",
+      "prompt": "Quel pourcentage approximatif de thymocytes subit l'apoptose dans la corticale thymique ?",
+      "options": ["Moins de 5%", "Environ 10 à 15%", "Plus de 90%", "Exactement 50%"],
+      "correctIndices": [2],
+      "explanation": "Plus de 90 % des thymocytes sont éliminés lors de la sélection positive/négative.",
       "sourcePage": 2
     },
     {
       "type": "QCM",
-      "prompt": "Parmi les affirmations suivantes sur ce mécanisme, lesquelles sont exactes ?",
-      "options": ["Prop 1", "Prop 2", "Prop 3", "Prop 4"],
+      "prompt": "Parmi ces éléments concernant ce mécanisme, lesquels sont exacts ?",
+      "options": ["Option courte 1", "Option courte 2", "Option courte 3", "Option courte 4"],
       "correctIndices": [0, 2],
-      "explanation": "Justification pédagogique.",
+      "explanation": "Justification concise.",
       "sourcePage": 4
     },
     {
       "type": "QROC",
-      "prompt": "Question ouverte courte vérifiant une notion clé ?",
-      "correctAnswer": "Réponse courte attendue",
+      "prompt": "Quel terme désigne l'agent ou le concept clé de cette étape ?",
+      "correctAnswer": "Réponse courte",
       "acceptedKeywords": ["motcle1", "synonyme"],
-      "explanation": "Justification pédagogique.",
+      "explanation": "Justification concise.",
       "sourcePage": 5
     }
   ]
 }
 
 EXTRAITS :
-${segContext}`
+${segContext}`,
+        { arrayKeys: ["questions"], numPredict: 2400 }
       );
 
-      if (aiQuiz?.questions && Array.isArray(aiQuiz.questions) && aiQuiz.questions.length > 0) {
+      if (
+        aiQuiz?.questions &&
+        Array.isArray(aiQuiz.questions) &&
+        aiQuiz.questions.length > 0
+      ) {
         for (let idx = 0; idx < aiQuiz.questions.length; idx += 1) {
           if (questions.length >= targetCount) break;
           const q = aiQuiz.questions[idx];
@@ -1281,6 +1352,11 @@ ${segContext}`
             q.options.length === 4 &&
             Array.isArray(q.correctIndices)
           ) {
+            const cleanOpts = q.options.map((o) =>
+              stripOptionLetterPrefix(String(o))
+            );
+            if (isLowQualityExcerptQuestion(cleanPrompt, cleanOpts)) continue;
+
             const validIndices = Array.from(
               new Set(
                 q.correctIndices.filter(
@@ -1290,6 +1366,9 @@ ${segContext}`
             ).sort((a, b) => a - b);
 
             if (validIndices.length > 0) {
+              const targetIndices =
+                q.type === "QCU" ? [validIndices[0]] : validIndices;
+              const shuffled = shuffleOptionsWithIndices(cleanOpts, targetIndices);
               seenPrompts.add(promptKey);
               anyAiUsed = true;
               questions.push({
@@ -1304,9 +1383,8 @@ ${segContext}`
                 fileName: src.fileName,
                 pageNumber: src.pageNumber,
                 prompt: cleanPrompt,
-                options: q.options.map((o) => String(o).trim()),
-                correctIndices:
-                  q.type === "QCU" ? [validIndices[0]] : validIndices,
+                options: shuffled.options,
+                correctIndices: shuffled.correctIndices,
                 explanation:
                   q.explanation?.trim() ||
                   `Source : ${src.documentTitle} (p.${src.pageNumber}).`,
@@ -1316,7 +1394,8 @@ ${segContext}`
           } else if (
             q.type === "QROC" &&
             typeof q.correctAnswer === "string" &&
-            q.correctAnswer.trim().length > 0
+            q.correctAnswer.trim().length > 0 &&
+            !isLowQualityExcerptQuestion(cleanPrompt)
           ) {
             seenPrompts.add(promptKey);
             anyAiUsed = true;
@@ -1348,7 +1427,8 @@ ${segContext}`
           } else if (
             q.type === "FILL_BLANK" &&
             q.sentenceWithBlank &&
-            q.correctAnswer
+            q.correctAnswer &&
+            !isLowQualityExcerptQuestion(cleanPrompt)
           ) {
             seenPrompts.add(promptKey);
             anyAiUsed = true;
@@ -1379,61 +1459,61 @@ ${segContext}`
           }
         }
       }
+    };
+
+    for (let sIdx = 0; sIdx < segments.length; sIdx += 1) {
+      if (shouldStop?.() || questions.length >= targetCount) break;
+
+      const segChunks = segments[sIdx];
+      const pageSpan = computePageRangeLabel(segChunks);
+      onProgress?.(
+        Math.round((sIdx / segments.length) * 100),
+        `Quiz (${pageSpan} · Lot ${sIdx + 1}/${segments.length})`
+      );
+
+      const batchSize = fullCourseMode ? 5 : 6;
+      const scopeHint = fullCourseMode
+        ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : interroge les notions, chiffres et mécanismes clés de ces pages pour couvrir 95% du cours sur les ${segments.length} lots.`
+        : "Focus ciblé et exigeant sur ce que l'étudiant cherche à comprendre.";
+
+      await runQuizPass(segChunks, scopeHint, batchSize);
     }
 
-    if (questions.length < targetCount && (anyAiUsed || !shouldStop?.())) {
-      const sentencePool: Array<{ chunk: SourceChunk; sent: string }> = [];
-      for (const c of orderedChunks) {
-        const sents = splitSentences(c.content);
-        if (sents.length > 0) {
-          for (const s of sents) sentencePool.push({ chunk: c, sent: s });
-        } else if (c.content.trim().length > 20) {
-          sentencePool.push({ chunk: c, sent: c.content.trim().slice(0, 180) });
-        }
+    // AI top-up pass if Ollama is responsive and slightly below targetCount
+    if (anyAiUsed && questions.length < targetCount && !shouldStop?.()) {
+      for (
+        let extra = 0;
+        extra < 2 && questions.length < targetCount;
+        extra += 1
+      ) {
+        const deficit = Math.min(6, targetCount - questions.length);
+        const topUpChunks = segments[extra % segments.length] || orderedChunks;
+        const avoidList = questions
+          .slice(-6)
+          .map((q) => q.prompt)
+          .join(" | ");
+        await runQuizPass(
+          topUpChunks,
+          `COMPLÉMENT (${deficit} nouvelles questions distinctes) : interroge d'autres valeurs, cas ou notions non encore posés.`,
+          deficit,
+          avoidHintFromList(avoidList)
+        );
       }
-      if (sentencePool.length > 0) {
-        let cursor = 0;
-        const maxFallbackQuestions = anyAiUsed
-          ? targetCount
-          : Math.min(targetCount, Math.max(3, sentencePool.length));
-        while (
-          questions.length < maxFallbackQuestions &&
-          cursor < targetCount * 2
-        ) {
-          const item = sentencePool[cursor % sentencePool.length];
-          const other =
-            sentencePool[(cursor + 1) % sentencePool.length] || item;
-          cursor += 1;
-          const fallbackPrompt = `D'après « ${item.chunk.documentTitle} » (${item.chunk.ueCode}, p.${item.chunk.pageNumber} · Q${questions.length + 1}), quelle proposition correspond exactement au cours ?`;
-          const key = fallbackPrompt.toLowerCase().slice(0, 60);
-          if (seenPrompts.has(key)) continue;
-          seenPrompts.add(key);
+    }
 
-          questions.push({
-            id: `sq-${questions.length + 1}`,
-            type: "QCU",
-            ueId: item.chunk.ueId,
-            ueCode: item.chunk.ueCode,
-            ueTitle: item.chunk.ueTitle,
-            chapterTitle: item.chunk.chapterTitle,
-            documentId: item.chunk.documentId,
-            documentTitle: item.chunk.documentTitle,
-            fileName: item.chunk.fileName,
-            pageNumber: item.chunk.pageNumber,
-            prompt: fallbackPrompt,
-            options: [
-              item.sent,
-              other.sent !== item.sent
-                ? other.sent
-                : `Affirmation inversée concernant ${item.chunk.chapterTitle}.`,
-              `Cette notion n'est pas abordée dans ${item.chunk.chapterTitle}.`,
-              `Assertion contradictoire avec la page ${item.chunk.pageNumber}.`,
-            ],
-            correctIndices: [0],
-            explanation: `Extrait direct de ${item.chunk.fileName} (page ${item.chunk.pageNumber}).`,
-            generatedByAi: false,
-          });
-        }
+    // Emergency factual/value fallback (zero raw poly paragraph copying)
+    if (questions.length < targetCount && (anyAiUsed || !shouldStop?.())) {
+      const factQuestions = buildFactQuestionsFromChunks(
+        orderedChunks,
+        targetCount - questions.length,
+        seenPrompts
+      );
+      for (const fq of factQuestions) {
+        if (questions.length >= targetCount) break;
+        questions.push({
+          ...fq,
+          id: `sq-${questions.length + 1}`,
+        });
       }
     }
 
@@ -1449,16 +1529,16 @@ ${segContext}`
     };
   }
 
-  // SUMMARY: Full-course structured summary (public 95%) vs targeted (private 5%)
+  // SUMMARY: Full-course structured "Fiche de Révision Ultime" (public 95%) vs targeted (private 5%)
   const title =
     params.title?.trim() ||
     (fullCourseMode
-      ? `Fiche Cours Complet (95%) — ${chunks[0]?.documentTitle || defaultTopic}`
+      ? `Fiche de Révision Ultime — ${chunks[0]?.documentTitle || defaultTopic}`
       : `Fiche Ciblée : ${defaultTopic}`);
 
   const segments = fullCourseMode
-    ? partitionChunks(orderedChunks, 4)
-    : [orderedChunks.slice(0, 10)];
+    ? partitionChunks(orderedChunks, orderedChunks.length >= 36 ? 6 : 4)
+    : [orderedChunks.slice(0, 8)];
 
   const sections: SummarySection[] = [];
   const overviewParts: string[] = [];
@@ -1476,18 +1556,40 @@ ${segContext}`
     onProgress?.(
       Math.round((sIdx / segments.length) * 100),
       fullCourseMode
-        ? `Fiche complète (${pageSpan} · Partie ${sIdx + 1}/${segments.length})`
+        ? `Fiche Ultime (${pageSpan} · Partie ${sIdx + 1}/${segments.length})`
         : "Rédaction de la fiche ciblée..."
     );
 
-    const segContext = formatChunksForPrompt(segChunks, 850, 12);
+    const segContext = formatChunksForPrompt(segChunks, 620, 9);
     const scopeInstruction = fullCourseMode
-      ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : Rédige un chapitre complet permettant à l'étudiant d'APPRENDRE INTÉGRALEMENT cette partie du polycopié sans avoir à rouvrir le PDF (mécanismes détaillés, définitions exactes, critères, seuils et repères).`
-      : "Rédige une fiche pédagogique ciblée qui répond exactement à la difficulté ou question de l'étudiant.";
+      ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : Rédige un chapitre ultra-structuré type « Fiche de Révision Ultime » permettant à un étudiant d'APPRENDRE INTÉGRALEMENT cette partie (définitions/étymologies, dates/valeurs clés, encadrés Règle d'or, puces **Terme** : explication détaillée, et tableaux comparatifs dès qu'il y a plusieurs espèces/catégories/étapes).`
+      : "Rédige une fiche pédagogique structurée type « Fiche de Révision Ultime » qui répond exactement à la difficulté ou question de l'étudiant.";
 
     const aiPart = await callOllamaJson<{
       sectionTitle?: string;
       summaryText?: string;
+      subsections?: Array<{
+        icon?: string;
+        title?: string;
+        intro?: string;
+        callouts?: Array<{
+          type?: "DEFINITION" | "RULE" | "ALERT" | "KEY_DATE";
+          icon?: string;
+          title?: string;
+          text?: string;
+          items?: string[];
+        }>;
+        bullets?: Array<{
+          lead?: string;
+          text?: string;
+          subItems?: string[];
+        }>;
+        table?: {
+          title?: string;
+          headers?: string[];
+          rows?: string[][];
+        } | null;
+      }>;
       keyPoints?: string[];
       keyConcepts?: Array<{
         term?: string;
@@ -1496,31 +1598,132 @@ ${segContext}`
       }>;
       examPitfalls?: string[];
     }>(
-      `Tu es Spix, professeur universitaire vétérinaire. ${scopeInstruction}
+      `Tu es Spix, professeur universitaire vétérinaire à Oniris. ${scopeInstruction}
 ${customContextBlock}
+STRUCTURE ATTENDUE (« Fiche de Révision Ultime » — rédigée pour réviser vite et en profondeur) :
+- Utilise des titres de sous-parties thématiques avec icône ("📜", "🌾", "🏫", "🎯", "📊", "💼", "⚠️", "🏷️", "🦠", "🆔", "🔬").
+- Mets en avant les définitions, dates clés et règles absolues dans des encadrés "callouts" (icônes "💡", "⚠️", "🚨").
+- Dans "bullets", écris **lead** (le terme/concept en 1 à 4 mots) et **text** (explication claire, précise, avec **gras** sur les mots-clés/valeurs et exemples concrets).
+- Inclus un "table" dès que l'extrait présente un lexique, des espèces, des stades ou des données comparables (sinon mets null).
+
 Réponds STRICTEMENT en JSON :
 {
-  "sectionTitle": "Titre clair et structuré de cette partie",
-  "summaryText": "Explication complète, fluide et pédagogique de la logique, des mécanismes, des rôles et des valeurs clés de cette partie (8 à 12 lignes).",
+  "sectionTitle": "Titre clair de ce grand chapitre",
+  "summaryText": "Synthèse fluide et pédagogique de cette partie (3 à 5 phrases).",
+  "subsections": [
+    {
+      "icon": "📜",
+      "title": "Titre de la sous-partie",
+      "intro": "Phrase d'accroche éventuelle.",
+      "callouts": [
+        {
+          "type": "DEFINITION",
+          "icon": "💡",
+          "title": "Définition & Point Clé à retenir",
+          "text": "Explication claire avec les **termes importants** en gras.",
+          "items": []
+        }
+      ],
+      "bullets": [
+        {
+          "lead": "Concept ou Catégorie",
+          "text": "Explication précise avec **valeurs exactes** et exemples.",
+          "subItems": ["Sous-détail éventuel"]
+        }
+      ],
+      "table": {
+        "title": "Tableau comparatif éventuel",
+        "headers": ["Colonne 1", "Colonne 2", "Colonne 3"],
+        "rows": [["Donnée 1", "Donnée 2", "Donnée 3"]]
+      }
+    }
+  ],
   "keyPoints": [
-    "Point essentiel détaillé 1 (avec repère/valeur exacte si présent)",
-    "Point essentiel détaillé 2",
-    "Point essentiel détaillé 3",
-    "Point essentiel détaillé 4",
-    "Point essentiel détaillé 5"
+    "Point essentiel 1 avec repère/valeur exacte",
+    "Point essentiel 2"
   ],
   "keyConcepts": [
-    { "term": "Concept clé", "definition": "Explication détaillée, mécanisme et repères...", "sourcePage": 1 }
+    { "term": "Concept clé", "definition": "Explication précise et mécanisme...", "sourcePage": 1 }
   ],
   "examPitfalls": ["Piège fréquent ou confusion à éviter en partiel"]
 }
 
 EXTRAITS :
-${segContext}`
+${segContext}`,
+      { arrayKeys: ["subsections"], numPredict: 3000 }
     );
 
+    const normalizedSubsections: SummarySubSection[] = [];
+    if (Array.isArray(aiPart?.subsections)) {
+      for (const rawSub of aiPart.subsections) {
+        if (!rawSub?.title) continue;
+        const callouts: SummaryCallout[] = Array.isArray(rawSub.callouts)
+          ? rawSub.callouts
+              .filter((c) => Boolean(c?.title && (c.text || (c.items && c.items.length > 0))))
+              .map((c) => ({
+                type: c.type || "DEFINITION",
+                icon:
+                  c.icon ||
+                  (c.type === "ALERT"
+                    ? "🚨"
+                    : c.type === "KEY_DATE" || c.type === "RULE"
+                    ? "⚠️"
+                    : "💡"),
+                title: String(c.title).trim(),
+                text: c.text ? String(c.text).trim() : undefined,
+                items: Array.isArray(c.items)
+                  ? c.items.map((x) => String(x).trim()).filter(Boolean)
+                  : undefined,
+              }))
+          : [];
+
+        const bullets: SummaryBullet[] = Array.isArray(rawSub.bullets)
+          ? rawSub.bullets
+              .filter((b) => Boolean(b?.text || b?.lead))
+              .map((b) => ({
+                lead: b.lead ? String(b.lead).trim() : undefined,
+                text: String(b.text || "").trim(),
+                subItems: Array.isArray(b.subItems)
+                  ? b.subItems.map((s) => String(s).trim()).filter(Boolean)
+                  : undefined,
+              }))
+          : [];
+
+        let table: SummaryTable | null = null;
+        if (
+          rawSub.table &&
+          Array.isArray(rawSub.table.headers) &&
+          rawSub.table.headers.length >= 2 &&
+          Array.isArray(rawSub.table.rows) &&
+          rawSub.table.rows.length > 0
+        ) {
+          table = {
+            title: rawSub.table.title
+              ? String(rawSub.table.title).trim()
+              : undefined,
+            headers: rawSub.table.headers.map((h) => String(h).trim()),
+            rows: rawSub.table.rows.map((r) =>
+              Array.isArray(r) ? r.map((cell) => String(cell).trim()) : []
+            ),
+          };
+        }
+
+        if (callouts.length > 0 || bullets.length > 0 || table || rawSub.intro) {
+          normalizedSubsections.push({
+            icon: rawSub.icon ? String(rawSub.icon).trim() : "📌",
+            title: String(rawSub.title).trim(),
+            intro: rawSub.intro ? String(rawSub.intro).trim() : undefined,
+            callouts,
+            bullets,
+            table,
+          });
+        }
+      }
+    }
+
     const hasAiContent = Boolean(
-      aiPart?.summaryText ||
+      normalizedSubsections.length > 0 ||
+        aiPart?.summaryText ||
         (aiPart?.keyConcepts && aiPart.keyConcepts.length > 0) ||
         (aiPart?.keyPoints && aiPart.keyPoints.length > 0)
     );
@@ -1536,17 +1739,36 @@ ${segContext}`
         aiPart?.summaryText?.trim() ||
         segChunks
           .slice(0, 3)
-          .map((c) => splitSentences(c.content)[0] || c.content.slice(0, 200))
+          .map((c) => splitSentences(c.content)[0] || cleanChunkTextForAi(c.content).slice(0, 180))
           .join(" ");
       const keyPoints = Array.isArray(aiPart?.keyPoints)
         ? aiPart!.keyPoints.map((k) => String(k).trim()).filter(Boolean)
         : [];
+
+      // Synthesize clean subsections if model omitted subsections array
+      if (normalizedSubsections.length === 0) {
+        normalizedSubsections.push({
+          icon: "🎯",
+          title: "Notions & Mécanismes Clés",
+          callouts: [
+            {
+              type: "DEFINITION",
+              icon: "💡",
+              title: "Synthèse Essentielle",
+              text: summaryText,
+            },
+          ],
+          bullets: keyPoints.map((kp) => ({ text: kp })),
+          table: null,
+        });
+      }
 
       sections.push({
         title: sectionTitle,
         pageRange: pageSpan,
         content: summaryText,
         keyPoints,
+        subsections: normalizedSubsections,
       });
       overviewParts.push(
         fullCourseMode
@@ -1584,20 +1806,79 @@ ${segContext}`
         }
       }
     } else {
+      const { definitions, quantFacts } = extractCourseFacts(segChunks);
+      const fallbackSubsections: SummarySubSection[] = [];
+
+      if (definitions.length > 0) {
+        fallbackSubsections.push({
+          icon: "🎯",
+          title: "Définitions & Notions Extraites",
+          callouts: [
+            {
+              type: "DEFINITION",
+              icon: "💡",
+              title: definitions[0].term,
+              text: definitions[0].explanation,
+            },
+          ],
+          bullets: definitions.slice(1, 8).map((d) => ({
+            lead: d.term,
+            text: d.explanation,
+          })),
+        });
+      }
+
+      if (quantFacts.length > 0) {
+        fallbackSubsections.push({
+          icon: "📊",
+          title: "Repères & Valeurs Clés à Retenir",
+          callouts: [
+            {
+              type: "KEY_DATE",
+              icon: "⚠️",
+              title: "Chiffres & Seuils du Cours",
+              items: quantFacts
+                .slice(0, 5)
+                .map((q) => `**${q.exactValue}** — ${q.contextSentence}`),
+            },
+          ],
+        });
+      }
+
       const fallbackText = segChunks
         .slice(0, 3)
-        .map((c) => splitSentences(c.content)[0] || c.content.slice(0, 200))
+        .map(
+          (c) =>
+            splitSentences(c.content)[0] ||
+            cleanChunkTextForAi(c.content).slice(0, 180)
+        )
         .join(" ");
+
+      const fallbackPoints = segChunks
+        .slice(0, 4)
+        .map(
+          (c) =>
+            splitSentences(c.content)[0] ||
+            cleanChunkTextForAi(c.content).slice(0, 140)
+        )
+        .filter(Boolean);
+
+      if (fallbackSubsections.length === 0) {
+        fallbackSubsections.push({
+          icon: "📜",
+          title: segChunks[0]?.chapterTitle || "Points Essentiels",
+          bullets: fallbackPoints.map((pt) => ({ text: pt })),
+        });
+      }
+
       sections.push({
         title: fullCourseMode
           ? `Partie ${sIdx + 1} · ${segChunks[0]?.chapterTitle || "Section"}`
           : defaultTopic,
         pageRange: pageSpan,
         content: fallbackText,
-        keyPoints: segChunks
-          .slice(0, 4)
-          .map((c) => splitSentences(c.content)[0] || c.content.slice(0, 140))
-          .filter(Boolean),
+        keyPoints: fallbackPoints,
+        subsections: fallbackSubsections,
       });
       overviewParts.push(fallbackText);
     }
