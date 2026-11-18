@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSession } from "next-auth/react";
 import {
+  CheckCircle2,
+  Clock,
   Database,
   HardDrive,
   Pencil,
@@ -15,6 +17,12 @@ import {
   UserX,
 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
+import {
+  CLASS_LEVELS,
+  EXAM_TYPES,
+  formatExamBadge,
+  type ClassLevel,
+} from "@/lib/class-levels";
 
 const ACCENT_COLORS = [
   { label: "AMBRE", hex: "#D99B26" },
@@ -51,6 +59,9 @@ interface HealthData {
     name: string;
     email: string;
     globalRole: "STUDENT" | "YEAR_ADMIN";
+    classLevel: ClassLevel;
+    isApproved: boolean;
+    createdAt: string;
     ueRoles: Array<{
       id: string;
       ueId: string;
@@ -65,6 +76,10 @@ interface UEAdminItem {
   title: string;
   description: string;
   semester: string;
+  classLevel?: ClassLevel;
+  examType?: string;
+  examDate?: string | null;
+  coeff?: number;
   accentColor: string;
   order: number;
   roles: Array<{
@@ -98,6 +113,10 @@ export default function AdminPage() {
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [semester, setSemester] = useState("S1");
+  const [ueClassLevel, setUeClassLevel] = useState<ClassLevel>("VET2");
+  const [examType, setExamType] = useState<string>("PARTIEL");
+  const [examDate, setExamDate] = useState<string>("");
+  const [coeff, setCoeff] = useState<number>(4);
   const [accentColor, setAccentColor] = useState("#D99B26");
   const [order, setOrder] = useState(1);
   const [ueError, setUeError] = useState<string | null>(null);
@@ -167,6 +186,10 @@ export default function AdminPage() {
     setTitle(ue.title);
     setDescription(ue.description);
     setSemester(ue.semester);
+    setUeClassLevel(ue.classLevel || "VET2");
+    setExamType(ue.examType || "PARTIEL");
+    setExamDate(ue.examDate || "");
+    setCoeff(ue.coeff ?? 4);
     setAccentColor(ue.accentColor);
     setOrder(ue.order);
     setUeError(null);
@@ -178,6 +201,10 @@ export default function AdminPage() {
     setTitle("");
     setDescription("");
     setSemester("S1");
+    setUeClassLevel("VET2");
+    setExamType("PARTIEL");
+    setExamDate("");
+    setCoeff(4);
     setAccentColor("#D99B26");
     setOrder(ues.length + 1);
     setUeError(null);
@@ -200,6 +227,10 @@ export default function AdminPage() {
           title: title.trim(),
           description: description.trim(),
           semester: semester.trim(),
+          classLevel: ueClassLevel,
+          examType,
+          examDate: examDate.trim() || null,
+          coeff: Number(coeff),
           accentColor,
           order: Number(order),
         }),
@@ -260,6 +291,45 @@ export default function AdminPage() {
       await fetchAdminData();
     }
   }
+
+  async function handleUpdateUser(
+    userId: string,
+    patch: {
+      isApproved?: boolean;
+      classLevel?: ClassLevel;
+      globalRole?: "STUDENT" | "YEAR_ADMIN";
+    }
+  ) {
+    const res = await fetch("/api/admin/users", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId, ...patch }),
+    });
+    if (res.ok) {
+      await fetchAdminData();
+    }
+  }
+
+  async function handleDeleteUser(userId: string, label: string) {
+    if (
+      !confirm(
+        `Refuser et supprimer définitivement le compte de ${label} ?`
+      )
+    ) {
+      return;
+    }
+    const res = await fetch(
+      `/api/admin/users?userId=${encodeURIComponent(userId)}`,
+      { method: "DELETE" }
+    );
+    if (res.ok) {
+      await fetchAdminData();
+    }
+  }
+
+  const allUsers = health?.users || [];
+  const pendingUsers = allUsers.filter((u) => !u.isApproved);
+  const approvedUsers = allUsers.filter((u) => u.isApproved);
 
   if (!isYearAdmin) {
     return (
@@ -403,10 +473,122 @@ export default function AdminPage() {
           )}
         </section>
 
-        {/* Section 2: CRUD UE */}
+        {/* Section 2: Pending Account Approvals & Class Governance */}
+        <section className="space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
+              02 / VALIDATION DES COMPTES &amp; GESTION DES CLASSES (PACENV · VET2–VET6)
+            </h2>
+            <span
+              className={`border px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider ${
+                pendingUsers.length > 0
+                  ? "border-amber bg-amber/15 text-ink"
+                  : "border-forest/40 bg-forest/10 text-forest"
+              }`}
+            >
+              {pendingUsers.length > 0
+                ? `${pendingUsers.length} EN ATTENTE DE VALIDATION`
+                : "AUCUNE DEMANDE EN ATTENTE"}
+            </span>
+          </div>
+
+          <div
+            className="border border-border bg-card"
+            style={{
+              borderTop: `3px solid ${
+                pendingUsers.length > 0 ? "#D99B26" : "#3B7A57"
+              }`,
+            }}
+          >
+            <div className="border-b border-border bg-paper px-4 py-2.5 font-mono text-xs font-semibold uppercase tracking-wider text-ink">
+              FILE D&apos;ATTENTE D&apos;INSCRIPTION ({pendingUsers.length})
+            </div>
+
+            {pendingUsers.length === 0 ? (
+              <div className="flex items-center gap-2.5 p-5 font-mono text-xs uppercase tracking-wider text-stone">
+                <CheckCircle2 className="h-4 w-4 text-forest" />
+                <span>
+                  TOUS LES COMPTES INSCRITS ONT ÉTÉ TRAITÉS PAR L&apos;ADMINISTRATION.
+                </span>
+              </div>
+            ) : (
+              <div className="divide-y divide-border">
+                {pendingUsers.map((u) => (
+                  <div
+                    key={u.id}
+                    className="flex flex-wrap items-center justify-between gap-4 p-4"
+                  >
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="inline-flex items-center gap-1 border border-amber/60 bg-amber/15 px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink">
+                          <Clock className="h-3 w-3 text-amber" />
+                          EN ATTENTE
+                        </span>
+                        <span className="bg-badge-bg px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-badge-text">
+                          {u.classLevel}
+                        </span>
+                        <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                          INSCRIT LE{" "}
+                          {new Date(u.createdAt).toLocaleDateString("fr-FR")}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-sm font-bold text-ink">
+                        {u.name}
+                      </p>
+                      <p className="font-mono text-[11px] text-stone">
+                        {u.email}
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        value={u.classLevel}
+                        onChange={(e) =>
+                          handleUpdateUser(u.id, {
+                            classLevel: e.target.value as ClassLevel,
+                          })
+                        }
+                        aria-label={`Classe de ${u.name}`}
+                        className="border border-border bg-paper px-2.5 py-1.5 font-mono text-xs uppercase text-ink focus:border-ink focus:outline-none"
+                      >
+                        {CLASS_LEVELS.map((lvl) => (
+                          <option key={lvl} value={lvl}>
+                            {lvl}
+                          </option>
+                        ))}
+                      </select>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleUpdateUser(u.id, { isApproved: true })
+                        }
+                        className="inline-flex items-center gap-1.5 border border-ink bg-forest px-3 py-1.5 font-mono text-xs font-semibold uppercase tracking-wider text-card hover:bg-forest/90"
+                      >
+                        <UserCheck className="h-3.5 w-3.5" />
+                        <span>VALIDER L&apos;ACCÈS</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteUser(u.id, u.name)}
+                        className="inline-flex items-center gap-1.5 border border-carmine bg-paper px-3 py-1.5 font-mono text-xs uppercase tracking-wider text-carmine hover:bg-carmine hover:text-card"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        <span>REFUSER &amp; SUPPRIMER</span>
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Section 3: CRUD UE */}
         <section className="space-y-4">
           <h2 className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-            02 / CRÉATION &amp; GESTION DES UNITÉS D&apos;ENSEIGNEMENT
+            03 / CRÉATION &amp; GESTION DES UNITÉS D&apos;ENSEIGNEMENT
           </h2>
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
@@ -491,6 +673,70 @@ export default function AdminPage() {
                 />
               </div>
 
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <div>
+                  <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
+                    CLASSE CIBLE
+                  </label>
+                  <select
+                    value={ueClassLevel}
+                    onChange={(e) =>
+                      setUeClassLevel(e.target.value as ClassLevel)
+                    }
+                    className="w-full border border-border bg-paper px-2 py-2 font-mono text-xs uppercase text-ink focus:border-ink focus:outline-none"
+                  >
+                    {CLASS_LEVELS.map((lvl) => (
+                      <option key={lvl} value={lvl}>
+                        {lvl}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
+                    ÉPREUVE
+                  </label>
+                  <select
+                    value={examType}
+                    onChange={(e) => setExamType(e.target.value)}
+                    className="w-full border border-border bg-paper px-2 py-2 font-mono text-xs uppercase text-ink focus:border-ink focus:outline-none"
+                  >
+                    {EXAM_TYPES.map((t) => (
+                      <option key={t} value={t}>
+                        {t}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
+                    DATE EXAMEN
+                  </label>
+                  <input
+                    type="date"
+                    value={examDate}
+                    onChange={(e) => setExamDate(e.target.value)}
+                    className="w-full border border-border bg-paper px-2 py-2 font-mono text-xs text-ink focus:border-ink focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
+                    COEFF.
+                  </label>
+                  <input
+                    type="number"
+                    min={1}
+                    max={30}
+                    value={coeff}
+                    onChange={(e) => setCoeff(Number(e.target.value))}
+                    className="w-full border border-border bg-paper px-2 py-2 font-mono text-xs text-ink focus:border-ink focus:outline-none"
+                  />
+                </div>
+              </div>
+
               <div>
                 <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
                   DESCRIPTION
@@ -558,7 +804,9 @@ export default function AdminPage() {
                 </div>
               ) : (
                 <div className="divide-y divide-border">
-                  {ues.map((ue) => (
+                  {ues.map((ue) => {
+                    const ex = formatExamBadge(ue.examType, ue.examDate);
+                    return (
                     <div
                       key={ue.id}
                       className="flex flex-wrap items-center justify-between gap-3 p-4"
@@ -568,6 +816,12 @@ export default function AdminPage() {
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="font-mono text-xs font-bold uppercase text-ink">
                             {ue.code} · {ue.semester}
+                          </span>
+                          <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase text-badge-text">
+                            {ue.classLevel || "VET2"}
+                          </span>
+                          <span className="border border-border bg-paper px-1.5 py-0.5 font-mono text-[10px] uppercase text-stone">
+                            {ex.typeLabel} : {ex.dateLabel} · COEFF {ue.coeff ?? 4}
                           </span>
                           {ue.channels[0] && (
                             <span className="border border-border bg-paper px-1.5 py-0.5 font-mono text-[10px] text-stone">
@@ -615,17 +869,18 @@ export default function AdminPage() {
                         </button>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
           </div>
         </section>
 
-        {/* Section 3: UE Manager Governance */}
+        {/* Section 4: UE Manager Governance */}
         <section className="space-y-4">
           <h2 className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-            03 / NOMINATION DES RESPONSABLES D&apos;UE (UE_MANAGER)
+            04 / NOMINATION DES RESPONSABLES D&apos;UE (UE_MANAGER) &amp; MEMBRES
           </h2>
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
@@ -639,16 +894,16 @@ export default function AdminPage() {
 
               <div>
                 <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
-                  UTILISATEUR INSCRIT
+                  UTILISATEUR VALIDÉ
                 </label>
                 <select
                   value={roleUserId}
                   onChange={(e) => setRoleUserId(e.target.value)}
                   className="w-full border border-border bg-paper px-3 py-2 text-sm text-ink focus:border-ink focus:outline-none"
                 >
-                  {(health?.users || []).map((u) => (
+                  {approvedUsers.map((u) => (
                     <option key={u.id} value={u.id}>
-                      {u.name} ({u.email}) — {u.globalRole}
+                      {u.name} · {u.classLevel} ({u.email}) — {u.globalRole}
                     </option>
                   ))}
                 </select>
@@ -683,48 +938,108 @@ export default function AdminPage() {
 
             <div className="border border-border bg-card lg:col-span-7">
               <div className="border-b border-border bg-paper px-4 py-2.5 font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-                MEMBRES DE LA PROMOTION ({health?.users?.length || 0})
+                MEMBRES DE LA PROMOTION ({allUsers.length})
               </div>
               <div className="divide-y divide-border">
-                {(health?.users || []).map((u) => (
-                  <div
-                    key={u.id}
-                    className="flex flex-wrap items-center justify-between gap-2 p-3.5"
-                  >
-                    <div>
-                      <p className="text-sm font-bold text-ink">
-                        {u.name}{" "}
-                        <span className="ml-1 font-mono text-[10px] uppercase text-stone">
-                          [{u.globalRole}]
-                        </span>
-                      </p>
-                      <p className="font-mono text-[11px] text-stone">
-                        {u.email}
-                      </p>
-                    </div>
-
-                    <div className="flex flex-wrap gap-1.5">
-                      {u.ueRoles.length === 0 ? (
-                        <span className="font-mono text-[10px] uppercase text-stone">
-                          AUCUNE UE ASSIGNÉE
-                        </span>
-                      ) : (
-                        u.ueRoles.map((r) => (
-                          <button
-                            key={r.id}
-                            type="button"
-                            onClick={() => handleRevokeRole(r.ueId, u.id)}
-                            className="inline-flex items-center gap-1 border border-badge-text/30 bg-badge-bg px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-badge-text hover:border-carmine hover:bg-carmine/10 hover:text-carmine"
-                            title="Cliquer pour révoquer"
+                {allUsers.map((u) => {
+                  const isSelf = session?.user?.id === u.id;
+                  return (
+                    <div
+                      key={u.id}
+                      className="flex flex-wrap items-center justify-between gap-3 p-3.5"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <p className="text-sm font-bold text-ink">
+                            {u.name}
+                          </p>
+                          <span className="border border-border bg-paper px-1.5 py-0.5 font-mono text-[10px] uppercase text-stone">
+                            {u.globalRole}
+                          </span>
+                          <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase text-badge-text">
+                            {u.classLevel}
+                          </span>
+                          <span
+                            className={`border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+                              u.isApproved
+                                ? "border-forest/40 bg-forest/10 text-forest"
+                                : "border-amber/60 bg-amber/15 text-ink"
+                            }`}
                           >
-                            <span>{r.ue.code}</span>
-                            <UserX className="h-3 w-3" />
+                            {u.isApproved ? "VALIDÉ" : "EN ATTENTE"}
+                          </span>
+                        </div>
+                        <p className="font-mono text-[11px] text-stone">
+                          {u.email}
+                        </p>
+                        {u.ueRoles.length > 0 && (
+                          <div className="mt-1.5 flex flex-wrap gap-1.5">
+                            {u.ueRoles.map((r) => (
+                              <button
+                                key={r.id}
+                                type="button"
+                                onClick={() => handleRevokeRole(r.ueId, u.id)}
+                                className="inline-flex items-center gap-1 border border-badge-text/30 bg-badge-bg px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-badge-text hover:border-carmine hover:bg-carmine/10 hover:text-carmine"
+                                title="Cliquer pour révoquer"
+                              >
+                                <span>{r.ue.code}</span>
+                                <UserX className="h-3 w-3" />
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <select
+                          value={u.classLevel}
+                          onChange={(e) =>
+                            handleUpdateUser(u.id, {
+                              classLevel: e.target.value as ClassLevel,
+                            })
+                          }
+                          aria-label={`Classe de ${u.name}`}
+                          className="border border-border bg-paper px-2 py-1 font-mono text-[10px] uppercase text-ink focus:border-ink focus:outline-none"
+                        >
+                          {CLASS_LEVELS.map((lvl) => (
+                            <option key={lvl} value={lvl}>
+                              {lvl}
+                            </option>
+                          ))}
+                        </select>
+
+                        {!isSelf && u.globalRole !== "YEAR_ADMIN" && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleUpdateUser(u.id, {
+                                isApproved: !u.isApproved,
+                              })
+                            }
+                            className={`border px-2 py-1 font-mono text-[10px] uppercase tracking-wider ${
+                              u.isApproved
+                                ? "border-border bg-paper text-stone hover:border-amber hover:text-ink"
+                                : "border-ink bg-forest text-card"
+                            }`}
+                          >
+                            {u.isApproved ? "SUSPENDRE" : "VALIDER"}
                           </button>
-                        ))
-                      )}
+                        )}
+
+                        {!isSelf && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteUser(u.id, u.name)}
+                            className="border border-border bg-paper p-1.5 text-stone hover:border-carmine hover:text-carmine"
+                            title="Supprimer ce compte"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>

@@ -23,6 +23,7 @@ import {
   PinOff,
   Plus,
   Sparkles,
+  Timer,
   Trash2,
   Upload,
   X,
@@ -32,6 +33,8 @@ import { useSpix } from "@/components/SpixContext";
 import { UEDiscussionPanel } from "@/components/UEDiscussionPanel";
 import { NotebookStudioPanel } from "@/components/NotebookStudioPanel";
 import { CommunityQuizSection } from "@/components/CommunityQuizSection";
+import { MockExamPanel } from "@/components/MockExamPanel";
+import { formatExamBadge, type ClassLevel } from "@/lib/class-levels";
 
 const CustomPdfReader = dynamic(
   () =>
@@ -94,6 +97,10 @@ interface UEDetail {
   title: string;
   description: string;
   semester: string;
+  classLevel?: ClassLevel;
+  examType?: string;
+  examDate?: string | null;
+  coeff?: number;
   accentColor: string;
   roles: Array<{
     id: string;
@@ -104,7 +111,7 @@ interface UEDetail {
   whiteboards: UEWhiteboardItem[];
 }
 
-type UETab = "courses" | "discussion" | "whiteboards" | "studio";
+type UETab = "courses" | "discussion" | "whiteboards" | "studio" | "exam";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} o`;
@@ -136,6 +143,8 @@ function UEWorkspaceContent() {
       ? "whiteboards"
       : tabParam === "studio"
       ? "studio"
+      : tabParam === "exam"
+      ? "exam"
       : "courses"
   );
 
@@ -145,6 +154,11 @@ function UEWorkspaceContent() {
   const [activeDoc, setActiveDoc] = useState<DocItem | null>(null);
   const [activePage, setActivePage] = useState<number>(1);
   const [activeTotalPages, setActiveTotalPages] = useState<number>(1);
+  const [capturedQuizSeed, setCapturedQuizSeed] = useState<{
+    id: string;
+    imageDataUrl: string;
+    title: string;
+  } | null>(null);
 
   // Chapter form
   const [newChapterTitle, setNewChapterTitle] = useState("");
@@ -158,8 +172,15 @@ function UEWorkspaceContent() {
     "OFFICIAL_COURSE" | "STUDENT_NOTE"
   >("STUDENT_NOTE");
   const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [autoGenerateOnUpload, setAutoGenerateOnUpload] = useState<boolean>(true);
   const [uploading, setUploading] = useState(false);
   const [uploadFeedback, setUploadFeedback] = useState<string | null>(null);
+  const [lastGeneratedPack, setLastGeneratedPack] = useState<{
+    docTitle: string;
+    docId: string;
+    items: Array<{ id: string; kind: string; title: string }>;
+  } | null>(null);
+  const [studioFocusDocId, setStudioFocusDocId] = useState<string | null>(null);
 
   // Create UE Whiteboard form
   const [wbTitle, setWbTitle] = useState("");
@@ -171,6 +192,7 @@ function UEWorkspaceContent() {
       tabParam === "discussion" ||
       tabParam === "whiteboards" ||
       tabParam === "studio" ||
+      tabParam === "exam" ||
       tabParam === "courses"
     ) {
       setActiveTab(tabParam);
@@ -351,6 +373,7 @@ function UEWorkspaceContent() {
       formData.append("chapterId", uploadChapterId);
       formData.append("title", uploadTitle.trim());
       formData.append("category", uploadCategory);
+      formData.append("autoGenerate", autoGenerateOnUpload ? "true" : "false");
       formData.append("file", uploadFile);
 
       const res = await fetch("/api/documents", {
@@ -360,11 +383,21 @@ function UEWorkspaceContent() {
 
       const data = (await res.json().catch(() => ({}))) as {
         error?: string;
+        document?: { id: string; title: string };
+        generatedPack?: Array<{ id: string; kind: string; title: string }>;
       };
 
       if (!res.ok) {
         setUploadFeedback(data.error || "Échec de l'upload.");
         return;
+      }
+
+      if (data.document && data.generatedPack && data.generatedPack.length > 0) {
+        setLastGeneratedPack({
+          docTitle: data.document.title,
+          docId: data.document.id,
+          items: data.generatedPack,
+        });
       }
 
       setUploadTitle("");
@@ -489,6 +522,7 @@ function UEWorkspaceContent() {
   const myPrivateBoards = ue.whiteboards.filter(
     (wb) => wb.creatorId === session?.user?.id && !wb.isPublic
   );
+  const examBadge = formatExamBadge(ue.examType, ue.examDate);
 
   return (
     <div className="space-y-4">
@@ -509,7 +543,14 @@ function UEWorkspaceContent() {
             <div>
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-mono text-xs font-semibold uppercase tracking-wider text-stone">
-                  {ue.code} · {ue.semester}
+                  {ue.code} · {ue.semester} · {ue.classLevel || "VET2"}
+                </span>
+                <span className="border border-border bg-paper px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-ink">
+                  {examBadge.typeLabel} : {examBadge.dateLabel}
+                  {examBadge.countdownLabel ? ` (${examBadge.countdownLabel})` : ""}
+                </span>
+                <span className="border border-border bg-paper px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-stone">
+                  COEFF : {ue.coeff ?? 4}
                 </span>
                 {ue.roles.map((r) => (
                   <span
@@ -603,6 +644,19 @@ function UEWorkspaceContent() {
           >
             <Sparkles className="h-3.5 w-3.5" />
             <span>STUDIO NOTEBOOK (SVG · FLASHCARDS)</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActiveTab("exam")}
+            className={`inline-flex items-center gap-2 border-b-2 px-4 py-2.5 font-mono text-xs uppercase tracking-wider transition-colors ${
+              activeTab === "exam"
+                ? "border-ink bg-card font-semibold text-ink"
+                : "border-transparent text-stone hover:text-ink"
+            }`}
+          >
+            <Timer className="h-3.5 w-3.5" />
+            <span>PARTIEL BLANC (CHRONO)</span>
           </button>
         </div>
       </div>
@@ -705,23 +759,80 @@ function UEWorkspaceContent() {
                 </div>
               </div>
 
-              <div className="mt-4 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setUploadOpen(false)}
-                  className="border border-border bg-paper px-4 py-2 font-mono text-xs uppercase tracking-wider text-ink"
-                >
-                  ANNULER
-                </button>
-                <button
-                  type="submit"
-                  disabled={uploading || !uploadFile || !uploadChapterId}
-                  className="border border-ink bg-ink px-5 py-2 font-mono text-xs uppercase tracking-wider text-card disabled:opacity-50"
-                >
-                  {uploading ? "INDEXATION & ENVOI..." : "PUBLIER LE PDF"}
-                </button>
+              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
+                <label className="flex cursor-pointer items-center gap-2 font-mono text-[10px] uppercase tracking-wider text-ink">
+                  <input
+                    type="checkbox"
+                    checked={autoGenerateOnUpload}
+                    onChange={(e) => setAutoGenerateOnUpload(e.target.checked)}
+                    className="h-3.5 w-3.5 accent-ink"
+                  />
+                  <span>
+                    GÉNÉRER AUTOMATIQUEMENT À L&apos;UPLOAD : FICHE DE RÉVISION +
+                    FLASHCARDS + QUIZ
+                  </span>
+                </label>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setUploadOpen(false)}
+                    className="border border-border bg-paper px-4 py-2 font-mono text-xs uppercase tracking-wider text-ink"
+                  >
+                    ANNULER
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={uploading || !uploadFile || !uploadChapterId}
+                    className="border border-ink bg-ink px-5 py-2 font-mono text-xs uppercase tracking-wider text-card disabled:opacity-50"
+                  >
+                    {uploading
+                      ? autoGenerateOnUpload
+                        ? "ENVOI & GÉNÉRATION DU PACK..."
+                        : "INDEXATION & ENVOI..."
+                      : "PUBLIER LE PDF"}
+                  </button>
+                </div>
               </div>
             </form>
+          )}
+
+          {lastGeneratedPack && (
+            <div
+              className="flex flex-wrap items-center justify-between gap-3 border border-forest bg-forest/10 px-4 py-3"
+              style={{ borderLeft: "3px solid #3B7A57" }}
+            >
+              <div>
+                <p className="font-mono text-xs font-bold uppercase tracking-wider text-forest">
+                  PACK DE RÉVISION GÉNÉRÉ POUR « {lastGeneratedPack.docTitle} »
+                </p>
+                <p className="mt-0.5 font-mono text-[10px] uppercase tracking-wider text-ink">
+                  FICHE SYNTHÈSE · FLASHCARDS · QUIZ CIBLÉ ({lastGeneratedPack.items.length}{" "}
+                  RESSOURCES CRÉÉES)
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setStudioFocusDocId(lastGeneratedPack.docId);
+                    setActiveTab("studio");
+                  }}
+                  className="inline-flex items-center gap-1.5 border border-ink bg-ink px-3.5 py-1.5 font-mono text-[11px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90"
+                >
+                  <Sparkles className="h-3.5 w-3.5" />
+                  <span>CONSULTER DANS LE STUDIO →</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setLastGeneratedPack(null)}
+                  className="border border-border bg-card p-1 text-stone hover:text-ink"
+                  title="Fermer"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
           )}
 
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
@@ -809,11 +920,20 @@ function UEWorkspaceContent() {
               {activeDoc && (
                 <CustomPdfReader
                   documentId={activeDoc.id}
+                  ueId={ue.id}
                   title={activeDoc.title}
                   fileName={activeDoc.fileName}
                   initialPage={activePage}
                   pageCountHint={activeDoc.pageCount}
                   onPageChange={handleReaderPageChange}
+                  onCreateQuizFromCapture={(imageDataUrl, pageNumber) => {
+                    setCapturedQuizSeed({
+                      id: `cap-${Date.now()}`,
+                      imageDataUrl,
+                      title: `${ue.code} · Schéma P.${pageNumber} (${activeDoc.title})`,
+                    });
+                    setActiveTab("studio");
+                  }}
                   onClose={() => setActiveDoc(null)}
                 />
               )}
@@ -871,6 +991,18 @@ function UEWorkspaceContent() {
                           </div>
 
                           <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setStudioFocusDocId(doc.id);
+                                setActiveTab("studio");
+                              }}
+                              title="Ouvrir la fiche, flashcards et quiz de ce cours dans le Studio"
+                              className="inline-flex items-center gap-1 border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned"
+                            >
+                              <Sparkles className="h-3 w-3" />
+                              <span>PACK RÉVISION</span>
+                            </button>
                             <button
                               type="button"
                               onClick={() => {
@@ -977,6 +1109,18 @@ function UEWorkspaceContent() {
                           </div>
 
                           <div className="flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setStudioFocusDocId(doc.id);
+                                setActiveTab("studio");
+                              }}
+                              title="Ouvrir la fiche, flashcards et quiz de cette note dans le Studio"
+                              className="inline-flex items-center gap-1 border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned"
+                            >
+                              <Sparkles className="h-3 w-3" />
+                              <span>PACK RÉVISION</span>
+                            </button>
                             <button
                               type="button"
                               onClick={() => {
@@ -1334,6 +1478,7 @@ function UEWorkspaceContent() {
             ueId={ue.id}
             ueCode={ue.code}
             documents={allUeDocuments}
+            focusDocumentId={studioFocusDocId}
             onOpenSource={(src) => {
               const found = allUeDocuments.find((d) => d.id === src.documentId);
               if (found) {
@@ -1350,9 +1495,30 @@ function UEWorkspaceContent() {
               fixedUeId={ue.id}
               canManageFixedUe={canManage}
               documents={allUeDocuments}
+              initialCapture={capturedQuizSeed}
+              onConsumeInitialCapture={() => setCapturedQuizSeed(null)}
             />
           </div>
         </div>
+      )}
+
+      {/* TAB 5: PARTIEL BLANC CHRONOMÉTRÉ */}
+      {activeTab === "exam" && (
+        <MockExamPanel
+          ueId={ue.id}
+          ueCode={ue.code}
+          ueTitle={ue.title}
+          hasDocuments={allUeDocuments.length > 0}
+          onOpenDocumentPage={(docId, pageNum) => {
+            const found = allUeDocuments.find((d) => d.id === docId);
+            if (found) {
+              setActiveTab("courses");
+              setActiveDoc(found);
+              setActivePage(pageNum);
+              setActiveTotalPages(found.pageCount);
+            }
+          }}
+        />
       )}
     </div>
   );

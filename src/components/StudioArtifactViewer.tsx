@@ -45,10 +45,13 @@ export function StudioArtifactViewer({
   const [svgFullscreen, setSvgFullscreen] = useState(false);
   const [copiedSvg, setCopiedSvg] = useState(false);
 
-  // Flashcards state
+  // Flashcards SRS state
   const [cardIndex, setCardIndex] = useState(0);
   const [flipped, setFlipped] = useState(false);
   const [masteredIds, setMasteredIds] = useState<Record<string, boolean>>({});
+  const [srsRatings, setSrsRatings] = useState<
+    Record<string, "AGAIN" | "HARD" | "GOOD" | "EASY">
+  >({});
 
   // Quiz state
   const [quizAnswers, setQuizAnswers] = useState<
@@ -161,9 +164,22 @@ export function StudioArtifactViewer({
     return (
       <div className="border border-ink bg-card">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-3 py-2 font-mono text-[10px] uppercase tracking-wider">
-          <span className="font-bold text-ink">
-            FLASHCARDS · CARTE {safeIdx + 1} / {cards.length}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="font-bold text-ink">
+              FLASHCARDS SRS · CARTE {safeIdx + 1} / {cards.length}
+            </span>
+            {srsRatings[currentCard.id] && (
+              <span className="border border-border bg-card px-1.5 py-0.5 text-[9px] text-stone">
+                {srsRatings[currentCard.id] === "AGAIN"
+                  ? "À REVOIR"
+                  : srsRatings[currentCard.id] === "HARD"
+                  ? "1J"
+                  : srsRatings[currentCard.id] === "GOOD"
+                  ? "3J"
+                  : "7J · ACQUIS"}
+              </span>
+            )}
+          </div>
           <span className="text-forest">
             MAÎTRISÉES : {masteredCount} / {cards.length}
           </span>
@@ -225,36 +241,37 @@ export function StudioArtifactViewer({
               </button>
             </div>
 
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => {
-                  setMasteredIds((prev) => ({
-                    ...prev,
-                    [currentCard.id]: false,
-                  }));
-                  setFlipped(false);
-                  if (safeIdx < cards.length - 1) setCardIndex(safeIdx + 1);
-                }}
-                className="border border-border bg-paper px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-stone hover:border-ink hover:text-ink"
-              >
-                À REVOIR
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setMasteredIds((prev) => ({
-                    ...prev,
-                    [currentCard.id]: true,
-                  }));
-                  setFlipped(false);
-                  if (safeIdx < cards.length - 1) setCardIndex(safeIdx + 1);
-                }}
-                className="inline-flex items-center gap-1 border border-forest bg-forest/10 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-forest hover:bg-forest hover:text-card"
-              >
-                <Check className="h-3 w-3" />
-                <span>MAÎTRISÉE</span>
-              </button>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(
+                [
+                  { id: "AGAIN", label: "À REVOIR", sub: "<1M", mastered: false, cls: "border-carmine/40 bg-carmine/10 text-carmine hover:bg-carmine hover:text-card" },
+                  { id: "HARD", label: "DIFFICILE", sub: "1J", mastered: false, cls: "border-amber/60 bg-amber/15 text-ink hover:bg-amber hover:text-card" },
+                  { id: "GOOD", label: "BIEN", sub: "3J", mastered: true, cls: "border-badge-text/40 bg-badge-bg text-badge-text hover:bg-badge-text hover:text-card" },
+                  { id: "EASY", label: "FACILE", sub: "7J", mastered: true, cls: "border-forest bg-forest/10 text-forest hover:bg-forest hover:text-card" },
+                ] as const
+              ).map((btn) => (
+                <button
+                  key={btn.id}
+                  type="button"
+                  onClick={() => {
+                    setMasteredIds((prev) => ({
+                      ...prev,
+                      [currentCard.id]: btn.mastered,
+                    }));
+                    setSrsRatings((prev) => ({
+                      ...prev,
+                      [currentCard.id]: btn.id,
+                    }));
+                    setFlipped(false);
+                    if (safeIdx < cards.length - 1) setCardIndex(safeIdx + 1);
+                  }}
+                  className={`inline-flex items-center gap-1 border px-2 py-1 font-mono text-[10px] uppercase tracking-wider transition-colors ${btn.cls}`}
+                >
+                  {btn.id === "EASY" && <Check className="h-3 w-3" />}
+                  <span>{btn.label}</span>
+                  <span className="opacity-70">({btn.sub})</span>
+                </button>
+              ))}
             </div>
           </div>
         </div>

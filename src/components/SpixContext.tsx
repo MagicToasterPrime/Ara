@@ -26,6 +26,13 @@ export interface SpixPageContext {
   pageCount?: number;
 }
 
+export interface SpixPendingImagePrompt {
+  id: string;
+  imageDataUrl: string;
+  prompt: string;
+  pageNumber?: number;
+}
+
 type DocNavigator = (
   documentId: string,
   pageNumber: number,
@@ -43,6 +50,13 @@ interface SpixContextValue {
     pageNumber: number,
     ueId: string
   ) => boolean;
+  pendingImagePrompt: SpixPendingImagePrompt | null;
+  triggerSpixImagePrompt: (payload: {
+    imageDataUrl: string;
+    prompt: string;
+    pageNumber?: number;
+  }) => void;
+  clearPendingImagePrompt: () => void;
 }
 
 const SpixReactContext = createContext<SpixContextValue | null>(null);
@@ -52,6 +66,8 @@ export function SpixProvider({ children }: { children: ReactNode }) {
     mode: "GLOBAL",
   });
   const [isOpen, setIsOpen] = useState(false);
+  const [pendingImagePrompt, setPendingImagePrompt] =
+    useState<SpixPendingImagePrompt | null>(null);
   const navigatorRef = useRef<DocNavigator | null>(null);
 
   const setPageContext = useCallback((ctx: SpixPageContext) => {
@@ -72,6 +88,27 @@ export function SpixProvider({ children }: { children: ReactNode }) {
     []
   );
 
+  const triggerSpixImagePrompt = useCallback(
+    (payload: {
+      imageDataUrl: string;
+      prompt: string;
+      pageNumber?: number;
+    }) => {
+      setIsOpen(true);
+      setPendingImagePrompt({
+        id: `img-${Date.now()}`,
+        imageDataUrl: payload.imageDataUrl,
+        prompt: payload.prompt,
+        pageNumber: payload.pageNumber,
+      });
+    },
+    []
+  );
+
+  const clearPendingImagePrompt = useCallback(() => {
+    setPendingImagePrompt(null);
+  }, []);
+
   return (
     <SpixReactContext.Provider
       value={{
@@ -81,6 +118,9 @@ export function SpixProvider({ children }: { children: ReactNode }) {
         setIsOpen,
         registerDocNavigator,
         navigateToDocPage,
+        pendingImagePrompt,
+        triggerSpixImagePrompt,
+        clearPendingImagePrompt,
       }}
     >
       {children}

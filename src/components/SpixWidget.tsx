@@ -40,6 +40,7 @@ interface ChatTurn {
   content: string;
   sources?: SpixSource[];
   scopeLabel?: string;
+  imagePreviewUrl?: string;
   artifact?: {
     title: string;
     content: StudioArtifactContent;
@@ -48,7 +49,14 @@ interface ChatTurn {
 
 export function SpixWidget() {
   const router = useRouter();
-  const { pageContext, isOpen, setIsOpen, navigateToDocPage } = useSpix();
+  const {
+    pageContext,
+    isOpen,
+    setIsOpen,
+    navigateToDocPage,
+    pendingImagePrompt,
+    clearPendingImagePrompt,
+  } = useSpix();
 
   const [scopeOverride, setScopeOverride] = useState<
     "AUTO" | "DOCUMENT" | "UE" | "GLOBAL"
@@ -120,13 +128,6 @@ export function SpixWidget() {
     pageContext.mode === "DOCUMENT"
       ? "#3B7A57"
       : pageContext.ueAccentColor || "#D99B26";
-
-  const squareBadgeText =
-    pageContext.mode === "DOCUMENT"
-      ? "PDF"
-      : pageContext.mode === "UE"
-      ? "UE"
-      : "IA";
 
   const quickSuggestions =
     effectiveScope === "DOCUMENT"
@@ -280,12 +281,16 @@ export function SpixWidget() {
     }
   }
 
-  async function sendQuestion(promptText: string) {
+  async function sendQuestion(
+    promptText: string,
+    overrideCapture?: { imageDataUrl: string; pageNumber?: number }
+  ) {
     const trimmed = promptText.trim();
     if (!trimmed || isStreaming) return;
 
     const lower = trimmed.toLowerCase();
     if (
+      !overrideCapture &&
       /\b(svg|sch[eé]ma|diagramme)\b/i.test(lower) &&
       (lower.includes("fais") ||
         lower.includes("génère") ||
@@ -297,11 +302,11 @@ export function SpixWidget() {
       await triggerStudio("SVG_DIAGRAM", trimmed);
       return;
     }
-    if (/\b(flashcards?|cartes?\s+m[eé]moire)\b/i.test(lower)) {
+    if (!overrideCapture && /\b(flashcards?|cartes?\s+m[eé]moire)\b/i.test(lower)) {
       await triggerStudio("FLASHCARDS", trimmed);
       return;
     }
-    if (/\b(quiz|qcm|qcu)\b/i.test(lower)) {
+    if (!overrideCapture && /\b(quiz|qcm|qcu)\b/i.test(lower)) {
       await triggerStudio("QUIZ", trimmed);
       return;
     }
@@ -320,6 +325,7 @@ export function SpixWidget() {
       role: "user",
       content: trimmed,
       scopeLabel,
+      imagePreviewUrl: overrideCapture?.imageDataUrl,
     };
 
     const assistantId = `a-${Date.now()}`;
@@ -341,7 +347,12 @@ export function SpixWidget() {
 
     try {
       const pageImagesBase64: Array<{ pageNumber: number; base64: string }> = [];
-      if (effectiveScope === "DOCUMENT" && pageContext.documentId) {
+      if (overrideCapture?.imageDataUrl) {
+        pageImagesBase64.push({
+          pageNumber: overrideCapture.pageNumber || pageContext.currentPage || 1,
+          base64: overrideCapture.imageDataUrl,
+        });
+      } else if (effectiveScope === "DOCUMENT" && pageContext.documentId) {
         const pageNum = pageContext.currentPage || 1;
         const dataUrl = await renderPdfPageToDataUrl(
           pageContext.documentId,
@@ -445,6 +456,17 @@ export function SpixWidget() {
     e.preventDefault();
     await sendQuestion(question);
   }
+
+  useEffect(() => {
+    if (!pendingImagePrompt || isStreaming) return;
+    const req = pendingImagePrompt;
+    clearPendingImagePrompt();
+    void sendQuestion(req.prompt, {
+      imageDataUrl: req.imageDataUrl,
+      pageNumber: req.pageNumber,
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingImagePrompt]);
 
   return (
     <>
@@ -652,6 +674,16 @@ export function SpixWidget() {
                       (isStreaming ? "Analyse en cours..." : "")}
                   </div>
 
+                  {turn.imagePreviewUrl && (
+                    <div className="mt-2 border border-border bg-card p-1.5">
+                      <img
+                        src={turn.imagePreviewUrl}
+                        alt="Capture de page PDF"
+                        className="max-h-36 w-auto border border-border object-contain"
+                      />
+                    </div>
+                  )}
+
                   {turn.artifact && (
                     <div className="mt-2.5">
                       <StudioArtifactViewer
@@ -775,15 +807,11 @@ export function SpixWidget() {
             ? `Spix (UE : ${pageContext.ueCode || ""})`
             : "Spix (Assistant IA)"
         }
-        className="fixed bottom-5 right-5 z-50 flex h-14 w-14 flex-col items-center justify-center border border-ink bg-ink text-card transition-colors hover:bg-ink/90 sm:bottom-6 sm:right-6"
+        className="fixed bottom-5 right-5 z-50 flex h-14 w-14 items-center justify-center border border-ink bg-ink text-card transition-colors hover:bg-ink/90 sm:bottom-6 sm:right-6"
         style={{ borderTop: `3px solid ${accentColor}` }}
       >
-        <Sparkles className="h-4 w-4" />
-        <span className="mt-0.5 font-mono text-[10px] font-bold uppercase tracking-wider">
+        <span className="font-mono text-xs font-bold uppercase tracking-wider">
           SPIX
-        </span>
-        <span className="font-mono text-[8px] uppercase tracking-widest text-card/75">
-          {squareBadgeText}
         </span>
       </button>
     </>

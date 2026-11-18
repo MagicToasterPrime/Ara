@@ -1,6 +1,10 @@
 import crypto from "node:crypto";
 import { prisma } from "@/lib/prisma";
+import { formatExamBadge } from "@/lib/class-levels";
+import { getUserErrorBook } from "@/lib/error-book";
 import { checkOllamaHealth, getOllamaConfig } from "@/lib/ollama";
+import { getAllUeMetaMap } from "@/lib/ue-meta";
+import { getUserAccountMeta } from "@/lib/user-schema";
 
 export type QuestionType = "QCU" | "QCM" | "FILL_BLANK" | "IMAGE_POINT";
 
@@ -10,6 +14,7 @@ export interface RevisionQuestion {
   ueId: string;
   ueCode: string;
   ueTitle: string;
+  chapterId?: string;
   chapterTitle: string;
   documentId: string;
   documentTitle: string;
@@ -252,6 +257,7 @@ function buildFallbackQCU(
     ueId: chunk.ueId,
     ueCode: chunk.ueCode,
     ueTitle: chunk.ueTitle,
+    chapterId: chunk.chapterId,
     chapterTitle: chunk.chapterTitle,
     documentId: chunk.documentId,
     documentTitle: chunk.documentTitle,
@@ -310,6 +316,7 @@ function buildFallbackQCM(
     ueId: chunk.ueId,
     ueCode: chunk.ueCode,
     ueTitle: chunk.ueTitle,
+    chapterId: chunk.chapterId,
     chapterTitle: chunk.chapterTitle,
     documentId: chunk.documentId,
     documentTitle: chunk.documentTitle,
@@ -370,6 +377,7 @@ function buildFallbackFillBlank(
     ueId: chunk.ueId,
     ueCode: chunk.ueCode,
     ueTitle: chunk.ueTitle,
+    chapterId: chunk.chapterId,
     chapterTitle: chunk.chapterTitle,
     documentId: chunk.documentId,
     documentTitle: chunk.documentTitle,
@@ -404,6 +412,7 @@ function buildImagePointQuestion(chunk: SampledChunk): RevisionQuestion {
     ueId: chunk.ueId,
     ueCode: chunk.ueCode,
     ueTitle: chunk.ueTitle,
+    chapterId: chunk.chapterId,
     chapterTitle: chunk.chapterTitle,
     documentId: chunk.documentId,
     documentTitle: chunk.documentTitle,
@@ -570,9 +579,23 @@ Format JSON exact attendu :
   }
 }
 
-export async function generateQuizQuestions(): Promise<RevisionQuestion[]> {
+export async function generateQuizQuestions(options?: {
+  userId?: string;
+  ueId?: string;
+  count?: number;
+}): Promise<RevisionQuestion[]> {
+  const requestedCount = Math.max(4, Math.min(20, options?.count || 4));
   const rawChunks = await prisma.documentChunk.findMany({
-    take: 80,
+    where: options?.ueId
+      ? {
+          document: {
+            chapter: {
+              ueId: options.ueId,
+            },
+          },
+        }
+      : undefined,
+    take: 140,
     include: {
       document: {
         select: {
@@ -613,21 +636,78 @@ export async function generateQuizQuestions(): Promise<RevisionQuestion[]> {
       ueTitle: c.document.chapter.ue.title,
     }));
 
-  const pool = shuffle(mapped.length > 0 ? mapped : rawChunks.map((c) => ({
-    id: c.id,
-    content: c.content.trim() || c.document.title,
-    pageNumber: c.pageNumber,
-    documentId: c.document.id,
-    documentTitle: c.document.title,
-    fileName: c.document.fileName,
-    chapterId: c.document.chapter.id,
-    chapterTitle: c.document.chapter.title,
-    ueId: c.document.chapter.ue.id,
-    ueCode: c.document.chapter.ue.code,
-    ueTitle: c.document.chapter.ue.title,
-  })));
+  const baseList: SampledChunk[] =
+    mapped.length > 0
+      ? mapped
+      : rawChunks.map((c) => ({
+          id: c.id,
+          content: c.content.trim() || c.document.title,
+          pageNumber: c.pageNumber,
+          documentId: c.document.id,
+          documentTitle: c.document.title,
+          fileName: c.document.fileName,
+          chapterId: c.document.chapter.id,
+          chapterTitle: c.document.chapter.title,
+          ueId: c.document.chapter.ue.id,
+          ueCode: c.document.chapter.ue.code,
+          ueTitle: c.document.chapter.ue.title,
+        }));
 
-  // Prefer distinct chapters across UEs
+  // Priority scoring: user's classLevel + upcoming exams + errorBook weak chapters
+  let priorityClass: string | null = null;
+  const weakChapterKeys = new Set<string>();
+  const urgentUeIds = new Set<string>();
+
+  if (!options?.ueId && options?.userId) {
+    try {
+      const [userMeta, errorBook, ueMetaMap] = await Promise.all([
+        getUserAccountMeta(options.userId),
+        getUserErrorBook(options.userId),
+        getAllUeMetaMap(),
+      ]);
+      priorityClass = userMeta.classLevel;
+      for (const wc of errorBook.weakChapters) {
+        if (wc.activeItems > 0) {
+          weakChapterKeys.add(`${wc.ueId}::${wc.chapterTitle}`);
+        }
+      }
+      ueMetaMap.forEach((meta, id) => {
+        const badge = formatExamBadge(meta.examType, meta.examDate);
+        if (
+          badge.daysRemaining !== null &&
+          badge.daysRemaining >= 0 &&
+          badge.daysRemaining <= 21
+        ) {
+          urgentUeIds.add(id);
+        }
+      });
+
+      const classFiltered = baseList.filter(
+        (c) => ueMetaMap.get(c.ueId)?.classLevel === priorityClass
+      );
+      if (classFiltered.length >= 2) {
+        baseList.splice(0, baseList.length, ...classFiltered);
+      }
+    } catch {
+      // Fallback safely to baseList
+    }
+  }
+
+  // Sort with randomized jitter + priority boost for weak chapters and approaching exams
+  const pool = baseList
+    .map((chunk) => {
+      const isWeak = weakChapterKeys.has(
+        `${chunk.ueId}::${chunk.chapterTitle}`
+      );
+      const isUrgent = urgentUeIds.has(chunk.ueId);
+      const weight =
+        Math.random() * 10 + (isWeak ? 8 : 0) + (isUrgent ? 5 : 0);
+      return { chunk, weight };
+    })
+    .sort((a, b) => b.weight - a.weight)
+    .map((item) => item.chunk);
+
+  // Prefer distinct chapters across UEs up to requestedCount
   const selected: SampledChunk[] = [];
   const usedChapters = new Set<string>();
   for (const item of pool) {
@@ -635,48 +715,54 @@ export async function generateQuizQuestions(): Promise<RevisionQuestion[]> {
       usedChapters.add(item.chapterId);
       selected.push(item);
     }
-    if (selected.length >= 4) break;
+    if (selected.length >= requestedCount) break;
   }
-  while (selected.length < 4) {
-    selected.push(pool[selected.length % pool.length]);
+  let fallbackCursor = 0;
+  while (selected.length < requestedCount) {
+    selected.push(pool[fallbackCursor % pool.length]);
+    fallbackCursor += 1;
   }
 
-  const [c1, c2, c3, c4] = selected;
+  const questions: RevisionQuestion[] = [];
+  const batchCount = Math.ceil(requestedCount / 4);
 
-  const fallbackQcu = buildFallbackQCU(c1, pool);
-  const fallbackQcm = buildFallbackQCM(c2, pool);
-  const fallbackFill = buildFallbackFillBlank(c3, pool);
-  const imagePointQ = buildImagePointQuestion(c4);
+  for (let b = 0; b < batchCount; b += 1) {
+    const c1 = selected[b * 4] || pool[0];
+    const c2 = selected[b * 4 + 1] || pool[1 % pool.length];
+    const c3 = selected[b * 4 + 2] || pool[2 % pool.length];
+    const c4 = selected[b * 4 + 3] || pool[3 % pool.length];
 
-  const aiEnriched = await tryOllamaQuizEnrichment(c1, c2, c3);
+    const fallbackQcu = buildFallbackQCU(c1, pool);
+    const fallbackQcm = buildFallbackQCM(c2, pool);
+    const fallbackFill = buildFallbackFillBlank(c3, pool);
+    const imagePointQ = buildImagePointQuestion(c4);
 
-  const qcuQuestion: RevisionQuestion = aiEnriched?.qcu
-    ? {
-        ...fallbackQcu,
-        ...aiEnriched.qcu,
-      }
-    : fallbackQcu;
+    if (b === 0) {
+      const aiEnriched = await tryOllamaQuizEnrichment(c1, c2, c3);
+      questions.push(
+        aiEnriched?.qcu ? { ...fallbackQcu, ...aiEnriched.qcu } : fallbackQcu,
+        aiEnriched?.qcm
+          ? { ...fallbackQcm, ...aiEnriched.qcm }
+          : fallbackQCMQuestionFix(fallbackQcm),
+        aiEnriched?.fillBlank
+          ? {
+              ...fallbackFill,
+              ...aiEnriched.fillBlank,
+              wordBank:
+                aiEnriched.fillBlank.wordBank &&
+                aiEnriched.fillBlank.wordBank.length >= 2
+                  ? aiEnriched.fillBlank.wordBank
+                  : fallbackFill.wordBank,
+            }
+          : fallbackFill,
+        imagePointQ
+      );
+    } else {
+      questions.push(fallbackQcu, fallbackQcm, fallbackFill, imagePointQ);
+    }
+  }
 
-  const qcmQuestion: RevisionQuestion = aiEnriched?.qcm
-    ? {
-        ...fallbackQcm,
-        ...aiEnriched.qcm,
-      }
-    : fallbackQCMQuestionFix(fallbackQcm);
-
-  const fillQuestion: RevisionQuestion = aiEnriched?.fillBlank
-    ? {
-        ...fallbackFill,
-        ...aiEnriched.fillBlank,
-        wordBank:
-          aiEnriched.fillBlank.wordBank &&
-          aiEnriched.fillBlank.wordBank.length >= 2
-            ? aiEnriched.fillBlank.wordBank
-            : fallbackFill.wordBank,
-      }
-    : fallbackFill;
-
-  return [qcuQuestion, qcmQuestion, fillQuestion, imagePointQ];
+  return questions.slice(0, requestedCount);
 }
 
 function fallbackQCMQuestionFix(q: RevisionQuestion): RevisionQuestion {

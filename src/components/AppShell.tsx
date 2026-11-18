@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { signOut, useSession } from "next-auth/react";
@@ -9,21 +9,37 @@ import {
   Flame,
   LogOut,
   PenTool,
+  Search,
   Settings,
   User as UserIcon,
 } from "lucide-react";
+import { GlobalSearchModal } from "@/components/GlobalSearchModal";
 import { SpixWidget } from "@/components/SpixWidget";
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { data: session, status } = useSession();
   const pathname = usePathname();
   const router = useRouter();
+  const [searchOpen, setSearchOpen] = useState(false);
 
   useEffect(() => {
     if (status === "unauthenticated") {
       router.replace("/login");
     }
   }, [status, router]);
+
+  useEffect(() => {
+    function handleShortcut(e: KeyboardEvent) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setSearchOpen((prev) => !prev);
+      } else if (e.key === "Escape") {
+        setSearchOpen(false);
+      }
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, []);
 
   if (status === "loading" || status === "unauthenticated") {
     return (
@@ -99,8 +115,22 @@ export function AppShell({ children }: { children: ReactNode }) {
 
           {/* Right Controls */}
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSearchOpen(true)}
+              className="inline-flex items-center gap-2 border border-border bg-paper px-2.5 py-1 font-mono text-[11px] uppercase tracking-wider text-stone transition-colors hover:border-ink hover:text-ink"
+              title="Recherche globale (Ctrl+K)"
+            >
+              <Search className="h-3.5 w-3.5" />
+              <span className="hidden sm:inline">RECHERCHER</span>
+              <span className="border border-border bg-card px-1 text-[9px] text-ink">
+                CTRL+K
+              </span>
+            </button>
+
             <span className="border border-border bg-paper px-2.5 py-1 font-mono text-[11px] uppercase tracking-wider text-ink">
               {isYearAdmin ? "[RESP. D'ANNÉE]" : "[ÉTUDIANT]"}
+              {user?.classLevel ? ` · ${user.classLevel}` : ""}
             </span>
 
             {isYearAdmin && (
@@ -172,6 +202,12 @@ export function AppShell({ children }: { children: ReactNode }) {
           </span>
         </div>
       </footer>
+
+      {/* Global Search Modal (Ctrl+K) */}
+      <GlobalSearchModal
+        isOpen={searchOpen}
+        onClose={() => setSearchOpen(false)}
+      />
 
       {/* Floating Context-Aware Spix Square */}
       <SpixWidget />

@@ -162,7 +162,7 @@ function WhiteboardDirectoryContent() {
       <div className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-4">
         <div>
           <h1 className="text-lg font-bold tracking-tight text-ink">
-            MES TABLEAUX BLANCS (TLDRAW)
+            MES TABLEAUX BLANCS COLLABORATIFS
           </h1>
           <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
             [ ESPACE PERSONNEL PRIVÉ/PUBLIC · INTÉGRATION PAR LES RESPONSABLES D&apos;UE ]

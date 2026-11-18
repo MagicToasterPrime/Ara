@@ -60,6 +60,12 @@ interface CommunityQuizSectionProps {
   canManageFixedUe?: boolean;
   ues?: UEOption[];
   documents?: PdfPickerDoc[];
+  initialCapture?: {
+    id: string;
+    imageDataUrl: string;
+    title: string;
+  } | null;
+  onConsumeInitialCapture?: () => void;
 }
 
 type PlayerAnswer =
@@ -72,6 +78,8 @@ export function CommunityQuizSection({
   canManageFixedUe = false,
   ues = [],
   documents = [],
+  initialCapture,
+  onConsumeInitialCapture,
 }: CommunityQuizSectionProps) {
   const { data: session } = useSession();
 
@@ -154,6 +162,23 @@ export function CommunityQuizSection({
   useEffect(() => {
     void fetchQuizzes();
   }, [fetchQuizzes]);
+
+  useEffect(() => {
+    if (!initialCapture) return;
+    setEditorOpen(true);
+    setQuizTitle((prev) => prev || initialCapture.title);
+    setDraftQuestions([
+      {
+        id: `cq-${Date.now()}`,
+        type: "IMAGE_OCCLUSION",
+        prompt: "Légendez chaque zone masquée sur ce schéma capturé :",
+        imageDataUrl: initialCapture.imageDataUrl,
+        masks: [],
+        showWordBank: true,
+      },
+    ]);
+    onConsumeInitialCapture?.();
+  }, [initialCapture, onConsumeInitialCapture]);
 
   function addDraftQuestion(type: CustomQuestionType) {
     const base: CustomQuizQuestion =

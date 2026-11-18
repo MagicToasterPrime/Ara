@@ -3,6 +3,7 @@ import Credentials from "next-auth/providers/credentials";
 import bcrypt from "bcryptjs";
 import type { GlobalRole } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { type ClassLevel, getUserAccountMeta } from "@/lib/user-schema";
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   session: {
@@ -44,11 +45,17 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
           return null;
         }
 
+        const meta = await getUserAccountMeta(user.id);
+        if (!meta.isApproved && user.globalRole !== "YEAR_ADMIN") {
+          return null;
+        }
+
         return {
           id: user.id,
           email: user.email,
           name: user.name,
           globalRole: user.globalRole,
+          classLevel: meta.classLevel,
         };
       },
     }),
@@ -60,6 +67,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         token.email = user.email;
         token.name = user.name;
         token.globalRole = user.globalRole;
+        token.classLevel = user.classLevel;
       }
       return token;
     },
@@ -70,6 +78,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
         session.user.name = (token.name as string) || "";
         session.user.globalRole =
           (token.globalRole as GlobalRole) || "STUDENT";
+        session.user.classLevel = (token.classLevel as ClassLevel) || "VET2";
       }
       return session;
     },
@@ -81,6 +90,8 @@ export interface CurrentUser {
   email: string;
   name: string;
   globalRole: GlobalRole;
+  classLevel: ClassLevel;
+  isApproved: boolean;
   ueRoles: Array<{ ueId: string; role: "UE_MANAGER" }>;
 }
 
@@ -106,7 +117,20 @@ export async function getCurrentUser(): Promise<CurrentUser | null> {
     },
   });
 
-  return user;
+  if (!user) {
+    return null;
+  }
+
+  const meta = await getUserAccountMeta(user.id);
+  if (!meta.isApproved && user.globalRole !== "YEAR_ADMIN") {
+    return null;
+  }
+
+  return {
+    ...user,
+    classLevel: meta.classLevel,
+    isApproved: user.globalRole === "YEAR_ADMIN" ? true : meta.isApproved,
+  };
 }
 
 export async function canManageUE(

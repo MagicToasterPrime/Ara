@@ -1,22 +1,36 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import * as pdfjsLib from "pdfjs-dist";
-import type { PDFDocumentProxy, RenderTask } from "pdfjs-dist/types/src/display/api";
+import type {
+  PDFDocumentProxy,
+  RenderTask,
+} from "pdfjs-dist/types/src/display/api";
 import {
+  Bookmark,
+  Check,
   ChevronLeft,
   ChevronRight,
+  Crop,
   Download,
   FileText,
+  Highlighter,
+  ImagePlus,
   List,
   Loader2,
   Maximize2,
   Minimize2,
+  PenTool,
+  Save,
   Search,
+  Sparkles,
+  StickyNote,
   X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+import { useSpix } from "@/components/SpixContext";
 
 interface DocumentChunkPreview {
   id: string;
@@ -24,29 +38,62 @@ interface DocumentChunkPreview {
   content: string;
 }
 
+export interface PdfHighlightRect {
+  id: string;
+  xPct: number;
+  yPct: number;
+  wPct: number;
+  hPct: number;
+}
+
+export interface PdfPageAnnotation {
+  pageNumber: number;
+  isBookmarked: boolean;
+  noteText: string;
+  highlights: PdfHighlightRect[];
+  updatedAt?: string;
+}
+
+interface CaptureBoxPx {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 export interface CustomPdfReaderProps {
   documentId: string;
+  ueId?: string;
   title: string;
   fileName: string;
   initialPage?: number;
   pageCountHint?: number;
   onPageChange?: (page: number, totalPages: number) => void;
+  onCreateQuizFromCapture?: (imageDataUrl: string, pageNumber: number) => void;
   onClose: () => void;
 }
 
 export function CustomPdfReader({
   documentId,
+  ueId,
   title,
   fileName,
   initialPage = 1,
   pageCountHint = 1,
   onPageChange,
+  onCreateQuizFromCapture,
   onClose,
 }: CustomPdfReaderProps) {
+  const { triggerSpixImagePrompt } = useSpix();
+
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
   const [totalPages, setTotalPages] = useState<number>(pageCountHint);
-  const [currentPage, setCurrentPage] = useState<number>(Math.max(1, initialPage));
-  const [pageInput, setPageInput] = useState<string>(String(Math.max(1, initialPage)));
+  const [currentPage, setCurrentPage] = useState<number>(
+    Math.max(1, initialPage)
+  );
+  const [pageInput, setPageInput] = useState<string>(
+    String(Math.max(1, initialPage))
+  );
 
   const [zoomMode, setZoomMode] = useState<"FIT" | "MANUAL">("FIT");
   const [manualScale, setManualScale] = useState<number>(1.1);
@@ -57,6 +104,7 @@ export function CustomPdfReader({
   const [docError, setDocError] = useState<string | null>(null);
 
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
+  const [sidebarTab, setSidebarTab] = useState<"INDEX" | "NOTES">("INDEX");
   const [viewMode, setViewMode] = useState<"CANVAS" | "TEXT">("CANVAS");
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
 
@@ -64,13 +112,37 @@ export function CustomPdfReader({
   const [searchQuery, setSearchQuery] = useState<string>("");
   const [livePageText, setLivePageText] = useState<string>("");
 
+  // Annotations & Bookmarks
+  const [annotationsByPage, setAnnotationsByPage] = useState<
+    Record<number, PdfPageAnnotation>
+  >({});
+  const [noteDraft, setNoteDraft] = useState<string>("");
+  const [savingNote, setSavingNote] = useState<boolean>(false);
+  const [noteSavedFeedback, setNoteSavedFeedback] = useState<boolean>(false);
+
+  // Zone Capture State
+  const [captureMode, setCaptureMode] = useState<boolean>(false);
+  const [isDraggingCapture, setIsDraggingCapture] = useState<boolean>(false);
+  const captureStartRef = useRef<{ x: number; y: number } | null>(null);
+  const [captureRectPx, setCaptureRectPx] = useState<CaptureBoxPx | null>(null);
+  const [capturedImageUrl, setCapturedImageUrl] = useState<string | null>(null);
+  const [sendingToWb, setSendingToWb] = useState<boolean>(false);
+  const [createdWbLink, setCreatedWbLink] = useState<{
+    id: string;
+    title: string;
+  } | null>(null);
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayRef = useRef<HTMLDivElement | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const renderTaskRef = useRef<RenderTask | null>(null);
 
-  // Sync external initialPage updates (e.g. clicking a Spix citation badge)
+  // Sync external initialPage updates (e.g. clicking a Spix / Search citation badge)
   useEffect(() => {
-    const safe = Math.max(1, Math.min(initialPage, totalPages || initialPage));
+    const safe = Math.max(
+      1,
+      Math.min(initialPage, totalPages || initialPage)
+    );
     setCurrentPage(safe);
     setPageInput(String(safe));
   }, [initialPage, totalPages]);
@@ -134,7 +206,7 @@ export function CustomPdfReader({
     };
   }, [documentId]);
 
-  // Load extracted chunks for in-document search
+  // Load extracted chunks + personal annotations
   useEffect(() => {
     let active = true;
     fetch(`/api/documents/${documentId}`, { cache: "no-store" })
@@ -148,10 +220,31 @@ export function CustomPdfReader({
       )
       .catch(() => {});
 
+    fetch(`/api/documents/${documentId}/annotations`, { cache: "no-store" })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { annotations?: PdfPageAnnotation[] } | null) => {
+        if (active && data?.annotations) {
+          const map: Record<number, PdfPageAnnotation> = {};
+          for (const a of data.annotations) {
+            map[a.pageNumber] = a;
+          }
+          setAnnotationsByPage(map);
+        }
+      })
+      .catch(() => {});
+
     return () => {
       active = false;
     };
   }, [documentId]);
+
+  // Keep draft note aligned with currentPage & clear pending capture when turning pages
+  useEffect(() => {
+    setNoteDraft(annotationsByPage[currentPage]?.noteText || "");
+    setCaptureRectPx(null);
+    setCapturedImageUrl(null);
+    setNoteSavedFeedback(false);
+  }, [currentPage, annotationsByPage]);
 
   // Notify parent / Spix whenever currentPage or totalPages changes
   useEffect(() => {
@@ -173,7 +266,6 @@ export function CustomPdfReader({
         const page = await pdfDoc.getPage(currentPage);
         if (cancelled) return;
 
-        // Extract selectable text for TEXT mode
         const textContent = await page.getTextContent();
         if (!cancelled) {
           const textLines = textContent.items
@@ -273,13 +365,261 @@ export function CustomPdfReader({
         goToPage(currentPage - 1);
       } else if (e.key === "ArrowRight") {
         goToPage(currentPage + 1);
-      } else if (e.key === "Escape" && isFullscreen) {
-        setIsFullscreen(false);
+      } else if (e.key === "Escape") {
+        if (captureRectPx) {
+          setCaptureRectPx(null);
+          setCapturedImageUrl(null);
+        } else if (captureMode) {
+          setCaptureMode(false);
+        } else if (isFullscreen) {
+          setIsFullscreen(false);
+        }
       }
     }
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [currentPage, goToPage, isFullscreen]);
+  }, [currentPage, goToPage, isFullscreen, captureMode, captureRectPx]);
+
+  const currentAnnotation: PdfPageAnnotation = annotationsByPage[currentPage] || {
+    pageNumber: currentPage,
+    isBookmarked: false,
+    noteText: "",
+    highlights: [],
+  };
+
+  const savedPagesList = useMemo(() => {
+    return Object.values(annotationsByPage)
+      .filter(
+        (a) =>
+          a.isBookmarked ||
+          a.noteText.trim().length > 0 ||
+          (a.highlights && a.highlights.length > 0)
+      )
+      .sort((a, b) => a.pageNumber - b.pageNumber);
+  }, [annotationsByPage]);
+
+  async function savePageAnnotation(next: PdfPageAnnotation) {
+    setSavingNote(true);
+    try {
+      const res = await fetch(`/api/documents/${documentId}/annotations`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(next),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as {
+          annotations?: PdfPageAnnotation[];
+        };
+        if (data.annotations) {
+          const map: Record<number, PdfPageAnnotation> = {};
+          for (const a of data.annotations) {
+            map[a.pageNumber] = a;
+          }
+          setAnnotationsByPage(map);
+        }
+        setNoteSavedFeedback(true);
+        setTimeout(() => setNoteSavedFeedback(false), 1800);
+      }
+    } finally {
+      setSavingNote(false);
+    }
+  }
+
+  async function handleToggleBookmark() {
+    await savePageAnnotation({
+      ...currentAnnotation,
+      pageNumber: currentPage,
+      isBookmarked: !currentAnnotation.isBookmarked,
+    });
+  }
+
+  async function handleSaveNoteText() {
+    await savePageAnnotation({
+      ...currentAnnotation,
+      pageNumber: currentPage,
+      noteText: noteDraft,
+    });
+  }
+
+  async function handleRemoveHighlight(highlightId: string) {
+    await savePageAnnotation({
+      ...currentAnnotation,
+      pageNumber: currentPage,
+      highlights: (currentAnnotation.highlights || []).filter(
+        (h) => h.id !== highlightId
+      ),
+    });
+  }
+
+  // Rectangular zone capture handlers
+  function getOverlayRelativePos(e: React.PointerEvent<HTMLDivElement>) {
+    const rect = overlayRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0, width: 1, height: 1 };
+    const x = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+    const y = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
+    return { x, y, width: rect.width, height: rect.height };
+  }
+
+  function handleCapturePointerDown(e: React.PointerEvent<HTMLDivElement>) {
+    if (!captureMode || e.button !== 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    const pos = getOverlayRelativePos(e);
+    captureStartRef.current = { x: pos.x, y: pos.y };
+    setCapturedImageUrl(null);
+    setCreatedWbLink(null);
+    setCaptureRectPx({ x: pos.x, y: pos.y, w: 0, h: 0 });
+    setIsDraggingCapture(true);
+  }
+
+  function handleCapturePointerMove(e: React.PointerEvent<HTMLDivElement>) {
+    if (!isDraggingCapture || !captureStartRef.current) return;
+    const pos = getOverlayRelativePos(e);
+    const sx = captureStartRef.current.x;
+    const sy = captureStartRef.current.y;
+    setCaptureRectPx({
+      x: Math.min(sx, pos.x),
+      y: Math.min(sy, pos.y),
+      w: Math.abs(pos.x - sx),
+      h: Math.abs(pos.y - sy),
+    });
+  }
+
+  function handleCapturePointerUp(e: React.PointerEvent<HTMLDivElement>) {
+    if (!isDraggingCapture) return;
+    setIsDraggingCapture(false);
+    captureStartRef.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // Ignore
+    }
+
+    if (
+      !captureRectPx ||
+      captureRectPx.w < 16 ||
+      captureRectPx.h < 16 ||
+      !canvasRef.current ||
+      !overlayRef.current
+    ) {
+      setCaptureRectPx(null);
+      return;
+    }
+
+    const canvas = canvasRef.current;
+    const displayRect = overlayRef.current.getBoundingClientRect();
+    const scaleX = canvas.width / Math.max(1, displayRect.width);
+    const scaleY = canvas.height / Math.max(1, displayRect.height);
+
+    const sx = Math.floor(captureRectPx.x * scaleX);
+    const sy = Math.floor(captureRectPx.y * scaleY);
+    const sw = Math.max(10, Math.floor(captureRectPx.w * scaleX));
+    const sh = Math.max(10, Math.floor(captureRectPx.h * scaleY));
+
+    const offscreen = document.createElement("canvas");
+    offscreen.width = sw;
+    offscreen.height = sh;
+    const ctx = offscreen.getContext("2d");
+    if (ctx) {
+      ctx.fillStyle = "#FFFFFF";
+      ctx.fillRect(0, 0, sw, sh);
+      ctx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+      setCapturedImageUrl(offscreen.toDataURL("image/png"));
+    }
+  }
+
+  async function handleSendCaptureToWhiteboard() {
+    if (!capturedImageUrl || sendingToWb) return;
+    setSendingToWb(true);
+    try {
+      const boardTitle = `${title.slice(0, 28)} · Fig. P.${currentPage}`;
+      const createRes = await fetch("/api/whiteboards", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: boardTitle,
+          ueId: ueId || null,
+          isPublic: false,
+        }),
+      });
+      if (!createRes.ok) return;
+      const createData = (await createRes.json()) as {
+        whiteboard?: { id: string; title: string };
+      };
+      if (!createData.whiteboard) return;
+
+      const dims = await new Promise<{ w: number; h: number }>((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          const maxW = 540;
+          const scale = img.width > maxW ? maxW / img.width : 1;
+          resolve({
+            w: Math.round(img.width * scale),
+            h: Math.round(img.height * scale),
+          });
+        };
+        img.onerror = () => resolve({ w: 420, h: 300 });
+        img.src = capturedImageUrl;
+      });
+
+      const snapshot = {
+        version: 2,
+        background: "DOTS",
+        elements: [
+          {
+            id: `el-pdf-${Date.now()}`,
+            type: "image",
+            x: 120,
+            y: 80,
+            width: dims.w,
+            height: dims.h,
+            dataUrl: capturedImageUrl,
+            caption: `${fileName} · PAGE ${currentPage}`,
+            strokeColor: "#1A1A1A",
+            fillColor: "#FCFBF9",
+            strokeWidth: 1.5,
+            dash: "solid",
+            opacity: 1,
+          },
+        ],
+      };
+
+      await fetch(`/api/whiteboards/${createData.whiteboard.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ snapshotData: JSON.stringify(snapshot) }),
+      });
+
+      setCreatedWbLink({
+        id: createData.whiteboard.id,
+        title: createData.whiteboard.title,
+      });
+    } finally {
+      setSendingToWb(false);
+    }
+  }
+
+  async function handleSaveZoneAsHighlight() {
+    if (!captureRectPx || !overlayRef.current) return;
+    const rect = overlayRef.current.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+
+    const newHighlight: PdfHighlightRect = {
+      id: `hl-${Date.now()}`,
+      xPct: Number(((captureRectPx.x / rect.width) * 100).toFixed(2)),
+      yPct: Number(((captureRectPx.y / rect.height) * 100).toFixed(2)),
+      wPct: Number(((captureRectPx.w / rect.width) * 100).toFixed(2)),
+      hPct: Number(((captureRectPx.h / rect.height) * 100).toFixed(2)),
+    };
+
+    await savePageAnnotation({
+      ...currentAnnotation,
+      pageNumber: currentPage,
+      highlights: [...(currentAnnotation.highlights || []), newHighlight],
+    });
+
+    setCaptureRectPx(null);
+    setCapturedImageUrl(null);
+  }
 
   const searchResults = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
@@ -340,15 +680,34 @@ export function CustomPdfReader({
         <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
-            onClick={() => setSidebarOpen((p) => !p)}
+            onClick={() => {
+              setSidebarOpen((p) => (sidebarTab === "INDEX" ? !p : true));
+              setSidebarTab("INDEX");
+            }}
             className={`inline-flex items-center gap-1 border px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider ${
-              sidebarOpen
+              sidebarOpen && sidebarTab === "INDEX"
                 ? "border-card bg-card text-ink"
                 : "border-card/30 text-card hover:bg-card/10"
             }`}
           >
             <List className="h-3 w-3" />
             <span>INDEX &amp; RECHERCHE</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setSidebarOpen((p) => (sidebarTab === "NOTES" ? !p : true));
+              setSidebarTab("NOTES");
+            }}
+            className={`inline-flex items-center gap-1 border px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider ${
+              sidebarOpen && sidebarTab === "NOTES"
+                ? "border-card bg-card text-ink"
+                : "border-card/30 text-card hover:bg-card/10"
+            }`}
+          >
+            <StickyNote className="h-3 w-3" />
+            <span>NOTES ({savedPagesList.length})</span>
           </button>
 
           <button
@@ -399,9 +758,9 @@ export function CustomPdfReader({
         </div>
       </div>
 
-      {/* Control Toolbar (Pagination + Zoom) */}
+      {/* Control Toolbar (Pagination + Capture/Bookmark + Zoom) */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-4 py-2">
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
             onClick={() => goToPage(currentPage - 1)}
@@ -445,6 +804,47 @@ export function CustomPdfReader({
             <span>SUIV.</span>
             <ChevronRight className="h-3.5 w-3.5" />
           </button>
+
+          <div className="mx-1 hidden h-4 w-px bg-border sm:block" />
+
+          {/* Capture Zone Tool */}
+          {viewMode === "CANVAS" && (
+            <button
+              type="button"
+              onClick={() => {
+                setCaptureMode((p) => !p);
+                setCaptureRectPx(null);
+                setCapturedImageUrl(null);
+              }}
+              className={`inline-flex items-center gap-1 border px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider transition-colors ${
+                captureMode
+                  ? "border-amber bg-amber text-card"
+                  : "border-border bg-card text-ink hover:border-ink"
+              }`}
+              title="Sélectionner un schéma ou une figure sur la page"
+            >
+              <Crop className="h-3 w-3" />
+              <span>{captureMode ? "MODE CAPTURE ACTIF" : "CAPTURER ZONE"}</span>
+            </button>
+          )}
+
+          {/* Page Bookmark Toggle */}
+          <button
+            type="button"
+            disabled={savingNote}
+            onClick={handleToggleBookmark}
+            className={`inline-flex items-center gap-1 border px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider transition-colors ${
+              currentAnnotation.isBookmarked
+                ? "border-ink bg-ink text-card"
+                : "border-border bg-card text-ink hover:border-ink"
+            }`}
+            title="Épingler cette page dans vos favoris"
+          >
+            <Bookmark className="h-3 w-3" />
+            <span>
+              {currentAnnotation.isBookmarked ? "PAGE ÉPINGLÉE" : "ÉPINGLER"}
+            </span>
+          </button>
         </div>
 
         {/* Zoom Controls */}
@@ -454,7 +854,9 @@ export function CustomPdfReader({
               type="button"
               onClick={() => {
                 setZoomMode("MANUAL");
-                setManualScale((s) => Math.max(0.6, Number((s - 0.15).toFixed(2))));
+                setManualScale((s) =>
+                  Math.max(0.6, Number((s - 0.15).toFixed(2)))
+                );
               }}
               title="Zoom arrière"
               className="border border-border bg-card p-1.5 text-ink hover:border-ink"
@@ -472,7 +874,9 @@ export function CustomPdfReader({
               type="button"
               onClick={() => {
                 setZoomMode("MANUAL");
-                setManualScale((s) => Math.min(2.2, Number((s + 0.15).toFixed(2))));
+                setManualScale((s) =>
+                  Math.min(2.2, Number((s + 0.15).toFixed(2)))
+                );
               }}
               title="Zoom avant"
               className="border border-border bg-card p-1.5 text-ink hover:border-ink"
@@ -495,81 +899,319 @@ export function CustomPdfReader({
         )}
       </div>
 
+      {/* Created Whiteboard Confirmation Strip */}
+      {createdWbLink && (
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-badge-bg px-4 py-2 text-badge-text">
+          <span className="font-mono text-[11px] uppercase tracking-wider">
+            CAPTURE IMPORTÉE DANS LE TABLEAU BLANC « {createdWbLink.title} »
+          </span>
+          <div className="flex items-center gap-2">
+            <Link
+              href={`/whiteboard/${createdWbLink.id}`}
+              className="border border-badge-text bg-card px-2.5 py-1 font-mono text-[10px] font-bold uppercase tracking-wider text-badge-text hover:bg-badge-text hover:text-card"
+            >
+              OUVRIR LE TABLEAU →
+            </Link>
+            <button
+              type="button"
+              onClick={() => setCreatedWbLink(null)}
+              className="p-0.5 hover:text-ink"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Active Capture Action Strip */}
+      {capturedImageUrl && (
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink bg-pinned px-4 py-2.5">
+          <div className="flex items-center gap-3">
+            <img
+              src={capturedImageUrl}
+              alt="Zone capturée"
+              className="h-12 w-16 border border-ink bg-white object-contain"
+            />
+            <div>
+              <p className="font-mono text-[11px] font-bold uppercase tracking-wider text-ink">
+                ZONE CAPTURÉE · PAGE {currentPage}
+              </p>
+              <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                CHOISISSEZ UNE ACTION CI-CONTRE
+              </p>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                triggerSpixImagePrompt({
+                  imageDataUrl: capturedImageUrl,
+                  prompt: `Explique en détail cette figure / cet extrait issu de « ${title} » (page ${currentPage}).`,
+                  pageNumber: currentPage,
+                });
+                setCaptureRectPx(null);
+                setCapturedImageUrl(null);
+                setCaptureMode(false);
+              }}
+              className="inline-flex items-center gap-1 border border-ink bg-ink px-2.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90"
+            >
+              <Sparkles className="h-3 w-3" />
+              <span>EXPLIQUER AVEC SPIX</span>
+            </button>
+
+            {onCreateQuizFromCapture && (
+              <button
+                type="button"
+                onClick={() => {
+                  onCreateQuizFromCapture(capturedImageUrl, currentPage);
+                  setCaptureRectPx(null);
+                  setCapturedImageUrl(null);
+                  setCaptureMode(false);
+                }}
+                className="inline-flex items-center gap-1 border border-badge-text bg-badge-bg px-2.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-badge-text hover:bg-badge-text hover:text-card"
+              >
+                <ImagePlus className="h-3 w-3" />
+                <span>QUIZ À LÉGENDER</span>
+              </button>
+            )}
+
+            <button
+              type="button"
+              disabled={sendingToWb}
+              onClick={handleSendCaptureToWhiteboard}
+              className="inline-flex items-center gap-1 border border-ink bg-card px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:bg-paper disabled:opacity-50"
+            >
+              <PenTool className="h-3 w-3" />
+              <span>
+                {sendingToWb ? "ENVOI..." : "VERS TABLEAU BLANC"}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              onClick={handleSaveZoneAsHighlight}
+              className="inline-flex items-center gap-1 border border-amber bg-amber/15 px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:bg-amber/30"
+            >
+              <Highlighter className="h-3 w-3" />
+              <span>SURLIGNER P.{currentPage}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setCaptureRectPx(null);
+                setCapturedImageUrl(null);
+              }}
+              className="border border-border bg-card p-1.5 text-stone hover:text-ink"
+              title="Annuler la capture"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Reader Body */}
       <div
         className={`flex min-h-0 flex-1 ${
-          isFullscreen ? "h-full" : "h-[620px]"
+          isFullscreen ? "h-full" : "h-[640px]"
         }`}
       >
-        {/* Optional Left Index & Search Sidebar */}
+        {/* Optional Left Sidebar (Index / Search OR Personal Notes & Bookmarks) */}
         {sidebarOpen && (
-          <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-paper">
-            <div className="border-b border-border p-2.5">
-              <div className="relative">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-stone" />
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Rechercher dans le PDF..."
-                  className="w-full border border-border bg-card py-1.5 pl-8 pr-2.5 text-xs text-ink placeholder:text-stone focus:border-ink focus:outline-none"
-                />
-              </div>
+          <aside className="flex w-72 shrink-0 flex-col border-r border-border bg-paper">
+            <div className="grid grid-cols-2 border-b border-border bg-card font-mono text-[10px] uppercase tracking-wider">
+              <button
+                type="button"
+                onClick={() => setSidebarTab("INDEX")}
+                className={`border-r border-border py-2 ${
+                  sidebarTab === "INDEX"
+                    ? "bg-ink font-bold text-card"
+                    : "text-stone hover:text-ink"
+                }`}
+              >
+                INDEX / CHERCHER
+              </button>
+              <button
+                type="button"
+                onClick={() => setSidebarTab("NOTES")}
+                className={`py-2 ${
+                  sidebarTab === "NOTES"
+                    ? "bg-ink font-bold text-card"
+                    : "text-stone hover:text-ink"
+                }`}
+              >
+                NOTES ({savedPagesList.length})
+              </button>
             </div>
 
-            <div className="flex-1 overflow-y-auto p-2">
-              {searchQuery.trim() ? (
-                searchResults.length === 0 ? (
-                  <p className="p-2 font-mono text-[10px] uppercase tracking-wider text-stone">
-                    AUCUNE OCCURRENCE TROUVÉE.
-                  </p>
-                ) : (
-                  <div className="space-y-1.5">
-                    <p className="px-1 font-mono text-[10px] uppercase tracking-wider text-stone">
-                      {searchResults.length} PAGE(S) TROUVÉE(S)
-                    </p>
-                    {searchResults.map((res) => (
-                      <button
-                        key={res.pageNumber}
-                        type="button"
-                        onClick={() => goToPage(res.pageNumber)}
-                        className={`block w-full border p-2 text-left transition-colors ${
-                          currentPage === res.pageNumber
-                            ? "border-ink bg-pinned"
-                            : "border-border bg-card hover:border-ink"
-                        }`}
-                      >
-                        <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-badge-text">
-                          PAGE {res.pageNumber}
-                        </span>
-                        <p className="mt-1 line-clamp-3 text-[11px] leading-snug text-ink">
-                          {res.snippet}
-                        </p>
-                      </button>
-                    ))}
+            {sidebarTab === "INDEX" ? (
+              <>
+                <div className="border-b border-border p-2.5">
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-stone" />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Rechercher dans le PDF..."
+                      className="w-full border border-border bg-card py-1.5 pl-8 pr-2.5 text-xs text-ink placeholder:text-stone focus:border-ink focus:outline-none"
+                    />
                   </div>
-                )
-              ) : (
-                <div className="grid grid-cols-3 gap-1.5">
-                  {Array.from({ length: totalPages }, (_, idx) => idx + 1).map(
-                    (pageNum) => (
-                      <button
-                        key={pageNum}
-                        type="button"
-                        onClick={() => goToPage(pageNum)}
-                        className={`border py-2 font-mono text-xs transition-colors ${
-                          currentPage === pageNum
-                            ? "border-ink bg-ink font-bold text-card"
-                            : "border-border bg-card text-ink hover:border-ink"
-                        }`}
-                      >
-                        P.{pageNum}
-                      </button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-2">
+                  {searchQuery.trim() ? (
+                    searchResults.length === 0 ? (
+                      <p className="p-2 font-mono text-[10px] uppercase tracking-wider text-stone">
+                        AUCUNE OCCURRENCE TROUVÉE.
+                      </p>
+                    ) : (
+                      <div className="space-y-1.5">
+                        <p className="px-1 font-mono text-[10px] uppercase tracking-wider text-stone">
+                          {searchResults.length} PAGE(S) TROUVÉE(S)
+                        </p>
+                        {searchResults.map((res) => (
+                          <button
+                            key={res.pageNumber}
+                            type="button"
+                            onClick={() => goToPage(res.pageNumber)}
+                            className={`block w-full border p-2 text-left transition-colors ${
+                              currentPage === res.pageNumber
+                                ? "border-ink bg-pinned"
+                                : "border-border bg-card hover:border-ink"
+                            }`}
+                          >
+                            <span className="font-mono text-[10px] font-bold uppercase tracking-wider text-badge-text">
+                              PAGE {res.pageNumber}
+                            </span>
+                            <p className="mt-1 line-clamp-3 text-[11px] leading-snug text-ink">
+                              {res.snippet}
+                            </p>
+                          </button>
+                        ))}
+                      </div>
                     )
+                  ) : (
+                    <div className="grid grid-cols-3 gap-1.5">
+                      {Array.from(
+                        { length: totalPages },
+                        (_, idx) => idx + 1
+                      ).map((pageNum) => {
+                        const meta = annotationsByPage[pageNum];
+                        return (
+                          <button
+                            key={pageNum}
+                            type="button"
+                            onClick={() => goToPage(pageNum)}
+                            className={`relative border py-2 font-mono text-xs transition-colors ${
+                              currentPage === pageNum
+                                ? "border-ink bg-ink font-bold text-card"
+                                : "border-border bg-card text-ink hover:border-ink"
+                            }`}
+                          >
+                            P.{pageNum}
+                            {meta?.isBookmarked && (
+                              <span
+                                className="absolute right-1 top-1 h-1.5 w-1.5 bg-amber"
+                                title="Page épinglée"
+                              />
+                            )}
+                          </button>
+                        );
+                      })}
+                    </div>
                   )}
                 </div>
-              )}
-            </div>
+              </>
+            ) : (
+              <div className="flex flex-1 flex-col overflow-hidden">
+                {/* Active Page Note Editor */}
+                <div className="border-b border-border bg-card p-3">
+                  <div className="mb-1.5 flex items-center justify-between font-mono text-[10px] uppercase tracking-wider">
+                    <span className="font-bold text-ink">
+                      NOTE SUR LA PAGE {currentPage}
+                    </span>
+                    {noteSavedFeedback && (
+                      <span className="inline-flex items-center gap-1 text-forest">
+                        <Check className="h-3 w-3" />
+                        SAUVÉE
+                      </span>
+                    )}
+                  </div>
+                  <textarea
+                    rows={5}
+                    value={noteDraft}
+                    onChange={(e) => setNoteDraft(e.target.value)}
+                    placeholder={`Écrivez vos remarques personnelles pour la page ${currentPage}...`}
+                    className="w-full border border-border bg-paper p-2 text-xs text-ink placeholder:text-stone focus:border-ink focus:outline-none"
+                  />
+                  <button
+                    type="button"
+                    disabled={savingNote}
+                    onClick={handleSaveNoteText}
+                    className="mt-2 inline-flex w-full items-center justify-center gap-1.5 border border-ink bg-ink px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
+                  >
+                    <Save className="h-3 w-3" />
+                    <span>
+                      {savingNote ? "ENREGISTREMENT..." : "ENREGISTRER LA NOTE"}
+                    </span>
+                  </button>
+                </div>
+
+                {/* Annotated / Bookmarked Pages List */}
+                <div className="flex-1 overflow-y-auto p-2.5">
+                  <p className="mb-2 font-mono text-[10px] font-semibold uppercase tracking-wider text-stone">
+                    PAGES ÉPINGLÉES &amp; ANNOTÉES
+                  </p>
+                  {savedPagesList.length === 0 ? (
+                    <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                      AUCUNE PAGE ANNOTÉE POUR L&apos;INSTANT.
+                    </p>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {savedPagesList.map((item) => (
+                        <button
+                          key={item.pageNumber}
+                          type="button"
+                          onClick={() => goToPage(item.pageNumber)}
+                          className={`block w-full border p-2 text-left ${
+                            currentPage === item.pageNumber
+                              ? "border-ink bg-pinned"
+                              : "border-border bg-card hover:border-ink"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-1 font-mono text-[10px] uppercase tracking-wider">
+                            <span className="font-bold text-ink">
+                              PAGE {item.pageNumber}
+                            </span>
+                            <div className="flex items-center gap-1">
+                              {item.isBookmarked && (
+                                <span className="bg-amber px-1 text-[9px] font-bold text-card">
+                                  ÉPINGLÉE
+                                </span>
+                              )}
+                              {item.highlights.length > 0 && (
+                                <span className="border border-border bg-paper px-1 text-[9px] text-stone">
+                                  {item.highlights.length} SURL.
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          {item.noteText.trim() && (
+                            <p className="mt-1 line-clamp-2 text-[11px] text-stone">
+                              {item.noteText}
+                            </p>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </aside>
         )}
 
@@ -602,6 +1244,59 @@ export function CustomPdfReader({
             <div className="flex flex-col items-center">
               <div className="relative border border-border bg-white">
                 <canvas ref={canvasRef} className="block" />
+
+                {/* Interactive Highlights + Zone Capture Layer */}
+                <div
+                  ref={overlayRef}
+                  onPointerDown={handleCapturePointerDown}
+                  onPointerMove={handleCapturePointerMove}
+                  onPointerUp={handleCapturePointerUp}
+                  className={`absolute inset-0 ${
+                    captureMode
+                      ? "cursor-crosshair"
+                      : "pointer-events-none"
+                  }`}
+                >
+                  {/* Saved User Highlights on this Page */}
+                  {(currentAnnotation.highlights || []).map((hl) => (
+                    <div
+                      key={hl.id}
+                      className="group pointer-events-auto absolute border border-amber bg-amber/20"
+                      style={{
+                        left: `${hl.xPct}%`,
+                        top: `${hl.yPct}%`,
+                        width: `${hl.wPct}%`,
+                        height: `${hl.hPct}%`,
+                      }}
+                    >
+                      <button
+                        type="button"
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          void handleRemoveHighlight(hl.id);
+                        }}
+                        title="Supprimer ce surlignage"
+                        className="absolute -right-2 -top-2 hidden h-4 w-4 items-center justify-center bg-carmine text-[10px] text-card group-hover:flex"
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+
+                  {/* Active Rectangular Capture Selection */}
+                  {captureRectPx && (
+                    <div
+                      className="absolute border-2 border-ink bg-amber/15"
+                      style={{
+                        left: captureRectPx.x,
+                        top: captureRectPx.y,
+                        width: captureRectPx.w,
+                        height: captureRectPx.h,
+                      }}
+                    />
+                  )}
+                </div>
+
                 {renderingPage && (
                   <div className="absolute right-2 top-2 border border-border bg-card/90 px-2 py-0.5 font-mono text-[10px] uppercase tracking-wider text-stone">
                     RENDU...

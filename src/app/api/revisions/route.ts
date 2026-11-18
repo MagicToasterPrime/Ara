@@ -2,6 +2,12 @@ import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import {
+  getUserErrorBook,
+  recordMissedQuestions,
+  reviewErrorBookItem,
+  type SrsRating,
+} from "@/lib/error-book";
+import {
   computeEffectiveStreak,
   ensureRevisionSchema,
   generateQuizQuestions,
@@ -23,46 +29,48 @@ function parseJsonSafe<T>(raw: string, fallback: T): T {
 async function buildPayload(userId: string) {
   const todayKey = getLocalDateKey();
 
-  const [dbUser, todaySession, chunkCount, allParticipants] = await Promise.all([
-    prisma.user.findUnique({
-      where: { id: userId },
-      select: {
-        id: true,
-        name: true,
-        revisionEnabled: true,
-        currentStreak: true,
-        bestStreak: true,
-        lastRevisionDate: true,
-        totalRevisionPoints: true,
-      },
-    }),
-    prisma.dailyRevisionSession.findUnique({
-      where: {
-        userId_dateKey: {
-          userId,
-          dateKey: todayKey,
+  const [dbUser, todaySession, chunkCount, allParticipants, errorBook] =
+    await Promise.all([
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: {
+          id: true,
+          name: true,
+          revisionEnabled: true,
+          currentStreak: true,
+          bestStreak: true,
+          lastRevisionDate: true,
+          totalRevisionPoints: true,
         },
-      },
-    }),
-    prisma.documentChunk.count(),
-    prisma.user.findMany({
-      where: {
-        OR: [
-          { revisionEnabled: true },
-          { bestStreak: { gt: 0 } },
-          { totalRevisionPoints: { gt: 0 } },
-        ],
-      },
-      select: {
-        id: true,
-        name: true,
-        currentStreak: true,
-        bestStreak: true,
-        lastRevisionDate: true,
-        totalRevisionPoints: true,
-      },
-    }),
-  ]);
+      }),
+      prisma.dailyRevisionSession.findUnique({
+        where: {
+          userId_dateKey: {
+            userId,
+            dateKey: todayKey,
+          },
+        },
+      }),
+      prisma.documentChunk.count(),
+      prisma.user.findMany({
+        where: {
+          OR: [
+            { revisionEnabled: true },
+            { bestStreak: { gt: 0 } },
+            { totalRevisionPoints: { gt: 0 } },
+          ],
+        },
+        select: {
+          id: true,
+          name: true,
+          currentStreak: true,
+          bestStreak: true,
+          lastRevisionDate: true,
+          totalRevisionPoints: true,
+        },
+      }),
+      getUserErrorBook(userId),
+    ]);
 
   const effectiveStreak = dbUser
     ? computeEffectiveStreak(dbUser.currentStreak, dbUser.lastRevisionDate)
@@ -125,6 +133,7 @@ async function buildPayload(userId: string) {
         }
       : null,
     leaderboard,
+    errorBook,
   };
 }
 
@@ -147,16 +156,20 @@ export async function GET() {
       where: { userId_dateKey: { userId: user.id, dateKey: todayKey } },
     });
     if (!existing) {
-      const questions = await generateQuizQuestions();
+      const questions = await generateQuizQuestions({ userId: user.id });
       if (questions.length > 0) {
-        await prisma.dailyRevisionSession.create({
-          data: {
-            userId: user.id,
-            dateKey: todayKey,
-            questionsJson: JSON.stringify(questions),
-            totalQuestions: questions.length,
-          },
-        });
+        await prisma.dailyRevisionSession
+          .upsert({
+            where: { userId_dateKey: { userId: user.id, dateKey: todayKey } },
+            update: {},
+            create: {
+              userId: user.id,
+              dateKey: todayKey,
+              questionsJson: JSON.stringify(questions),
+              totalQuestions: questions.length,
+            },
+          })
+          .catch(() => null);
       }
     }
   }
@@ -175,14 +188,41 @@ export async function POST(req: Request) {
 
   try {
     const body = (await req.json()) as {
-      action?: "TOGGLE" | "GENERATE_DAILY" | "GENERATE_BONUS" | "SUBMIT";
+      action?:
+        | "TOGGLE"
+        | "GENERATE_DAILY"
+        | "GENERATE_BONUS"
+        | "SUBMIT"
+        | "REVIEW_ERROR";
       enabled?: boolean;
       sessionId?: string;
       answers?: Record<string, RevisionAnswerValue>;
+      errorItemId?: string;
+      rating?: SrsRating;
     };
 
     const todayKey = getLocalDateKey();
     const yesterdayKey = getYesterdayDateKey();
+
+    if (body.action === "REVIEW_ERROR") {
+      const errorItemId = body.errorItemId?.trim();
+      const rating = body.rating;
+      if (
+        !errorItemId ||
+        (rating !== "AGAIN" &&
+          rating !== "HARD" &&
+          rating !== "GOOD" &&
+          rating !== "EASY")
+      ) {
+        return NextResponse.json(
+          { error: "Paramètres de révision SRS invalides." },
+          { status: 400 }
+        );
+      }
+      await reviewErrorBookItem(user.id, errorItemId, rating);
+      const payload = await buildPayload(user.id);
+      return NextResponse.json(payload);
+    }
 
     if (body.action === "TOGGLE") {
       const enabled = Boolean(body.enabled);
@@ -196,16 +236,22 @@ export async function POST(req: Request) {
           where: { userId_dateKey: { userId: user.id, dateKey: todayKey } },
         });
         if (!existing) {
-          const questions = await generateQuizQuestions();
+          const questions = await generateQuizQuestions({ userId: user.id });
           if (questions.length > 0) {
-            await prisma.dailyRevisionSession.create({
-              data: {
-                userId: user.id,
-                dateKey: todayKey,
-                questionsJson: JSON.stringify(questions),
-                totalQuestions: questions.length,
-              },
-            });
+            await prisma.dailyRevisionSession
+              .upsert({
+                where: {
+                  userId_dateKey: { userId: user.id, dateKey: todayKey },
+                },
+                update: {},
+                create: {
+                  userId: user.id,
+                  dateKey: todayKey,
+                  questionsJson: JSON.stringify(questions),
+                  totalQuestions: questions.length,
+                },
+              })
+              .catch(() => null);
           }
         }
       }
@@ -218,7 +264,7 @@ export async function POST(req: Request) {
       body.action === "GENERATE_DAILY" ||
       body.action === "GENERATE_BONUS"
     ) {
-      const questions = await generateQuizQuestions();
+      const questions = await generateQuizQuestions({ userId: user.id });
       if (questions.length === 0) {
         return NextResponse.json(
           {
@@ -234,14 +280,18 @@ export async function POST(req: Request) {
       });
 
       if (!existing) {
-        await prisma.dailyRevisionSession.create({
-          data: {
-            userId: user.id,
-            dateKey: todayKey,
-            questionsJson: JSON.stringify(questions),
-            totalQuestions: questions.length,
-          },
-        });
+        await prisma.dailyRevisionSession
+          .upsert({
+            where: { userId_dateKey: { userId: user.id, dateKey: todayKey } },
+            update: {},
+            create: {
+              userId: user.id,
+              dateKey: todayKey,
+              questionsJson: JSON.stringify(questions),
+              totalQuestions: questions.length,
+            },
+          })
+          .catch(() => null);
       } else if (body.action === "GENERATE_BONUS" || !existing.completed) {
         await prisma.dailyRevisionSession.update({
           where: { id: existing.id },
@@ -337,6 +387,11 @@ export async function POST(req: Request) {
           });
         }
       });
+
+      const missedQuestions = questions.filter((q) => !results[q.id]);
+      if (missedQuestions.length > 0) {
+        await recordMissedQuestions(user.id, missedQuestions);
+      }
 
       const payload = await buildPayload(user.id);
       return NextResponse.json({

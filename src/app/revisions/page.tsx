@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useSession } from "next-auth/react";
 import {
   Award,
+  Brain,
   Check,
   CheckCircle2,
   FileText,
@@ -13,6 +14,7 @@ import {
   Loader2,
   Power,
   RefreshCw,
+  RotateCcw,
   Trophy,
   XCircle,
 } from "lucide-react";
@@ -69,12 +71,43 @@ interface LeaderboardEntry {
   completedToday: boolean;
 }
 
+interface ErrorBookCard {
+  id: string;
+  fingerprint: string;
+  ueId: string;
+  ueCode: string;
+  chapterId: string;
+  chapterTitle: string;
+  wrongCount: number;
+  srsBox: number;
+  mastered: boolean;
+  nextReviewDate: string;
+  question: RevisionQuestion;
+}
+
+interface WeakChapterSummary {
+  ueId: string;
+  ueCode: string;
+  chapterTitle: string;
+  errorCount: number;
+  activeItems: number;
+}
+
+interface UserErrorBookPayload {
+  items: ErrorBookCard[];
+  weakChapters: WeakChapterSummary[];
+  dueCount: number;
+  activeCount: number;
+  masteredCount: number;
+}
+
 interface RevisionsPayload {
   userState: UserRevisionState;
   todayKey: string;
   hasCourseContent: boolean;
   todaySession: DailySessionData | null;
   leaderboard: LeaderboardEntry[];
+  errorBook?: UserErrorBookPayload;
   gradingResults?: Record<string, boolean>;
 }
 
@@ -99,6 +132,9 @@ export default function RevisionsPage() {
   const [gradingResults, setGradingResults] = useState<
     Record<string, boolean> | null
   >(null);
+  const [revealedErrorIds, setRevealedErrorIds] = useState<
+    Record<string, boolean>
+  >({});
 
   useEffect(() => {
     setPageContext({ mode: "GLOBAL" });
@@ -187,6 +223,10 @@ export default function RevisionsPage() {
   const userState = data?.userState;
   const sessionData = data?.todaySession;
   const leaderboard = data?.leaderboard || [];
+  const errorBook = data?.errorBook;
+  const activeErrorItems = (errorBook?.items || []).filter(
+    (item) => !item.mastered
+  );
 
   return (
     <AppShell>
@@ -708,6 +748,200 @@ export default function RevisionsPage() {
               </div>
             </aside>
           </div>
+        )}
+
+        {/* Carnet d'Erreurs & Répétition Espacée (SRS) */}
+        {!loading && errorBook && (
+          <section className="space-y-4 border-t border-border pt-6">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h2 className="flex items-center gap-2 text-base font-bold uppercase tracking-tight text-ink">
+                  <Brain className="h-4 w-4 text-carmine" />
+                  <span>CARNET D&apos;ERREURS &amp; RÉPÉTITION ESPACÉE (SRS)</span>
+                </h2>
+                <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
+                  [ REPRISE AUTOMATIQUE DES NOTIONS RATÉES EN QUIZ OU EN PARTIEL BLANC ]
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-wider">
+                <span className="border border-carmine/40 bg-carmine/10 px-2.5 py-1 text-carmine">
+                  {errorBook.dueCount} À REVOIR AUJOURD&apos;HUI
+                </span>
+                <span className="border border-border bg-card px-2.5 py-1 text-ink">
+                  {errorBook.activeCount} ACTIVES · {errorBook.masteredCount}{" "}
+                  MAÎTRISÉES
+                </span>
+              </div>
+            </div>
+
+            {activeErrorItems.length === 0 ? (
+              <div className="border border-border bg-card p-6 text-center font-mono text-xs uppercase tracking-wider text-stone">
+                CARNET D&apos;ERREURS VIERGE — TOUTES VOS QUESTIONS RATÉES ONT
+                ÉTÉ MAÎTRISÉES OU AUCUNE ERREUR ENREGISTRÉE.
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
+                {/* Weak Chapters Ranking */}
+                <div className="border border-border bg-card lg:col-span-4">
+                  <div className="border-b border-border bg-paper px-4 py-2.5 font-mono text-xs font-semibold uppercase tracking-wider text-ink">
+                    CHAPITRES PRIORITAIRES ({errorBook.weakChapters.length})
+                  </div>
+                  <div className="divide-y divide-border">
+                    {errorBook.weakChapters.map((wc) => (
+                      <div key={`${wc.ueCode}-${wc.chapterTitle}`} className="p-3.5">
+                        <div className="flex items-center justify-between gap-2 font-mono text-[10px] uppercase tracking-wider">
+                          <span className="bg-badge-bg px-1.5 py-0.5 font-bold text-badge-text">
+                            {wc.ueCode}
+                          </span>
+                          <span className="text-carmine">
+                            {wc.errorCount} ERREUR{wc.errorCount > 1 ? "S" : ""}
+                          </span>
+                        </div>
+                        <p className="mt-1.5 text-xs font-semibold text-ink">
+                          {wc.chapterTitle}
+                        </p>
+                        <p className="mt-0.5 font-mono text-[10px] uppercase text-stone">
+                          {wc.activeItems} NOTION{wc.activeItems > 1 ? "S" : ""} EN
+                          COURS DE RÉTENTION
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* SRS Error Cards */}
+                <div className="space-y-3 lg:col-span-8">
+                  {activeErrorItems.slice(0, 6).map((item) => {
+                    const q = item.question;
+                    const revealed = Boolean(revealedErrorIds[item.id]);
+                    const isDue = item.nextReviewDate <= (data?.todayKey || "");
+
+                    return (
+                      <article
+                        key={item.id}
+                        className="border border-border bg-card p-4"
+                        style={{
+                          borderLeft: `3px solid ${
+                            isDue ? "#C83E4D" : "#D99B26"
+                          }`,
+                        }}
+                      >
+                        <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider">
+                            <span className="bg-badge-bg px-2 py-0.5 font-bold text-badge-text">
+                              {item.ueCode}
+                            </span>
+                            <span className="border border-border bg-paper px-2 py-0.5 text-ink">
+                              BOÎTE SRS {item.srsBox}/5
+                            </span>
+                            <span className="border border-carmine/30 bg-carmine/10 px-2 py-0.5 text-carmine">
+                              RATÉE {item.wrongCount}×
+                            </span>
+                          </div>
+                          <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                            PROCHAINE RÉVISION : {item.nextReviewDate}
+                          </span>
+                        </div>
+
+                        <p className="text-sm font-semibold text-ink">
+                          {q.prompt}
+                        </p>
+                        {q.sentenceWithBlank && (
+                          <p className="mt-1.5 border border-border bg-paper px-3 py-2 text-xs text-ink">
+                            {q.sentenceWithBlank}
+                          </p>
+                        )}
+
+                        {!revealed ? (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setRevealedErrorIds((p) => ({
+                                ...p,
+                                [item.id]: true,
+                              }))
+                            }
+                            className="mt-3 inline-flex items-center gap-1.5 border border-ink bg-paper px-3 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:bg-pinned"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>AFFICHER LA RÉPONSE &amp; ÉVALUER (SRS)</span>
+                          </button>
+                        ) : (
+                          <div className="mt-3 space-y-3 border-t border-border pt-3">
+                            <div className="border border-forest/40 bg-forest/10 p-3 text-xs text-ink">
+                              {q.options && q.correctIndices && (
+                                <p className="font-semibold">
+                                  Réponse(s) attendue(s) :{" "}
+                                  {q.correctIndices
+                                    .map((i) => q.options?.[i])
+                                    .filter(Boolean)
+                                    .join(" · ")}
+                                </p>
+                              )}
+                              {q.correctAnswer && (
+                                <p className="font-semibold">
+                                  Mot-clé attendu : {q.correctAnswer}
+                                </p>
+                              )}
+                              <p className="mt-1 text-stone">{q.explanation}</p>
+                            </div>
+
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              {(
+                                [
+                                  {
+                                    rating: "AGAIN",
+                                    label: "À REVOIR (<1M)",
+                                    cls: "border-carmine bg-carmine/10 text-carmine hover:bg-carmine hover:text-card",
+                                  },
+                                  {
+                                    rating: "HARD",
+                                    label: "DIFFICILE (1J)",
+                                    cls: "border-amber bg-amber/15 text-ink hover:bg-amber hover:text-card",
+                                  },
+                                  {
+                                    rating: "GOOD",
+                                    label: "BIEN (3J)",
+                                    cls: "border-badge-text bg-badge-bg text-badge-text hover:bg-badge-text hover:text-card",
+                                  },
+                                  {
+                                    rating: "EASY",
+                                    label: "FACILE · MAÎTRISÉ (7J)",
+                                    cls: "border-forest bg-forest/15 text-forest hover:bg-forest hover:text-card",
+                                  },
+                                ] as const
+                              ).map((btn) => (
+                                <button
+                                  key={btn.rating}
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => {
+                                    setRevealedErrorIds((p) => ({
+                                      ...p,
+                                      [item.id]: false,
+                                    }));
+                                    void postAction({
+                                      action: "REVIEW_ERROR",
+                                      errorItemId: item.id,
+                                      rating: btn.rating,
+                                    });
+                                  }}
+                                  className={`border px-2.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider transition-colors ${btn.cls}`}
+                                >
+                                  {btn.label}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+          </section>
         )}
 
         {/* Community Custom Quizzes & Image Occlusion Editor */}

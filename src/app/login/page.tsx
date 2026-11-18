@@ -19,13 +19,33 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
+      const normalizedEmail = email.trim().toLowerCase();
       const res = await signIn("credentials", {
-        email: email.trim().toLowerCase(),
+        email: normalizedEmail,
         password,
         redirect: false,
       });
 
       if (res?.error) {
+        const statusRes = await fetch("/api/auth/status", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: normalizedEmail, password }),
+        }).catch(() => null);
+
+        if (statusRes?.ok) {
+          const statusData = (await statusRes.json().catch(() => ({}))) as {
+            status?: string;
+            classLevel?: string;
+          };
+          if (statusData.status === "PENDING_APPROVAL") {
+            setError(
+              `Compte (${statusData.classLevel || "ÉTUDIANT"}) en attente de validation par un administrateur (YEAR_ADMIN).`
+            );
+            return;
+          }
+        }
+
         setError("Identifiants incorrects. Vérifiez votre email et mot de passe.");
         return;
       }

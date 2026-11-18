@@ -2,7 +2,9 @@ import fsp from "node:fs/promises";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { canManageUE, getCurrentUser } from "@/lib/auth";
+import { normalizeClassLevel } from "@/lib/class-levels";
 import { resolveDocumentFilePath } from "@/lib/storage";
+import { getUeMeta, setUeMeta } from "@/lib/ue-meta";
 
 export async function GET(
   _req: Request,
@@ -92,7 +94,10 @@ export async function GET(
     channels = [createdChannel];
   }
 
-  const isManager = await canManageUE(user.id, user.globalRole, ue.id);
+  const [isManager, meta] = await Promise.all([
+    canManageUE(user.id, user.globalRole, ue.id),
+    getUeMeta(ue.id),
+  ]);
 
   const chapters = ue.chapters.map((chapter) => ({
     id: chapter.id,
@@ -125,6 +130,10 @@ export async function GET(
       title: ue.title,
       description: ue.description,
       semester: ue.semester,
+      classLevel: meta.classLevel,
+      examType: meta.examType,
+      examDate: meta.examDate,
+      coeff: meta.coeff,
       accentColor: ue.accentColor,
       order: ue.order,
       updatedAt: ue.updatedAt,
@@ -157,6 +166,10 @@ export async function PATCH(
       title?: string;
       description?: string;
       semester?: string;
+      classLevel?: string;
+      examType?: string;
+      examDate?: string | null;
+      coeff?: number;
       accentColor?: string;
       order?: number;
     };
@@ -175,7 +188,17 @@ export async function PATCH(
       },
     });
 
-    return NextResponse.json({ ue: updated });
+    await setUeMeta(params.ueId, {
+      ...(body.classLevel !== undefined
+        ? { classLevel: normalizeClassLevel(body.classLevel) }
+        : {}),
+      ...(body.examType !== undefined ? { examType: body.examType } : {}),
+      ...(body.examDate !== undefined ? { examDate: body.examDate } : {}),
+      ...(body.coeff !== undefined ? { coeff: Number(body.coeff) } : {}),
+    });
+
+    const meta = await getUeMeta(params.ueId);
+    return NextResponse.json({ ue: { ...updated, ...meta } });
   } catch (error) {
     console.error("[UE PATCH] Error:", error);
     return NextResponse.json(

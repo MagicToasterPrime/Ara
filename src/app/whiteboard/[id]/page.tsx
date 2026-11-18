@@ -16,7 +16,7 @@ const WhiteboardCanvas = dynamic(
     ssr: false,
     loading: () => (
       <div className="flex h-full items-center justify-center border border-border bg-card font-mono text-xs uppercase tracking-wider text-stone">
-        CHARGEMENT DE L&apos;ÉDITEUR TLDRAW...
+        CHARGEMENT DE L&apos;ATELIER TABLEAU BLANC...
       </div>
     ),
   }

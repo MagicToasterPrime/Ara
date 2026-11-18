@@ -43,6 +43,12 @@ async function ensureEnvironment() {
 
   const uploadDir = path.join(ROOT, "storage", "uploads");
   await fsp.mkdir(uploadDir, { recursive: true });
+
+  const nextBuildId = path.join(ROOT, ".next", "BUILD_ID");
+  if (fs.existsSync(nextBuildId)) {
+    await fsp.rm(path.join(ROOT, ".next"), { recursive: true, force: true });
+    log("Cache .next issu d'un build production nettoyé avant démarrage dev.");
+  }
 }
 
 function tryDockerComposeUp() {
@@ -105,6 +111,12 @@ async function startEmbeddedPgvector() {
   await db.exec(`
     ALTER TABLE "Whiteboard" ADD COLUMN IF NOT EXISTS "isPublic" BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE "Whiteboard" ADD COLUMN IF NOT EXISTS "isIntegrated" BOOLEAN NOT NULL DEFAULT false;
+    ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "classLevel" TEXT NOT NULL DEFAULT 'VET2';
+    ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "isApproved" BOOLEAN NOT NULL DEFAULT true;
+    ALTER TABLE "UE" ADD COLUMN IF NOT EXISTS "classLevel" TEXT NOT NULL DEFAULT 'VET2';
+    ALTER TABLE "UE" ADD COLUMN IF NOT EXISTS "examType" TEXT NOT NULL DEFAULT 'PARTIEL';
+    ALTER TABLE "UE" ADD COLUMN IF NOT EXISTS "examDate" TEXT;
+    ALTER TABLE "UE" ADD COLUMN IF NOT EXISTS "coeff" INTEGER NOT NULL DEFAULT 4;
     ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "revisionEnabled" BOOLEAN NOT NULL DEFAULT false;
     ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "currentStreak" INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "bestStreak" INTEGER NOT NULL DEFAULT 0;
@@ -161,6 +173,53 @@ async function startEmbeddedPgvector() {
     );
     CREATE INDEX IF NOT EXISTS "CommunityQuiz_ueId_createdAt_idx" ON "CommunityQuiz"("ueId", "createdAt");
     CREATE INDEX IF NOT EXISTS "CommunityQuiz_authorId_createdAt_idx" ON "CommunityQuiz"("authorId", "createdAt");
+    CREATE TABLE IF NOT EXISTS "PdfPageNote" (
+      "id" TEXT NOT NULL,
+      "userId" TEXT NOT NULL,
+      "documentId" TEXT NOT NULL,
+      "pageNumber" INTEGER NOT NULL,
+      "isBookmarked" BOOLEAN NOT NULL DEFAULT false,
+      "noteText" TEXT NOT NULL DEFAULT '',
+      "highlightsJson" TEXT NOT NULL DEFAULT '[]',
+      "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "PdfPageNote_pkey" PRIMARY KEY ("id")
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS "PdfPageNote_userId_documentId_pageNumber_key" ON "PdfPageNote"("userId", "documentId", "pageNumber");
+    CREATE TABLE IF NOT EXISTS "ErrorBookItem" (
+      "id" TEXT NOT NULL,
+      "userId" TEXT NOT NULL,
+      "fingerprint" TEXT NOT NULL,
+      "ueId" TEXT NOT NULL,
+      "ueCode" TEXT NOT NULL,
+      "chapterId" TEXT NOT NULL DEFAULT '',
+      "chapterTitle" TEXT NOT NULL,
+      "questionJson" TEXT NOT NULL,
+      "wrongCount" INTEGER NOT NULL DEFAULT 1,
+      "srsBox" INTEGER NOT NULL DEFAULT 1,
+      "mastered" BOOLEAN NOT NULL DEFAULT false,
+      "nextReviewDate" TEXT NOT NULL,
+      "lastMissedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      CONSTRAINT "ErrorBookItem_pkey" PRIMARY KEY ("id")
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS "ErrorBookItem_userId_fingerprint_key" ON "ErrorBookItem"("userId", "fingerprint");
+    CREATE INDEX IF NOT EXISTS "ErrorBookItem_userId_mastered_idx" ON "ErrorBookItem"("userId", "mastered");
+    CREATE TABLE IF NOT EXISTS "MockExamSession" (
+      "id" TEXT NOT NULL,
+      "userId" TEXT NOT NULL,
+      "ueId" TEXT NOT NULL,
+      "durationMinutes" INTEGER NOT NULL,
+      "questionsJson" TEXT NOT NULL,
+      "answersJson" TEXT NOT NULL DEFAULT '{}',
+      "score" INTEGER NOT NULL DEFAULT 0,
+      "totalQuestions" INTEGER NOT NULL DEFAULT 0,
+      "grade20" DOUBLE PRECISION NOT NULL DEFAULT 0,
+      "chapterBreakdownJson" TEXT NOT NULL DEFAULT '[]',
+      "completed" BOOLEAN NOT NULL DEFAULT false,
+      "startedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "completedAt" TIMESTAMP(3),
+      CONSTRAINT "MockExamSession_pkey" PRIMARY KEY ("id")
+    );
+    CREATE INDEX IF NOT EXISTS "MockExamSession_userId_ueId_idx" ON "MockExamSession"("userId", "ueId");
   `);
 
   const socketServer = new PGLiteSocketServer({

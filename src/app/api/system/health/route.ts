@@ -3,6 +3,10 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { checkOllamaHealth } from "@/lib/ollama";
 import { getStorageStats } from "@/lib/storage";
+import {
+  ensureUserAccountSchema,
+  getAllUsersAccountMeta,
+} from "@/lib/user-schema";
 
 export async function GET() {
   const user = await getCurrentUser();
@@ -10,7 +14,9 @@ export async function GET() {
     return NextResponse.json({ error: "Non authentifié" }, { status: 401 });
   }
 
-  const [ollama, storage, counts] = await Promise.all([
+  await ensureUserAccountSchema();
+
+  const [ollama, storage, counts, metaMap] = await Promise.all([
     checkOllamaHealth(),
     getStorageStats(),
     Promise.all([
@@ -22,6 +28,9 @@ export async function GET() {
       prisma.whiteboard.count(),
       prisma.channel.count(),
     ]),
+    user.globalRole === "YEAR_ADMIN"
+      ? getAllUsersAccountMeta()
+      : Promise.resolve(null),
   ]);
 
   const [
@@ -34,7 +43,7 @@ export async function GET() {
     channelCount,
   ] = counts;
 
-  const users =
+  const rawUsers =
     user.globalRole === "YEAR_ADMIN"
       ? await prisma.user.findMany({
           orderBy: { createdAt: "asc" },
@@ -57,6 +66,16 @@ export async function GET() {
           },
         })
       : undefined;
+
+  const users = rawUsers?.map((u) => {
+    const meta = metaMap?.get(u.id);
+    return {
+      ...u,
+      classLevel: meta?.classLevel ?? "VET2",
+      isApproved:
+        u.globalRole === "YEAR_ADMIN" ? true : (meta?.isApproved ?? true),
+    };
+  });
 
   return NextResponse.json({
     ollama,

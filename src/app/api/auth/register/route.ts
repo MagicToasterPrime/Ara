@@ -1,9 +1,15 @@
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { prisma } from "@/lib/prisma";
+import {
+  ensureUserAccountSchema,
+  isValidClassLevel,
+  normalizeClassLevel,
+} from "@/lib/user-schema";
 
 export async function GET() {
   try {
+    await ensureUserAccountSchema();
     const userCount = await prisma.user.count();
     return NextResponse.json({
       hasUsers: userCount > 0,
@@ -20,10 +26,13 @@ export async function GET() {
 
 export async function POST(req: Request) {
   try {
+    await ensureUserAccountSchema();
+
     const body = (await req.json()) as {
       name?: string;
       email?: string;
       password?: string;
+      classLevel?: string;
     };
 
     const name = body.name?.trim() || "";
@@ -40,6 +49,18 @@ export async function POST(req: Request) {
       );
     }
 
+    if (!isValidClassLevel(body.classLevel)) {
+      return NextResponse.json(
+        {
+          error:
+            "Veuillez sélectionner votre classe (PACENV, VET2, VET3, VET4, VET5 ou VET6).",
+        },
+        { status: 400 }
+      );
+    }
+
+    const classLevel = normalizeClassLevel(body.classLevel);
+
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
       return NextResponse.json(
@@ -50,11 +71,13 @@ export async function POST(req: Request) {
 
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const createdUser = await prisma.$transaction(async (tx) => {
+    const { user, isApproved } = await prisma.$transaction(async (tx) => {
       const existingCount = await tx.user.count();
-      const globalRole = existingCount === 0 ? "YEAR_ADMIN" : "STUDENT";
+      const isFirstUser = existingCount === 0;
+      const globalRole = isFirstUser ? "YEAR_ADMIN" : "STUDENT";
+      const approved = isFirstUser;
 
-      const user = await tx.user.create({
+      const created = await tx.user.create({
         data: {
           name,
           email,
@@ -70,10 +93,26 @@ export async function POST(req: Request) {
         },
       });
 
-      return user;
+      await tx.$executeRaw`
+        UPDATE "User"
+        SET "classLevel" = ${classLevel}, "isApproved" = ${approved}
+        WHERE "id" = ${created.id}
+      `;
+
+      return { user: created, isApproved: approved };
     });
 
-    return NextResponse.json({ user: createdUser }, { status: 201 });
+    return NextResponse.json(
+      {
+        user: {
+          ...user,
+          classLevel,
+          isApproved,
+        },
+        requiresApproval: !isApproved,
+      },
+      { status: 201 }
+    );
   } catch (error) {
     console.error("[Register POST] Error:", error);
     return NextResponse.json(

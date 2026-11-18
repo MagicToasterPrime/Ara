@@ -33,6 +33,8 @@ model User {
   name                String
   passwordHash        String
   globalRole          GlobalRole @default(STUDENT)
+  classLevel          String   @default("VET2")
+  isApproved          Boolean  @default(true)
   revisionEnabled     Boolean  @default(false)
   currentStreak       Int      @default(0)
   bestStreak          Int      @default(0)
@@ -75,6 +77,10 @@ model UE {
   title       String
   description String
   semester    String
+  classLevel  String       @default("VET2")
+  examType    String       @default("PARTIEL")
+  examDate    String?
+  coeff       Int          @default(4)
   accentColor String       @default("#D99B26")
   order       Int          @default(0)
   createdAt   DateTime     @default(now())
@@ -239,4 +245,54 @@ model CommunityQuizUpvote {
   quiz CommunityQuiz @relation(fields: [quizId], references: [id], onDelete: Cascade)
 
   @@id([userId, quizId])
+}
+
+model PdfPageNote {
+  id             String   @id @default(cuid())
+  userId         String
+  documentId     String
+  pageNumber     Int
+  isBookmarked   Boolean  @default(false)
+  noteText       String   @default("")
+  highlightsJson String   @default("[]")
+  updatedAt      DateTime @default(now())
+
+  @@unique([userId, documentId, pageNumber])
+}
+
+model ErrorBookItem {
+  id             String   @id @default(cuid())
+  userId         String
+  fingerprint    String
+  ueId           String
+  ueCode         String
+  chapterId      String   @default("")
+  chapterTitle   String
+  questionJson   String
+  wrongCount     Int      @default(1)
+  srsBox         Int      @default(1)
+  mastered       Boolean  @default(false)
+  nextReviewDate String
+  lastMissedAt   DateTime @default(now())
+
+  @@unique([userId, fingerprint])
+  @@index([userId, mastered])
+}
+
+model MockExamSession {
+  id                   String    @id @default(cuid())
+  userId               String
+  ueId                 String
+  durationMinutes      Int
+  questionsJson        String
+  answersJson          String    @default("{}")
+  score                Int       @default(0)
+  totalQuestions       Int       @default(0)
+  grade20              Float     @default(0)
+  chapterBreakdownJson String    @default("[]")
+  completed            Boolean   @default(false)
+  startedAt            DateTime  @default(now())
+  completedAt          DateTime?
+
+  @@index([userId, ueId])
 }

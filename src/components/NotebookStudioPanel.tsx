@@ -49,6 +49,7 @@ interface NotebookStudioPanelProps {
   ueId: string;
   ueCode: string;
   documents: StudioDocOption[];
+  focusDocumentId?: string | null;
   onOpenSource?: (source: StudioSourceRef) => void;
 }
 
@@ -63,6 +64,7 @@ export function NotebookStudioPanel({
   ueId,
   ueCode,
   documents,
+  focusDocumentId,
   onOpenSource,
 }: NotebookStudioPanelProps) {
   const { data: session } = useSession();
@@ -80,10 +82,14 @@ export function NotebookStudioPanel({
   const [loadingList, setLoadingList] = useState(true);
 
   useEffect(() => {
+    if (focusDocumentId) {
+      setSelectedDocIds([focusDocumentId]);
+      return;
+    }
     setSelectedDocIds((prev) =>
       prev.length > 0 ? prev : documents.map((d) => d.id)
     );
-  }, [documents]);
+  }, [documents, focusDocumentId]);
 
   const fetchArtifacts = useCallback(async () => {
     try {
@@ -95,11 +101,17 @@ export function NotebookStudioPanel({
       const data = (await res.json()) as { artifacts?: StudioArtifactRow[] };
       const list = data.artifacts || [];
       setArtifacts(list);
-      setActiveArtifact((prev) => prev || list[0] || null);
+      setActiveArtifact((prev) => {
+        if (focusDocumentId) {
+          const match = list.find((a) => a.documentId === focusDocumentId);
+          if (match) return match;
+        }
+        return prev || list[0] || null;
+      });
     } finally {
       setLoadingList(false);
     }
-  }, [ueId]);
+  }, [ueId, focusDocumentId]);
 
   useEffect(() => {
     void fetchArtifacts();
