@@ -2,23 +2,37 @@ import crypto from "node:crypto";
 import fsp from "node:fs/promises";
 import { prisma } from "@/lib/prisma";
 import {
+  ensureDocumentStatusSchema,
+  getDocumentStatusMap,
+  setDocumentProcessingStatus,
+} from "@/lib/document-status";
+import {
   checkOllamaHealth,
   describeImageWithOllama,
   embedExistingDocumentChunks,
   formatVectorLiteral,
   generateEmbedding,
   getOllamaConfig,
-  getOptimalOllamaThreads,
+  getOllamaInferenceOptions,
   getParisHour,
+  OLLAMA_STRICT_SYSTEM_RULE,
+  OLLAMA_TIMEOUT_MS,
+  ollamaPostJson,
+  ollamaPostStream,
   storeDocumentChunksUnindexed,
   withOllamaLock,
 } from "@/lib/ollama";
-import { extractPdfPages } from "@/lib/pdf";
+import {
+  extractPdfPages,
+  hasUsableExtractedText,
+  hasUsableText,
+} from "@/lib/pdf";
 import {
   buildFactFlashcardsFromChunks,
   buildFactQuestionsFromChunks,
   cleanChunkTextForAi,
   extractCourseFacts,
+  hasGenericPlaceholderLeak,
   isLowQualityExcerptQuestion,
   parseOllamaJsonWithRecovery,
   selectHighValueText,
@@ -212,8 +226,8 @@ export async function gatherStudioSourceChunks(params: {
       ? documentIds
       : undefined;
 
-  const targetLimit = fullDocument ? 4000 : 14;
-  const minSubstantialLen = fullDocument ? 60 : 80;
+  const targetLimit = fullDocument ? 6000 : 14;
+  const minSubstantialLen = fullDocument ? 40 : 80;
 
   const collected: SourceChunk[] = [];
   const seen = new Set<string>();
@@ -429,7 +443,7 @@ export async function gatherStudioSourceChunks(params: {
         : undefined,
       select: { id: true, documentId: true, pageNumber: true, content: true },
       orderBy: [{ documentId: "asc" }, { pageNumber: "asc" }],
-      take: fullDocument ? 4000 : 400,
+      take: fullDocument ? 6000 : 400,
     });
 
     const refsByDoc = new Map<
@@ -757,52 +771,211 @@ export function compileSwissEditorialSvg(params: {
 </svg>`;
 }
 
+const SVG_DIAGRAM_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    title: {
+      type: "string",
+      description: "Titre synthétique du schéma reflétant le sujet exact du cours",
+    },
+    subtitle: {
+      type: "string",
+      description: "Sous-titre académique précisant le périmètre scientifique du cours",
+    },
+    layout: {
+      type: "string",
+      enum: ["FLOW", "HIERARCHY", "RADIAL"],
+      description: "Disposition visuelle la plus adaptée au concept",
+    },
+    nodes: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          id: { type: "string", description: "Identifiant unique séquentiel (n1 à n6)" },
+          code: { type: "string", description: "Repère court d'étape ou de catégorie tiré du cours" },
+          label: { type: "string", description: "Nom exact de la notion ou étape tirée du cours" },
+          detail: {
+            type: "string",
+            description: "Explication factuelle concise (8 à 14 mots) tirée du document fourni",
+          },
+        },
+        required: ["id", "code", "label", "detail"],
+      },
+    },
+    edges: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          from: { type: "string", description: "Identifiant du nœud source" },
+          to: { type: "string", description: "Identifiant du nœud cible" },
+          label: { type: "string", description: "Verbe ou relation causale exacte issue du cours" },
+        },
+        required: ["from", "to", "label"],
+      },
+    },
+  },
+  required: ["title", "subtitle", "layout", "nodes", "edges"],
+};
+
+const FLASHCARDS_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    cards: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          front: {
+            type: "string",
+            description:
+              "Question recto directe, autonome et précise (10 à 22 mots) portant sur un fait, un chiffre, un mécanisme ou une définition réelle du document",
+          },
+          back: {
+            type: "string",
+            description:
+              "Réponse verso exacte et concise (1 à 2 phrases) mettant en gras la valeur ou le terme scientifique clé issu du document",
+          },
+          tag: {
+            type: "string",
+            description:
+              "Étiquette thématique courte en majuscules correspondant au type de notion",
+          },
+          sourcePage: {
+            type: "integer",
+            description: "Numéro de page exact tel qu'indiqué dans les extraits du cours",
+          },
+        },
+        required: ["front", "back", "tag", "sourcePage"],
+      },
+    },
+  },
+  required: ["cards"],
+};
+
+const STUDIO_QUIZ_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    questions: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          type: {
+            type: "string",
+            enum: ["QCU", "QCM", "QROC"],
+            description:
+              "Type de question : QCU (1 seule bonne réponse), QCM (2 ou 3 bonnes réponses), ou QROC (réponse ouverte courte)",
+          },
+          prompt: {
+            type: "string",
+            description:
+              "Énoncé interrogatif précis, autonome et contextualisé portant sur un fait concret du document fourni",
+          },
+          options: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Pour QCU et QCM : exactement 4 propositions courtes (1 à 10 mots), homogènes, sans préfixe alphabétique, issues du document (tableau vide pour QROC)",
+          },
+          correctIndices: {
+            type: "array",
+            items: { type: "integer" },
+            description:
+              "Pour QCU (1 indice de 0 à 3) ou QCM (2 ou 3 indices de 0 à 3) désignant les bonnes propositions dans options (tableau vide pour QROC)",
+          },
+          correctAnswer: {
+            type: "string",
+            description:
+              "Pour QROC : réponse exacte attendue en 1 à 4 mots tirée du cours (chaîne vide pour QCU/QCM)",
+          },
+          acceptedKeywords: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "Pour QROC : mots-clés scientifiques exacts et synonymes acceptés tirés du cours (tableau vide pour QCU/QCM)",
+          },
+          explanation: {
+            type: "string",
+            description:
+              "Justification pédagogique concise rédigée à partir des faits précis du document",
+          },
+          sourcePage: {
+            type: "integer",
+            description: "Numéro de page exact de l'extrait source utilisé",
+          },
+        },
+        required: [
+          "type",
+          "prompt",
+          "options",
+          "correctIndices",
+          "correctAnswer",
+          "acceptedKeywords",
+          "explanation",
+          "sourcePage",
+        ],
+      },
+    },
+  },
+  required: ["questions"],
+};
+
 async function callOllamaJson<T>(
   prompt: string,
   options?: {
+    system?: string;
+    format?: Record<string, unknown> | "json";
     timeoutMs?: number;
     arrayKeys?: string[];
     numPredict?: number;
   }
 ): Promise<T | null> {
-  const timeoutMs = options?.timeoutMs ?? 150000;
+  const timeoutMs = Math.max(options?.timeoutMs ?? OLLAMA_TIMEOUT_MS, OLLAMA_TIMEOUT_MS);
   const arrayKeys = options?.arrayKeys ?? [];
   const numPredict = options?.numPredict ?? 2600;
+  const systemPrompt = options?.system
+    ? `${options.system}\n${OLLAMA_STRICT_SYSTEM_RULE}`
+    : OLLAMA_STRICT_SYSTEM_RULE;
+  const schemaOrJson = options?.format ?? "json";
 
   return withOllamaLock(async () => {
     const health = await checkOllamaHealth();
     if (!health.online) return null;
 
-    const { host, model } = getOllamaConfig();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const { model } = getOllamaConfig();
 
     try {
-      const res = await fetch(`${host}/api/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          prompt,
-          format: "json",
-          stream: false,
-          options: {
-            temperature: 0.25,
-            num_ctx: 8192,
-            num_predict: numPredict,
-            num_thread: getOptimalOllamaThreads(),
-          },
-        }),
-        signal: controller.signal,
-      });
-      if (!res.ok) return null;
-      const data = (await res.json()) as { response?: string };
-      if (!data.response) return null;
-      return parseOllamaJsonWithRecovery<T>(data.response, arrayKeys);
-    } catch {
+      const requestBody = {
+        model,
+        system: systemPrompt,
+        prompt,
+        format: schemaOrJson,
+        stream: false,
+        options: getOllamaInferenceOptions({ num_predict: numPredict }),
+      };
+
+      let res = await ollamaPostJson<{ response?: string }>(
+        "/api/generate",
+        requestBody,
+        timeoutMs
+      );
+
+      // Compatibility fallback if an older Ollama server (< 0.5) rejects JSON Schema objects in `format`
+      if (!res.ok && res.status === 400 && typeof schemaOrJson === "object") {
+        res = await ollamaPostJson<{ response?: string }>(
+          "/api/generate",
+          { ...requestBody, format: "json" },
+          timeoutMs
+        );
+      }
+
+      if (!res.ok || !res.data?.response) return null;
+      return parseOllamaJsonWithRecovery<T>(res.data.response, arrayKeys);
+    } catch (err) {
+      console.warn("[Studio] Ollama JSON call error:", err);
       return null;
-    } finally {
-      clearTimeout(timer);
     }
   });
 }
@@ -880,33 +1053,6 @@ function formatChunksForPrompt(
     .join("\n\n");
 }
 
-function partitionChunks(
-  allChunks: SourceChunk[],
-  segmentCount: number
-): SourceChunk[][] {
-  if (allChunks.length === 0) return [];
-  if (segmentCount <= 1) return [allChunks];
-
-  if (allChunks.length <= segmentCount) {
-    const out: SourceChunk[][] = [];
-    for (let i = 0; i < segmentCount; i += 1) {
-      out.push([allChunks[i % allChunks.length]]);
-    }
-    return out;
-  }
-
-  const result: SourceChunk[][] = [];
-  for (let i = 0; i < segmentCount; i += 1) {
-    const start = Math.floor((i * allChunks.length) / segmentCount);
-    const end = Math.max(
-      start + 1,
-      Math.floor(((i + 1) * allChunks.length) / segmentCount)
-    );
-    result.push(allChunks.slice(start, end));
-  }
-  return result;
-}
-
 function computePageRangeLabel(segmentChunks: SourceChunk[]): string {
   if (segmentChunks.length === 0) return "P.1";
   let minP = Infinity;
@@ -920,46 +1066,50 @@ function computePageRangeLabel(segmentChunks: SourceChunk[]): string {
 }
 
 /**
- * Streaming plain-text call (no JSON mode). Streaming lets us keep a partial answer
- * if the CPU is slow and the timeout hits, instead of throwing everything away.
+ * Streaming plain-text call (no JSON mode). Uses native node:http/https streaming with
+ * >= 1200s (20 min) timeout and keeps partial text if interrupted.
  */
 async function callOllamaText(
   prompt: string,
-  options?: { timeoutMs?: number; numPredict?: number; temperature?: number }
+  options?: {
+    system?: string;
+    timeoutMs?: number;
+    numPredict?: number;
+    temperature?: number;
+  }
 ): Promise<string | null> {
-  const timeoutMs = options?.timeoutMs ?? 240000;
-  const numPredict = options?.numPredict ?? 1400;
+  const timeoutMs = Math.max(options?.timeoutMs ?? OLLAMA_TIMEOUT_MS, OLLAMA_TIMEOUT_MS);
+  const numPredict = options?.numPredict ?? 1800;
+  const systemPrompt = options?.system
+    ? `${options.system}\n${OLLAMA_STRICT_SYSTEM_RULE}`
+    : OLLAMA_STRICT_SYSTEM_RULE;
 
   return withOllamaLock(async () => {
     const health = await checkOllamaHealth();
     if (!health.online) return null;
 
-    const { host, model } = getOllamaConfig();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const { model } = getOllamaConfig();
     let acc = "";
 
     try {
-      const res = await fetch(`${host}/api/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const res = await ollamaPostStream(
+        "/api/generate",
+        {
           model,
+          system: systemPrompt,
           prompt,
           stream: true,
-          options: {
-            temperature: options?.temperature ?? 0.25,
-            num_ctx: 8192,
+          options: getOllamaInferenceOptions({
+            temperature: options?.temperature,
             num_predict: numPredict,
             repeat_penalty: 1.15,
-            num_thread: getOptimalOllamaThreads(),
-          },
-        }),
-        signal: controller.signal,
-      });
-      if (!res.ok || !res.body) return null;
+          }),
+        },
+        timeoutMs
+      );
+      if (!res.ok || !res.stream) return null;
 
-      const reader = res.body.getReader();
+      const reader = res.stream.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
       for (;;) {
@@ -982,69 +1132,157 @@ async function callOllamaText(
         }
       }
       return acc.trim() || null;
-    } catch {
+    } catch (err) {
+      console.warn("[Studio] Ollama text stream warning:", err);
       return acc.trim() || null;
-    } finally {
-      clearTimeout(timer);
     }
   });
 }
 
-interface SummaryWindow {
+export interface ContextWindow {
   text: string;
   chunks: SourceChunk[];
   pageRange: string;
+  wordCount: number;
 }
 
 /**
- * Cuts the WHOLE selected material (every chunk, in page order) into consecutive windows,
- * so the summary covers the entire handout instead of a sample of it.
+ * num_ctx = 8192 tokens ≈ ~5500–6000 French words TOTAL (system + instructions + input + output).
+ * Keeping each input window <= 2000 words / <= 12000 chars prevents silent context truncation
+ * even on 150–300 page handouts while preserving headroom for structured output tokens.
  */
-function buildSummaryWindows(
+const MAX_WORDS_PER_CONTEXT_WINDOW = 2000;
+const MAX_CHARS_PER_CONTEXT_WINDOW = 12000;
+
+export function countWords(text: string): number {
+  const trimmed = text.trim();
+  if (!trimmed) return 0;
+  return trimmed.split(/\s+/).length;
+}
+
+export function hasUsableChunksText(
+  chunks: Array<{ content: string }>
+): boolean {
+  if (!Array.isArray(chunks) || chunks.length === 0) return false;
+  const combined = chunks
+    .map((c) => cleanChunkTextForAi(c.content || ""))
+    .join(" ");
+  return hasUsableText(combined);
+}
+
+function truncateToContextBudget(
+  text: string,
+  maxWords = MAX_WORDS_PER_CONTEXT_WINDOW,
+  maxChars = MAX_CHARS_PER_CONTEXT_WINDOW
+): string {
+  let trimmed = text.trim();
+  if (trimmed.length > maxChars) {
+    trimmed = trimmed.slice(0, maxChars);
+    const lastSpace = trimmed.lastIndexOf(" ");
+    if (lastSpace > Math.floor(maxChars * 0.7)) {
+      trimmed = trimmed.slice(0, lastSpace);
+    }
+  }
+  const words = trimmed.split(/\s+/);
+  if (words.length > maxWords) {
+    trimmed = words.slice(0, maxWords).join(" ");
+  }
+  return trimmed.trim();
+}
+
+function splitSingleOversizedPiece(
+  text: string,
+  maxWords: number,
+  maxChars: number
+): string[] {
+  if (countWords(text) <= maxWords && text.length <= maxChars) {
+    return [text];
+  }
+  const words = text.split(/\s+/);
+  const parts: string[] = [];
+  let cur: string[] = [];
+  let curChars = 0;
+
+  for (const word of words) {
+    const nextChars = curChars + word.length + (cur.length > 0 ? 1 : 0);
+    if (cur.length > 0 && (cur.length + 1 > maxWords || nextChars > maxChars)) {
+      parts.push(cur.join(" "));
+      cur = [];
+      curChars = 0;
+    }
+    cur.push(word);
+    curChars += word.length + (cur.length > 1 ? 1 : 0);
+  }
+  if (cur.length > 0) {
+    parts.push(cur.join(" "));
+  }
+  return parts;
+}
+
+/**
+ * Splits the ENTIRE selected course (all chunks in document & page order) into consecutive
+ * context-window-safe segments processed sequentially one after another so large handouts
+ * NEVER exceed num_ctx (8192) or suffer silent truncation.
+ */
+function splitChunksIntoContextWindows(
   chunks: SourceChunk[],
-  opts: { targetChars: number; maxWindows: number }
-): SummaryWindow[] {
+  opts?: {
+    maxWords?: number;
+    maxChars?: number;
+    maxWindows?: number;
+    targetMinWindows?: number;
+  }
+): ContextWindow[] {
+  const maxWordsCap = Math.min(
+    opts?.maxWords ?? MAX_WORDS_PER_CONTEXT_WINDOW,
+    MAX_WORDS_PER_CONTEXT_WINDOW
+  );
+  const maxCharsCap = Math.min(
+    opts?.maxChars ?? MAX_CHARS_PER_CONTEXT_WINDOW,
+    MAX_CHARS_PER_CONTEXT_WINDOW
+  );
+  const maxWindows = opts?.maxWindows ?? 40;
+
   const sorted = [...chunks].sort((a, b) =>
     a.documentId === b.documentId
       ? a.pageNumber - b.pageNumber
       : a.documentId.localeCompare(b.documentId)
   );
 
-  const rawPieces = sorted
-    .map((chunk) => ({ chunk, text: cleanChunkTextForAi(chunk.content) }))
-    .filter((p) => p.text.length >= 20);
-  if (rawPieces.length === 0) return [];
+  const pieces: Array<{ chunk: SourceChunk; text: string; words: number }> = [];
+  for (const chunk of sorted) {
+    const cleaned = cleanChunkTextForAi(chunk.content);
+    if (cleaned.length < 20) continue;
+    const subTexts = splitSingleOversizedPiece(cleaned, maxWordsCap, maxCharsCap);
+    for (const sub of subTexts) {
+      pieces.push({ chunk, text: sub, words: countWords(sub) });
+    }
+  }
 
-  const HARD_CAP = 7600;
-  const total = rawPieces.reduce((n, p) => n + p.text.length + 8, 0);
-  const keepRatio =
-    total > opts.maxWindows * HARD_CAP
-      ? (opts.maxWindows * HARD_CAP) / total
-      : 1;
+  if (pieces.length === 0) return [];
 
-  const pieces = rawPieces.map((p) => ({
-    chunk: p.chunk,
-    text:
-      keepRatio < 1
-        ? selectHighValueText(
-            p.text,
-            Math.max(200, Math.floor(p.text.length * keepRatio))
-          )
-        : p.text,
-  }));
+  const totalWords = pieces.reduce((sum, p) => sum + p.words, 0);
+  const totalChars = pieces.reduce((sum, p) => sum + p.text.length + 12, 0);
 
-  const adjustedTotal = pieces.reduce((n, p) => n + p.text.length + 8, 0);
-  const budget = Math.min(
-    HARD_CAP,
-    Math.max(
-      opts.targetChars,
-      Math.ceil((adjustedTotal / opts.maxWindows) * 1.06)
-    )
-  );
+  let effectiveMaxWords = maxWordsCap;
+  let effectiveMaxChars = maxCharsCap;
 
-  const windows: SummaryWindow[] = [];
+  if (opts?.targetMinWindows && opts.targetMinWindows > 1 && pieces.length > 1) {
+    const desired = Math.min(opts.targetMinWindows, pieces.length);
+    const wordsPerTarget = Math.ceil(totalWords / desired);
+    const charsPerTarget = Math.ceil(totalChars / desired);
+    if (wordsPerTarget < effectiveMaxWords && wordsPerTarget >= 180) {
+      effectiveMaxWords = wordsPerTarget;
+    }
+    if (charsPerTarget < effectiveMaxChars && charsPerTarget >= 1200) {
+      effectiveMaxChars = charsPerTarget;
+    }
+  }
+
+  const windows: ContextWindow[] = [];
   let curPieces: typeof pieces = [];
-  let curLen = 0;
+  let curWords = 0;
+  let curChars = 0;
 
   const flush = () => {
     if (curPieces.length === 0) return;
@@ -1065,25 +1303,46 @@ function buildSummaryWindows(
       parts.push(`${prefix}${p.text}`);
     }
     const winChunks = curPieces.map((p) => p.chunk);
+    const text = truncateToContextBudget(
+      parts.join("\n"),
+      maxWordsCap,
+      maxCharsCap
+    );
     windows.push({
-      text: parts.join("\n"),
+      text,
       chunks: winChunks,
       pageRange: computePageRangeLabel(winChunks),
+      wordCount: countWords(text),
     });
     curPieces = [];
-    curLen = 0;
+    curWords = 0;
+    curChars = 0;
   };
 
   for (const piece of pieces) {
-    if (curLen + piece.text.length > budget && curPieces.length > 0) {
+    const pieceChars = piece.text.length + 18;
+    if (
+      curPieces.length > 0 &&
+      (curWords + piece.words > effectiveMaxWords ||
+        curChars + pieceChars > effectiveMaxChars)
+    ) {
       flush();
     }
     curPieces.push(piece);
-    curLen += piece.text.length + 8;
+    curWords += piece.words;
+    curChars += pieceChars;
   }
   flush();
 
-  return windows;
+  if (windows.length <= maxWindows) {
+    return windows;
+  }
+
+  // Only if an extraordinary document produces > maxWindows, sample evenly across the entire document
+  return Array.from(
+    { length: maxWindows },
+    (_, i) => windows[Math.floor((i * (windows.length - 1)) / (maxWindows - 1))]
+  );
 }
 
 interface ParsedSummaryMarkdown {
@@ -1146,7 +1405,13 @@ function parseSummaryMarkdown(raw: string): ParsedSummaryMarkdown {
       for (const r of rawBody) {
         const normalized = headers.map((_, i) => r[i] ?? "");
         const joined = normalized.join(" ").trim();
-        if (!joined || /^(?:valeur|colonne [a-z0-9]|donn[ée]e\s*\d|\.{3}|-)+$/i.test(joined)) {
+        if (
+          !joined ||
+          /^(?:valeur|colonne [a-z0-9]|donn[ée]e\s*(?:r[ée]elle\s*)?[a-z0-9]+|[ée]l[ée]ment\s*r[ée]el\s*[a-z0-9]+|caract[ée]ristique\s*\d|\.{3}|-)+$/i.test(
+            joined
+          ) ||
+          normalized.some((cell) => hasGenericPlaceholderLeak(cell))
+        ) {
           continue;
         }
         const key = normalized.map((c) => c.toLowerCase()).join("|");
@@ -1309,7 +1574,12 @@ export async function generateStudioArtifact(params: {
   pageImagesBase64?: PageImageInput[];
   onProgress?: (percent: number, detailLabel: string) => void;
   shouldStop?: () => boolean;
-}): Promise<{ title: string; content: StudioArtifactContent; usedAi: boolean }> {
+}): Promise<{
+  title: string;
+  content: StudioArtifactContent;
+  usedAi: boolean;
+  emptySourceText?: boolean;
+}> {
   const {
     kind,
     chunks,
@@ -1329,6 +1599,88 @@ export async function generateStudioArtifact(params: {
         ...chunks.filter((c) => !c.content.includes("[REPÈRE VISUEL")),
       ];
 
+  const defaultTopic =
+    prompt?.trim().slice(0, 72) ||
+    chunks[0]?.documentTitle ||
+    chunks[0]?.ueTitle ||
+    "Synthèse de cours";
+
+  // Hard safety guard: never call Ollama on empty/scanned PDFs with no usable text
+  if (!hasUsableChunksText(orderedChunks)) {
+    const uniqueDocIds = Array.from(
+      new Set(orderedChunks.map((c) => c.documentId).filter(Boolean))
+    );
+    console.error(
+      `[Studio] Génération ${kind} annulée : texte extrait vide ou PDF scanné sans texte exploitable (documents: ${
+        uniqueDocIds.join(", ") || "aucun"
+      }). Aucun appel Ollama effectué.`
+    );
+    if (uniqueDocIds.length === 1) {
+      await setDocumentProcessingStatus(
+        uniqueDocIds[0],
+        "ERROR",
+        "PDF scanné ou sans texte exploitable (OCR requis)"
+      ).catch(() => null);
+    }
+
+    if (kind === "FLASHCARDS") {
+      return {
+        title: params.title?.trim() || `Flashcards — ${defaultTopic}`,
+        usedAi: false,
+        emptySourceText: true,
+        content: { kind: "FLASHCARDS", cards: [], sources },
+      };
+    }
+    if (kind === "QUIZ") {
+      return {
+        title: params.title?.trim() || `Quiz — ${defaultTopic}`,
+        usedAi: false,
+        emptySourceText: true,
+        content: { kind: "QUIZ", questions: [], sources },
+      };
+    }
+    if (kind === "SVG_DIAGRAM") {
+      const emptyTitle = params.title?.trim() || `Schéma : ${defaultTopic}`;
+      const svg = compileSwissEditorialSvg({
+        title: emptyTitle,
+        subtitle: "PDF sans texte exploitable",
+        layout: "FLOW",
+        nodes: [],
+        edges: [],
+        sources,
+      });
+      return {
+        title: emptyTitle,
+        usedAi: false,
+        emptySourceText: true,
+        content: {
+          kind: "SVG_DIAGRAM",
+          title: emptyTitle,
+          subtitle: "PDF sans texte exploitable",
+          layout: "FLOW",
+          nodes: [],
+          edges: [],
+          svg,
+          sources,
+        },
+      };
+    }
+    return {
+      title: params.title?.trim() || `Fiche — ${defaultTopic}`,
+      usedAi: false,
+      emptySourceText: true,
+      content: {
+        kind: "SUMMARY",
+        pipeline: "FULL_V3",
+        overview: "Aucun texte exploitable détecté dans ce document (PDF scanné ou vide).",
+        sections: [],
+        keyConcepts: [],
+        examPitfalls: [],
+        sources,
+      },
+    };
+  }
+
   let visualContextNote = "";
   if (Array.isArray(pageImagesBase64) && pageImagesBase64.length > 0) {
     const descriptions: string[] = [];
@@ -1347,14 +1699,11 @@ export async function generateStudioArtifact(params: {
     }
   }
 
-  const contextText =
-    visualContextNote + formatChunksForPrompt(orderedChunks, 560, 7);
-
-  const defaultTopic =
-    prompt?.trim().slice(0, 72) ||
-    chunks[0]?.documentTitle ||
-    chunks[0]?.ueTitle ||
-    "Synthèse de cours";
+  const contextText = truncateToContextBudget(
+    visualContextNote + formatChunksForPrompt(orderedChunks, 900, 10),
+    2000,
+    12000
+  );
 
   const customContextBlock = prompt?.trim()
     ? `\nOBJECTIF ET CONTEXTE PRIORITAIRE DE L'ÉTUDIANT :\n« ${prompt.trim()} »\nAdapte impérativement les explications, exemples et questions à ce que l'étudiant cherche à comprendre.\n`
@@ -1369,24 +1718,27 @@ export async function generateStudioArtifact(params: {
       nodes?: SvgNodeSpec[];
       edges?: SvgEdgeSpec[];
     }>(
-      `Tu es Spix, professeur universitaire vétérinaire. À partir des extraits de cours ci-dessous, conçois un schéma conceptuel clair en français qui aide à comprendre la logique et les relations entre notions sur : "${defaultTopic}".
+      `À partir des extraits de cours ci-dessous, conçois un schéma conceptuel rigoureux en français sur : "${defaultTopic}".
 ${customContextBlock}
-Réponds STRICTEMENT en JSON :
-{
-  "title": "Titre court du schéma",
-  "subtitle": "Sous-titre académique",
-  "layout": "FLOW",
-  "nodes": [
-    { "id": "n1", "code": "01 / ÉTAPE", "label": "Nom court", "detail": "Explication concise en 10 mots" }
-  ],
-  "edges": [
-    { "from": "n1", "to": "n2", "label": "relation" }
-  ]
-}
-Contraintes : 4 à 6 nœuds maximum, ids n1..n6.
+DESCRIPTION DES CHAMPS JSON ATTENDUS :
+- "title" : titre court et précis résumant le sujet exact du schéma.
+- "subtitle" : sous-titre académique précisant le domaine scientifique traité.
+- "layout" : une valeur parmi "FLOW", "HIERARCHY" ou "RADIAL".
+- "nodes" : tableau de 4 à 6 nœuds maximum, chacun contenant :
+  - "id" : identifiant séquentiel ("n1" à "n6").
+  - "code" : repère court d'étape ou de catégorie tiré du cours.
+  - "label" : intitulé exact du concept tiré du document.
+  - "detail" : explication factuelle concise (8 à 14 mots) fondée sur le cours.
+- "edges" : tableau de liaisons entre nœuds, chacune contenant "from", "to" (identifiants de nœuds existants) et "label" (relation causale ou fonctionnelle réelle issue du cours).
 
-EXTRAITS :
-${contextText}`
+EXTRAITS DU COURS :
+${contextText}`,
+      {
+        system:
+          "Tu es Spix, professeur universitaire vétérinaire spécialisé dans la synthèse visuelle scientifique.",
+        format: SVG_DIAGRAM_SCHEMA,
+        numPredict: 2000,
+      }
     );
 
     let nodes: SvgNodeSpec[] = [];
@@ -1396,26 +1748,37 @@ ${contextText}`
     let layout: "FLOW" | "HIERARCHY" | "RADIAL" = "FLOW";
     let usedAi = false;
 
-    if (
-      aiDiagram?.nodes &&
-      Array.isArray(aiDiagram.nodes) &&
-      aiDiagram.nodes.length >= 2
-    ) {
+    const validAiNodes = Array.isArray(aiDiagram?.nodes)
+      ? aiDiagram.nodes.filter(
+          (n) =>
+            n?.label &&
+            !hasGenericPlaceholderLeak(n.label) &&
+            !hasGenericPlaceholderLeak(n.detail)
+        )
+      : [];
+
+    if (validAiNodes.length >= 2) {
       usedAi = true;
-      nodes = aiDiagram.nodes.slice(0, 6).map((n, idx) => ({
+      nodes = validAiNodes.slice(0, 6).map((n, idx) => ({
         id: n.id || `n${idx + 1}`,
         code: n.code || `0${idx + 1}`,
         label: n.label || `Concept ${idx + 1}`,
         detail: n.detail || "",
         color: SWISS_COLORS[idx % SWISS_COLORS.length],
       }));
-      edges = Array.isArray(aiDiagram.edges) ? aiDiagram.edges : [];
-      if (aiDiagram.title) diagramTitle = aiDiagram.title;
-      if (aiDiagram.subtitle) subtitle = aiDiagram.subtitle;
+      edges = Array.isArray(aiDiagram?.edges)
+        ? aiDiagram.edges.filter((e) => !hasGenericPlaceholderLeak(e.label))
+        : [];
+      if (aiDiagram?.title && !hasGenericPlaceholderLeak(aiDiagram.title)) {
+        diagramTitle = aiDiagram.title;
+      }
+      if (aiDiagram?.subtitle && !hasGenericPlaceholderLeak(aiDiagram.subtitle)) {
+        subtitle = aiDiagram.subtitle;
+      }
       if (
-        aiDiagram.layout === "HIERARCHY" ||
-        aiDiagram.layout === "RADIAL" ||
-        aiDiagram.layout === "FLOW"
+        aiDiagram?.layout === "HIERARCHY" ||
+        aiDiagram?.layout === "RADIAL" ||
+        aiDiagram?.layout === "FLOW"
       ) {
         layout = aiDiagram.layout;
       }
@@ -1468,28 +1831,44 @@ ${contextText}`
   }
 
   if (kind === "FLASHCARDS") {
-    const targetCount = fullCourseMode ? 60 : 10;
+    // Split large handouts into sequential context-safe windows (never overflowing num_ctx = 8192)
+    const windows = fullCourseMode
+      ? splitChunksIntoContextWindows(orderedChunks, {
+          maxWords: 1600,
+          maxChars: 9500,
+          maxWindows: 30,
+          targetMinWindows: Math.min(
+            10,
+            Math.max(1, Math.ceil(orderedChunks.length / 4))
+          ),
+        })
+      : splitChunksIntoContextWindows(orderedChunks.slice(0, 12), {
+          maxWords: 1800,
+          maxChars: 10500,
+          maxWindows: 1,
+        });
+
+    const targetCount = fullCourseMode
+      ? Math.min(100, Math.max(60, windows.length * 5))
+      : 10;
     const title =
       params.title?.trim() ||
       (fullCourseMode
-        ? `60 Flashcards — ${chunks[0]?.documentTitle || defaultTopic}`
+        ? `Flashcards complètes — ${chunks[0]?.documentTitle || defaultTopic}`
         : `Flashcards ciblées : ${defaultTopic}`);
-
-    const segments = fullCourseMode
-      ? partitionChunks(orderedChunks, 10)
-      : [orderedChunks.slice(0, 8)];
 
     const cards: FlashcardItem[] = [];
     const seenFronts = new Set<string>();
     let anyAiUsed = false;
 
     const runFlashcardPass = async (
-      segChunks: SourceChunk[],
+      win: ContextWindow,
       passLabel: string,
       desiredCount: number,
       avoidHint = ""
     ) => {
-      const segContext = formatChunksForPrompt(segChunks, 560, 8);
+      if (!hasUsableText(win.text)) return;
+
       const aiCards = await callOllamaJson<{
         cards?: Array<{
           front?: string;
@@ -1498,32 +1877,24 @@ ${contextText}`
           sourcePage?: number;
         }>;
       }>(
-        `Tu es un créateur de flashcards pédagogiques de niveau NotebookLM pour des étudiants vétérinaires d'Oniris.
-Génère exactement ${desiredCount} flashcards de RÉVISION ACTIVE basées sur les VALEURS, DÉFINITIONS, MÉCANISMES et CRITÈRES extraits de ces extraits.
+        `Génère exactement ${desiredCount} flashcards de révision active fondées uniquement sur les faits, valeurs chiffrées, définitions, mécanismes et critères présents dans les extraits ci-dessous.
 ${passLabel}
 ${customContextBlock}${avoidHint}
-RÈGLES STRICTES :
-1. RECTO ("front") : Une QUESTION DIRECTE, COURTE et AUTONOME en une seule phrase (10 à 22 mots max), testant une valeur précise (taille, %, seuil, date, effectif), un mécanisme, un rôle ou une distinction.
-   EXEMPLE MODÈLE : "Quelle est la plage de taille caractéristique d'un érythrocyte chez les mammifères ?"
-   INTERDIT : "Notion clé page X : que faut-il retenir ?" ou recopier une phrase du texte.
-2. VERSO ("back") : Réponse exacte, nette et concise en 1 à 2 phrases. Mets la valeur ou le terme clé en gras au début (ex : "**6 à 8 µm** de diamètre en moyenne (cellule biconcave anucléée chez les mammifères).").
-3. Indique un "tag" court (ex : "VALEUR CLÉ", "DÉFINITION", "MÉCANISME", "ANATOMIE", "CLINIQUE") et "sourcePage".
+DESCRIPTION DES CHAMPS JSON ATTENDUS (objet contenant le tableau "cards") :
+- "front" : une question directe, courte et autonome en une seule phrase (10 à 22 mots) portant sur une valeur exacte, un mécanisme, un rôle anatomique/physiologique ou une distinction réelle du document. Interdit de formuler une question méta sur la page ou de recopier une phrase brute.
+- "back" : la réponse exacte, nette et concise en 1 à 2 phrases en mettant le terme ou la valeur clé en gras au début.
+- "tag" : une catégorie thématique courte en majuscules adaptée à la discipline (ex. catégorie scientifique pertinente du passage).
+- "sourcePage" : l'entier correspondant au numéro de page exact [P.X] indiqué dans les extraits.
 
-Réponds STRICTEMENT en JSON :
-{
-  "cards": [
-    {
-      "front": "Question courte et directe sur une valeur, notion ou mécanisme ?",
-      "back": "**Réponse clé** : explication concise et précise issue du cours.",
-      "tag": "VALEUR CLÉ",
-      "sourcePage": 1
-    }
-  ]
-}
-
-EXTRAITS :
-${segContext}`,
-        { arrayKeys: ["cards"], numPredict: 2400 }
+EXTRAITS DU COURS (${win.pageRange}) :
+${win.text}`,
+        {
+          system:
+            "Tu es un créateur de flashcards pédagogiques universitaires vétérinaires exigeant et rigoureux.",
+          format: FLASHCARDS_SCHEMA,
+          arrayKeys: ["cards"],
+          numPredict: 2600,
+        }
       );
 
       if (
@@ -1531,7 +1902,6 @@ ${segContext}`,
         Array.isArray(aiCards.cards) &&
         aiCards.cards.length > 0
       ) {
-        anyAiUsed = true;
         for (let idx = 0; idx < aiCards.cards.length; idx += 1) {
           if (cards.length >= targetCount) break;
           const c = aiCards.cards[idx];
@@ -1541,15 +1911,17 @@ ${segContext}`,
           if (
             cleanFront.length < 10 ||
             cleanBack.length < 4 ||
-            isLowQualityExcerptQuestion(cleanFront)
+            isLowQualityExcerptQuestion(cleanFront, undefined, cleanBack) ||
+            hasGenericPlaceholderLeak(c.tag)
           ) {
             continue;
           }
           const normKey = cleanFront.toLowerCase().slice(0, 60);
           if (seenFronts.has(normKey)) continue;
           seenFronts.add(normKey);
+          anyAiUsed = true;
 
-          const src = resolveSourceChunkByPage(segChunks, c.sourcePage, idx);
+          const src = resolveSourceChunkByPage(win.chunks, c.sourcePage, idx);
           cards.push({
             id: `fc-${cards.length + 1}-${crypto.randomUUID().slice(0, 4)}`,
             front: cleanFront,
@@ -1564,39 +1936,38 @@ ${segContext}`,
       }
     };
 
-    for (let sIdx = 0; sIdx < segments.length; sIdx += 1) {
+    const perWindowCount = fullCourseMode
+      ? Math.max(4, Math.ceil(targetCount / Math.max(1, windows.length)))
+      : 10;
+
+    for (let sIdx = 0; sIdx < windows.length; sIdx += 1) {
       if (shouldStop?.() || cards.length >= targetCount) break;
 
-      const segChunks = segments[sIdx];
-      const pageSpan = computePageRangeLabel(segChunks);
+      const win = windows[sIdx];
       onProgress?.(
-        Math.round((sIdx / segments.length) * 100),
-        `Flashcards (${pageSpan} · Lot ${sIdx + 1}/${segments.length})`
+        Math.round((sIdx / Math.max(1, windows.length)) * 100),
+        `Flashcards (${win.pageRange} · Lot ${sIdx + 1}/${windows.length})`
       );
 
       const scopeHint = fullCourseMode
-        ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : extrais toutes les valeurs, définitions et mécanismes de ces pages (objectif global : 95% du cours sur les ${segments.length} lots).`
+        ? `PARTIE ${sIdx + 1}/${windows.length} DU COURS (${win.pageRange}) : couvre les valeurs, définitions et mécanismes clés présents dans ces pages.`
         : "Focus ciblé et exigeant sur la notion demandée par l'étudiant.";
 
-      await runFlashcardPass(
-        segChunks,
-        scopeHint,
-        fullCourseMode ? 6 : 10
-      );
+      await runFlashcardPass(win, scopeHint, perWindowCount);
     }
 
     // AI top-up pass if Ollama is responsive and slightly below targetCount
-    if (anyAiUsed && cards.length < targetCount && !shouldStop?.()) {
+    if (anyAiUsed && cards.length < targetCount && !shouldStop?.() && windows.length > 0) {
       for (let extra = 0; extra < 2 && cards.length < targetCount; extra += 1) {
         const deficit = Math.min(10, targetCount - cards.length);
-        const topUpChunks = segments[extra % segments.length] || orderedChunks;
+        const topUpWin = windows[extra % windows.length];
         const avoidList = cards
           .slice(-8)
           .map((c) => c.front)
           .join(" | ");
         await runFlashcardPass(
-          topUpChunks,
-          `COMPLÉMENT (${deficit} nouvelles flashcards distinctes) : explore d'autres détails, chiffres ou exemples non encore traités.`,
+          topUpWin,
+          `COMPLÉMENT (${deficit} nouvelles flashcards distinctes) : explore d'autres faits, chiffres ou mécanismes présents dans le texte non encore traités.`,
           deficit,
           avoidHintFromList(avoidList)
         );
@@ -1632,28 +2003,44 @@ ${segContext}`,
   }
 
   if (kind === "QUIZ") {
-    const targetCount = fullCourseMode ? 30 : 6;
+    // Split large handouts into sequential context-safe windows (never overflowing num_ctx = 8192)
+    const windows = fullCourseMode
+      ? splitChunksIntoContextWindows(orderedChunks, {
+          maxWords: 1600,
+          maxChars: 9500,
+          maxWindows: 25,
+          targetMinWindows: Math.min(
+            10,
+            Math.max(1, Math.ceil(orderedChunks.length / 4))
+          ),
+        })
+      : splitChunksIntoContextWindows(orderedChunks.slice(0, 12), {
+          maxWords: 1800,
+          maxChars: 10500,
+          maxWindows: 1,
+        });
+
+    const targetCount = fullCourseMode
+      ? Math.min(60, Math.max(30, windows.length * 3))
+      : 6;
     const title =
       params.title?.trim() ||
       (fullCourseMode
-        ? `Quiz complet (30 Q) — ${chunks[0]?.documentTitle || defaultTopic}`
+        ? `Quiz complet (${targetCount} Q) — ${chunks[0]?.documentTitle || defaultTopic}`
         : `Quiz ciblé : ${defaultTopic}`);
-
-    const segments = fullCourseMode
-      ? partitionChunks(orderedChunks, 10)
-      : [orderedChunks.slice(0, 8)];
 
     const questions: RevisionQuestion[] = [];
     const seenPrompts = new Set<string>();
     let anyAiUsed = false;
 
     const runQuizPass = async (
-      segChunks: SourceChunk[],
+      win: ContextWindow,
       passLabel: string,
       batchSize: number,
       avoidHint = ""
     ) => {
-      const segContext = formatChunksForPrompt(segChunks, 560, 8);
+      if (!hasUsableText(win.text)) return;
+
       const aiQuiz = await callOllamaJson<{
         questions?: Array<{
           type?: "QCU" | "QCM" | "QROC" | "FILL_BLANK";
@@ -1668,51 +2055,29 @@ ${segContext}`,
           sourcePage?: number;
         }>;
       }>(
-        `Tu es un concepteur d'examens de niveau NotebookLM pour étudiants vétérinaires d'Oniris.
-Génère un QUIZ ORIGINAL de ${batchSize} questions précises testant les VALEURS, SEUILS, DÉFINITIONS et MÉCANISMES extraits du cours ci-dessous.
+        `Génère exactement ${batchSize} questions d'examen originales et précises testant les valeurs, seuils, définitions et mécanismes scientifiques extraits du cours ci-dessous.
 ${passLabel}
 ${customContextBlock}${avoidHint}
-RÈGLES ABSOLUES (NON NÉGOCIABLES) :
-1. INTERDIT de recopier des phrases du polycopié en options ou de demander « quelle phrase correspond au cours ».
-2. QCU (majoritaire) : pose une question directe et précise (ex : "Quel pourcentage approximatif de thymocytes subit la mort par apoptose lors du processus de sélection dans la corticale thymique ?").
-   Les 4 options ("options") DOIVENT être COURTES (1 à 8 mots maximum, homogènes entre elles), SANS préfixe "A./B.", comme : ["Moins de 5%", "Environ 10 à 15%", "Plus de 90%", "Exactement 50%"].
-3. QCM : question à 2 ou 3 bonnes réponses, avec 4 options courtes et claires (1 à 10 mots max par option).
-4. QROC : question ouverte courte dont la réponse attendue tient en 1 à 4 mots exacts (un terme, chiffre ou mécanisme).
-5. Varie la position de la bonne réponse et rédige une "explanation" concise.
+DESCRIPTION DES CHAMPS JSON ATTENDUS (objet contenant le tableau "questions") :
+Chaque élément de "questions" doit contenir :
+- "type" : "QCU" (majoritaire, une seule bonne réponse), "QCM" (2 ou 3 bonnes réponses) ou "QROC" (question ouverte à réponse courte exacte).
+- "prompt" : énoncé interrogatif direct, autonome et contextualisé portant sur un fait précis du cours (interdit de recopier des phrases du polycopié en propositions ou de demander quelle phrase figure dans le cours).
+- "options" : pour QCU et QCM, un tableau de exactement 4 propositions courtes (1 à 10 mots chacune), homogènes entre elles, plausibles et sans préfixe alphabétique ; pour QROC, un tableau vide.
+- "correctIndices" : pour QCU, un tableau contenant l'unique indice entier (0 à 3) de la bonne réponse en variant la position ; pour QCM, 2 ou 3 indices entiers (0 à 3) ; pour QROC, un tableau vide.
+- "correctAnswer" : pour QROC uniquement, la réponse exacte attendue en 1 à 4 mots tirée du cours ; chaîne vide pour QCU/QCM.
+- "acceptedKeywords" : pour QROC uniquement, liste des mots-clés scientifiques exacts et synonymes acceptés tirés du cours ; tableau vide pour QCU/QCM.
+- "explanation" : justification pédagogique concise rédigée à partir des faits précis du cours.
+- "sourcePage" : entier correspondant au numéro de page exact [P.X] figurant dans les extraits.
 
-Réponds STRICTEMENT en JSON :
-{
-  "questions": [
-    {
-      "type": "QCU",
-      "prompt": "Quel pourcentage approximatif de thymocytes subit l'apoptose dans la corticale thymique ?",
-      "options": ["Moins de 5%", "Environ 10 à 15%", "Plus de 90%", "Exactement 50%"],
-      "correctIndices": [2],
-      "explanation": "Plus de 90 % des thymocytes sont éliminés lors de la sélection positive/négative.",
-      "sourcePage": 2
-    },
-    {
-      "type": "QCM",
-      "prompt": "Parmi ces éléments concernant ce mécanisme, lesquels sont exacts ?",
-      "options": ["Option courte 1", "Option courte 2", "Option courte 3", "Option courte 4"],
-      "correctIndices": [0, 2],
-      "explanation": "Justification concise.",
-      "sourcePage": 4
-    },
-    {
-      "type": "QROC",
-      "prompt": "Quel terme désigne l'agent ou le concept clé de cette étape ?",
-      "correctAnswer": "Réponse courte",
-      "acceptedKeywords": ["motcle1", "synonyme"],
-      "explanation": "Justification concise.",
-      "sourcePage": 5
-    }
-  ]
-}
-
-EXTRAITS :
-${segContext}`,
-        { arrayKeys: ["questions"], numPredict: 2400 }
+EXTRAITS DU COURS (${win.pageRange}) :
+${win.text}`,
+        {
+          system:
+            "Tu es un concepteur d'examens universitaires vétérinaires rigoureux.",
+          format: STUDIO_QUIZ_SCHEMA,
+          arrayKeys: ["questions"],
+          numPredict: 2600,
+        }
       );
 
       if (
@@ -1723,12 +2088,13 @@ ${segContext}`,
         for (let idx = 0; idx < aiQuiz.questions.length; idx += 1) {
           if (questions.length >= targetCount) break;
           const q = aiQuiz.questions[idx];
-          const src = resolveSourceChunkByPage(segChunks, q.sourcePage, idx);
+          const src = resolveSourceChunkByPage(win.chunks, q.sourcePage, idx);
           if (!src || !q.prompt) continue;
 
           const cleanPrompt = q.prompt.trim();
           const promptKey = cleanPrompt.toLowerCase().slice(0, 60);
           if (seenPrompts.has(promptKey)) continue;
+          if (hasGenericPlaceholderLeak(q.explanation)) continue;
 
           if (
             (q.type === "QCU" || q.type === "QCM") &&
@@ -1779,7 +2145,7 @@ ${segContext}`,
             q.type === "QROC" &&
             typeof q.correctAnswer === "string" &&
             q.correctAnswer.trim().length > 0 &&
-            !isLowQualityExcerptQuestion(cleanPrompt)
+            !isLowQualityExcerptQuestion(cleanPrompt, undefined, q.correctAnswer)
           ) {
             seenPrompts.add(promptKey);
             anyAiUsed = true;
@@ -1787,7 +2153,7 @@ ${segContext}`,
             const kw = Array.isArray(q.acceptedKeywords)
               ? q.acceptedKeywords
                   .map((k) => String(k).trim())
-                  .filter((k) => k.length > 0)
+                  .filter((k) => k.length > 0 && !hasGenericPlaceholderLeak(k))
               : [];
             questions.push({
               id: `sq-${questions.length + 1}`,
@@ -1812,7 +2178,7 @@ ${segContext}`,
             q.type === "FILL_BLANK" &&
             q.sentenceWithBlank &&
             q.correctAnswer &&
-            !isLowQualityExcerptQuestion(cleanPrompt)
+            !isLowQualityExcerptQuestion(cleanPrompt, undefined, q.correctAnswer)
           ) {
             seenPrompts.add(promptKey);
             anyAiUsed = true;
@@ -1845,39 +2211,41 @@ ${segContext}`,
       }
     };
 
-    for (let sIdx = 0; sIdx < segments.length; sIdx += 1) {
+    const batchSizePerWindow = fullCourseMode
+      ? Math.max(3, Math.ceil(targetCount / Math.max(1, windows.length)))
+      : 6;
+
+    for (let sIdx = 0; sIdx < windows.length; sIdx += 1) {
       if (shouldStop?.() || questions.length >= targetCount) break;
 
-      const segChunks = segments[sIdx];
-      const pageSpan = computePageRangeLabel(segChunks);
+      const win = windows[sIdx];
       onProgress?.(
-        Math.round((sIdx / segments.length) * 100),
-        `Quiz (${pageSpan} · Lot ${sIdx + 1}/${segments.length})`
+        Math.round((sIdx / Math.max(1, windows.length)) * 100),
+        `Quiz (${win.pageRange} · Lot ${sIdx + 1}/${windows.length})`
       );
 
-      const batchSize = fullCourseMode ? 3 : 6;
       const scopeHint = fullCourseMode
-        ? `PARTIE ${sIdx + 1}/${segments.length} DU COURS (${pageSpan}) : interroge les notions, chiffres et mécanismes clés de ces pages pour couvrir 95% du cours sur les ${segments.length} lots.`
+        ? `PARTIE ${sIdx + 1}/${windows.length} DU COURS (${win.pageRange}) : interroge les notions, chiffres et mécanismes clés présents dans ces pages.`
         : "Focus ciblé et exigeant sur ce que l'étudiant cherche à comprendre.";
 
-      await runQuizPass(segChunks, scopeHint, batchSize);
+      await runQuizPass(win, scopeHint, batchSizePerWindow);
     }
 
     // AI top-up pass if Ollama is responsive and slightly below targetCount
-    if (anyAiUsed && questions.length < targetCount && !shouldStop?.()) {
+    if (anyAiUsed && questions.length < targetCount && !shouldStop?.() && windows.length > 0) {
       for (
         let extra = 0;
         extra < 2 && questions.length < targetCount;
         extra += 1
       ) {
         const deficit = Math.min(6, targetCount - questions.length);
-        const topUpChunks = segments[extra % segments.length] || orderedChunks;
+        const topUpWin = windows[extra % windows.length];
         const avoidList = questions
           .slice(-6)
           .map((q) => q.prompt)
           .join(" | ");
         await runQuizPass(
-          topUpChunks,
+          topUpWin,
           `COMPLÉMENT (${deficit} nouvelles questions distinctes) : interroge d'autres valeurs, cas ou notions non encore posés.`,
           deficit,
           avoidHintFromList(avoidList)
@@ -1920,11 +2288,12 @@ ${segContext}`,
       ? `Fiche de Révision Ultime — ${chunks[0]?.documentTitle || defaultTopic}`
       : `Fiche Ciblée : ${defaultTopic}`);
 
-  const windows = buildSummaryWindows(
+  // Context-window-safe sequential splitting covering the ENTIRE handout (no 8-window truncation!)
+  const windows = splitChunksIntoContextWindows(
     orderedChunks,
     fullCourseMode
-      ? { targetChars: 4800, maxWindows: 8 }
-      : { targetChars: 5600, maxWindows: 2 }
+      ? { maxWords: 1800, maxChars: 11000, maxWindows: 40 }
+      : { maxWords: 2000, maxChars: 12000, maxWindows: 3 }
   );
 
   const sections: SummarySection[] = [];
@@ -1941,46 +2310,38 @@ ${segContext}`,
     totalWindows: number
   ) => {
     const scope = fullCourseMode
-      ? `Tu traites la PARTIE ${wIdx + 1}/${totalWindows} du polycopié (pages ${pageRange}). Couvre de façon exhaustive TOUTES les notions scientifiques présentes dans ces pages.`
+      ? `Tu traites la PARTIE ${wIdx + 1}/${totalWindows} du polycopié (pages ${pageRange}). Couvre de façon exhaustive toutes les notions scientifiques présentes dans ces pages.`
       : "Réponds précisément à la demande de l'étudiant à partir de ces extraits.";
 
-    return `Tu es un major de promo vétérinaire (Oniris) qui rédige une FICHE DE RÉVISION ULTIME ultra-claire et complète à partir des diapositives/polycopiés ci-dessous.
-${scope}
+    return `${scope}
 ${customContextBlock}
 RÈGLES IMPÉRATIVES :
-1. Garde 100 % des notions scientifiques réelles : définitions, molécules, hormones, récepteurs, mécanismes, organes, classifications, abréviations expliquées, valeurs chiffrées et exceptions présentes dans le texte.
-2. IGNORE totalement les bruits de diapos : numéros de pages isolés, questions orales du prof (« d'après vous ? », « savoir positionner les flèches »), références bibliographiques (« Pocock & Richards 2004 ») et titres de cours répétés.
-3. N'INVENTE RIEN hors du texte. Dans un tableau, ne répète JAMAIS la même ligne ; n'ajoute un tableau que si le texte compare réellement au moins 2 entités distinctes (ex : hormones hydrosolubles vs liposolubles, espèces, récepteurs).
-4. Ne mets dans PIÈGES que des confusions réelles issues du texte.
+1. Conserve 100 % des notions scientifiques réelles du texte : définitions, molécules, hormones, récepteurs, mécanismes, organes, classifications, abréviations expliquées, valeurs chiffrées et exceptions.
+2. Ignore totalement les bruits de diapositives : numéros de pages isolés, questions orales de l'enseignant, références bibliographiques et en-têtes répétés.
+3. N'invente aucune donnée absente du texte. N'insère un tableau Markdown que lorsque le passage compare réellement au moins deux entités scientifiques distinctes, sans jamais répéter de ligne.
+4. Ne place dans la rubrique des pièges que des confusions ou exceptions réellement présentes dans ces pages.
 
-FORMAT OBLIGATOIRE (Markdown pur, PAS de JSON) :
-TITRE: titre court et précis de cette partie
-## 📜 Titre d'une sous-partie thématique
-> 💡 **Définition** : définition exacte avec les **mots-clés** en gras
-> ⚠️ **À retenir** : règle d'or, mécanisme majeur ou seuil clé
-- **Terme clé** : explication complète et structurée (mécanisme, abréviation, valeur, exemple)
-  - précision ou exception éventuelle
-| Entité | Caractéristique 1 | Caractéristique 2 |
-|---|---|---|
-| Élément réel A | Donnée réelle A1 | Donnée réelle A2 |
-| Élément réel B | Donnée réelle B1 | Donnée réelle B2 |
-## 🎯 Autre sous-partie thématique
-- **Autre terme** : explication claire
-PIÈGES:
-- distinction importante issue du cours
-
-Produis 3 à 5 sous-parties bien fournies (au moins 4 puces riches par sous-partie), en français irréprochable.
+SYNTAXE MARKDOWN OBLIGATOIRE (Markdown pur, sans JSON) :
+- Première ligne : le préfixe "TITRE:" suivi du titre précis de cette section du cours.
+- Ensuite 3 à 5 sous-parties introduites chacune par un titre Markdown niveau 2 ("##") suivi d'un emoji thématique pertinent et de l'intitulé réel de la sous-partie.
+- Utilise des citations Markdown (">") avec l'emoji 💡 pour une définition exacte et l'emoji ⚠️ pour une règle majeure ou un seuil chiffré tiré du cours.
+- Rédige au moins 4 puces Markdown ("-") détaillées par sous-partie, en mettant en gras le nom du concept réel suivi de deux-points et de son explication complète (avec sous-puces indentées de deux espaces pour les exceptions ou précisions).
+- Ajoute un tableau Markdown uniquement si le cours compare explicitement plusieurs entités réelles.
+- Termine par une ligne "PIÈGES:" suivie d'une liste à puces des distinctions et pièges réels issus du passage.
 
 EXTRAITS DU COURS (pages ${pageRange}) :
 ${winText}`;
   };
+
+  const summarySystemPrompt =
+    "Tu es un major de promotion vétérinaire qui rédige une fiche de révision universitaire exhaustive, rigoureuse et strictement fidèle aux extraits de cours fournis.";
 
   for (let wIdx = 0; wIdx < windows.length; wIdx += 1) {
     if (shouldStop?.()) break;
 
     const win = windows[wIdx];
     onProgress?.(
-      Math.round((wIdx / windows.length) * 100),
+      Math.round((wIdx / Math.max(1, windows.length)) * 100),
       fullCourseMode
         ? `Fiche ultime (${win.pageRange} · partie ${wIdx + 1}/${windows.length})`
         : "Rédaction de la fiche ciblée..."
@@ -2000,17 +2361,25 @@ ${winText}`;
 
     let md = await callOllamaText(
       buildSummaryPrompt(win.text, win.pageRange, wIdx, windows.length),
-      { numPredict: 1400, timeoutMs: 240000 }
+      {
+        system: summarySystemPrompt,
+        numPredict: 1800,
+        timeoutMs: OLLAMA_TIMEOUT_MS,
+      }
     );
     let parsed = md ? parseSummaryMarkdown(md) : null;
     let aiOk = Boolean(parsed) && scoreRichness(parsed) >= 3;
 
     // Automatic single retry with condensed high-value text if first attempt failed
     if (!aiOk && !shouldStop?.()) {
-      const condensed = selectHighValueText(win.text, 3200);
+      const condensed = selectHighValueText(win.text, 4500);
       md = await callOllamaText(
         buildSummaryPrompt(condensed, win.pageRange, wIdx, windows.length),
-        { numPredict: 1200, timeoutMs: 200000 }
+        {
+          system: summarySystemPrompt,
+          numPredict: 1400,
+          timeoutMs: OLLAMA_TIMEOUT_MS,
+        }
       );
       parsed = md ? parseSummaryMarkdown(md) : null;
       aiOk = Boolean(parsed) && scoreRichness(parsed) >= 3;
@@ -2193,13 +2562,23 @@ export function isStalePublicArtifact(
       if (qs.length === 0) return true;
       const anyAi = qs.some((q) => Boolean(q.generatedByAi));
       if (!anyAi) return true;
-      return qs.some((q) => isLowQualityExcerptQuestion(q.prompt || "", q.options));
+      return qs.some(
+        (q) =>
+          isLowQualityExcerptQuestion(
+            q.prompt || "",
+            q.options,
+            q.correctAnswer || q.flashcardBack
+          ) || hasGenericPlaceholderLeak(q.explanation)
+      );
     }
     if (kind === "FLASHCARDS") {
       const cards = Array.isArray(parsed.cards) ? parsed.cards : [];
       if (cards.length === 0) return true;
-      return cards.some((c) =>
-        /notion clé\s*\(|quel élément faut-il maîtriser/i.test(c.front || "")
+      return cards.some(
+        (c) =>
+          /notion clé\s*\(|quel élément faut-il maîtriser/i.test(c.front || "") ||
+          hasGenericPlaceholderLeak(c.front) ||
+          hasGenericPlaceholderLeak(c.back)
       );
     }
     if (kind === "SUMMARY") {
@@ -2208,6 +2587,23 @@ export function isStalePublicArtifact(
       const secs = Array.isArray(parsed.sections) ? parsed.sections : [];
       if (secs.length === 0) return true;
       if (secs.some((s) => /IA indisponible/i.test(s.title || ""))) return true;
+      if (
+        secs.some(
+          (s) =>
+            hasGenericPlaceholderLeak(s.title) ||
+            (s.subsections || []).some(
+              (sub) =>
+                hasGenericPlaceholderLeak(sub.title) ||
+                (sub.bullets || []).some(
+                  (b) =>
+                    hasGenericPlaceholderLeak(b.lead) ||
+                    hasGenericPlaceholderLeak(b.text)
+                )
+            )
+        )
+      ) {
+        return true;
+      }
       return !secs.some(
         (s) => Array.isArray(s.subsections) && s.subsections.length > 0
       );
@@ -2304,6 +2700,7 @@ export interface BackgroundQueueSnapshot {
     totalDocuments: number;
     indexedDocuments: number;
     unindexedDocuments: number;
+    errorDocuments: number;
     pendingIndexingChunks: number;
     totalExpectedAiArtifacts: number;
     completedPublicAiArtifacts: number;
@@ -2375,12 +2772,12 @@ export function requestStopBackgroundQueue(): void {
 }
 
 export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnapshot> {
-  await ensureStudioSchema();
+  await Promise.all([ensureStudioSchema(), ensureDocumentStatusSchema()]);
   const state = getQueueState();
 
-  const [docs, chunkStatsRows, publicArtifactRows] = await Promise.all([
+  const [docs, docStatusMap, chunkStatsRows, publicArtifactRows] = await Promise.all([
     prisma.document.findMany({
-      orderBy: { createdAt: "desc" },
+      orderBy: { createdAt: "asc" },
       select: {
         id: true,
         title: true,
@@ -2396,6 +2793,7 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
         },
       },
     }),
+    getDocumentStatusMap(),
     prisma.$queryRaw<
       Array<{ documentId: string; totalChunks: number; embeddedChunks: number }>
     >`
@@ -2440,11 +2838,18 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
   const indexingQueue: IndexingQueueItem[] = [];
   const aiContentQueue: AiQueueItem[] = [];
   let indexedDocuments = 0;
+  let errorDocuments = 0;
   let pendingIndexingChunks = 0;
   let completedPublicAiArtifacts = 0;
   let totalExpectedAiArtifacts = 0;
 
   for (const doc of docs) {
+    const docStatus = docStatusMap.get(doc.id);
+    if (docStatus?.processingStatus === "ERROR") {
+      errorDocuments += 1;
+      continue;
+    }
+
     const cStats = chunkStatsMap.get(doc.id) || {
       totalChunks: 0,
       embeddedChunks: 0,
@@ -2553,7 +2958,8 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
       )
     );
   } else {
-    const totalTasksAll = docs.length + totalExpectedAiArtifacts;
+    const activeDocsCount = Math.max(0, docs.length - errorDocuments);
+    const totalTasksAll = activeDocsCount + totalExpectedAiArtifacts;
     const doneTasksAll = indexedDocuments + completedPublicAiArtifacts;
     overallProgressPercent =
       totalTasksAll > 0 ? Math.round((doneTasksAll / totalTasksAll) * 100) : 100;
@@ -2594,6 +3000,7 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
       totalDocuments: docs.length,
       indexedDocuments,
       unindexedDocuments: indexingQueue.length,
+      errorDocuments,
       pendingIndexingChunks,
       totalExpectedAiArtifacts,
       completedPublicAiArtifacts,
@@ -2621,6 +3028,8 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
   generatedCount: number;
 }> {
   const state = getQueueState();
+
+  // Synchronous atomic guard BEFORE any await: strictly enforces concurrency = 1
   if (state.isRunning) {
     return {
       skipped: true,
@@ -2644,83 +3053,96 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
     };
   }
 
-  const health = await checkOllamaHealth();
-  if (!health.online) {
-    return {
-      skipped: true,
-      reason: "ollama-offline",
-      indexedCount: 0,
-      generatedCount: 0,
-    };
-  }
-
-  await ensureStudioSchema();
-  const initialSnapshot = await getBackgroundQueueSnapshot();
-
-  const matchesTarget = (item: { chapterId: string; documentId: string }) =>
-    (!targetChapterId || item.chapterId === targetChapterId) &&
-    (!targetDocumentId || item.documentId === targetDocumentId);
-
-  const totalIdxPlanned =
-    scope === "ALL" || scope === "INDEXING_ONLY"
-      ? initialSnapshot.indexingQueue.filter(matchesTarget).length
-      : 0;
-  const totalAiPlanned =
-    scope === "ALL" || scope === "AI_ONLY"
-      ? initialSnapshot.aiContentQueue.filter(matchesTarget).length
-      : 0;
-
-  if (totalIdxPlanned === 0 && totalAiPlanned === 0) {
-    state.lastRunAt = new Date().toISOString();
-    state.lastRunSummary = "Aucun document ni contenu IA en attente.";
-    return {
-      skipped: false,
-      reason: "nothing-pending",
-      indexedCount: 0,
-      generatedCount: 0,
-    };
-  }
-
+  // Acquire lock synchronously before any async I/O so overlapping triggers cannot race
   state.isRunning = true;
   state.stopRequested = false;
   state.mode = mode;
   state.currentPhase = "IDLE";
   state.currentDocumentId = null;
   state.currentAiKind = null;
-  state.currentTaskLabel = "Initialisation de la file...";
+  state.currentTaskLabel = "Vérification d'Ollama et de la file d'attente...";
   state.currentItemProgressPercent = 0;
   state.currentItemStartedAtMs = Date.now();
   state.completedItemsInRun = 0;
-  state.totalItemsInRun = totalIdxPlanned + totalAiPlanned;
+  state.totalItemsInRun = 0;
   state.startedAt = new Date().toISOString();
 
   let indexedCount = 0;
   let generatedCount = 0;
-  const maxItems = Math.max(1, options?.maxItems || 100);
+  const maxItems =
+    typeof options?.maxItems === "number" && options.maxItems > 0
+      ? options.maxItems
+      : Number.POSITIVE_INFINITY;
 
   const shouldAbort = () =>
     state.stopRequested || (mode === "NIGHTLY_AUTO" && !isWithinOffPeakWindow());
 
   try {
-    // Phase 1: Index unindexed documents sequentially
+    const health = await checkOllamaHealth();
+    if (!health.online) {
+      return {
+        skipped: true,
+        reason: "ollama-offline",
+        indexedCount: 0,
+        generatedCount: 0,
+      };
+    }
+
+    await Promise.all([ensureStudioSchema(), ensureDocumentStatusSchema()]);
+    const initialSnapshot = await getBackgroundQueueSnapshot();
+
+    const matchesTarget = (item: { chapterId: string; documentId: string }) =>
+      (!targetChapterId || item.chapterId === targetChapterId) &&
+      (!targetDocumentId || item.documentId === targetDocumentId);
+
+    const totalIdxPlanned =
+      scope === "ALL" || scope === "INDEXING_ONLY"
+        ? initialSnapshot.indexingQueue.filter(matchesTarget).length
+        : 0;
+    const totalAiPlanned =
+      scope === "ALL" || scope === "AI_ONLY"
+        ? initialSnapshot.aiContentQueue.filter(matchesTarget).length
+        : 0;
+
+    if (totalIdxPlanned === 0 && totalAiPlanned === 0) {
+      state.lastRunAt = new Date().toISOString();
+      state.lastRunSummary = "Aucun document ni contenu IA en attente.";
+      return {
+        skipped: false,
+        reason: "nothing-pending",
+        indexedCount: 0,
+        generatedCount: 0,
+      };
+    }
+
+    state.currentTaskLabel = "Initialisation de la file...";
+    state.totalItemsInRun = totalIdxPlanned + totalAiPlanned;
+
+    // Phase 1: Index ALL unindexed non-error documents strictly sequentially (one by one)
     if (scope === "ALL" || scope === "INDEXING_ONLY") {
-      const unindexedDocs = await prisma.document.findMany({
-        where: {
-          isIndexed: false,
-          ...(targetChapterId ? { chapterId: targetChapterId } : {}),
-          ...(targetDocumentId ? { id: targetDocumentId } : {}),
-        },
-        orderBy: { createdAt: "desc" },
-        select: {
-          id: true,
-          title: true,
-          localPath: true,
-          _count: { select: { chunks: true } },
-        },
-      });
+      const [unindexedDocs, statusMap] = await Promise.all([
+        prisma.document.findMany({
+          where: {
+            isIndexed: false,
+            ...(targetChapterId ? { chapterId: targetChapterId } : {}),
+            ...(targetDocumentId ? { id: targetDocumentId } : {}),
+          },
+          orderBy: { createdAt: "asc" },
+          select: {
+            id: true,
+            title: true,
+            localPath: true,
+            _count: { select: { chunks: true } },
+          },
+        }),
+        getDocumentStatusMap(),
+      ]);
 
       for (const doc of unindexedDocs) {
         if (shouldAbort()) break;
+        if (statusMap.get(doc.id)?.processingStatus === "ERROR") {
+          continue;
+        }
 
         state.currentPhase = "INDEXING";
         state.currentDocumentId = doc.id;
@@ -2735,6 +3157,25 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
             const buffer = await fsp.readFile(resolvedPath);
             const extracted = await extractPdfPages(buffer);
 
+            if (extracted.parseError || !extracted.hasExtractableText || !hasUsableExtractedText(extracted.pages)) {
+              const reason = extracted.parseError
+                ? `PDF corrompu ou illisible (${extracted.parseError})`
+                : "PDF scanné ou sans texte exploitable (OCR requis)";
+              console.error(
+                `[NightlyIndex] Document "${doc.title}" (${doc.id}) ignoré : ${reason}. Aucun appel Ollama effectué.`
+              );
+              await prisma.document.update({
+                where: { id: doc.id },
+                data: {
+                  isIndexed: false,
+                  ...(extracted.pageCount > 0 ? { pageCount: extracted.pageCount } : {}),
+                },
+              });
+              await setDocumentProcessingStatus(doc.id, "ERROR", reason);
+              state.completedItemsInRun += 1;
+              continue;
+            }
+
             await prisma.document.update({
               where: { id: doc.id },
               data: { pageCount: extracted.pageCount },
@@ -2744,7 +3185,7 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
               doc.id,
               extracted.pages
             );
-            if (stored.chunkCount === 0) {
+            if (!stored.hasUsableText || stored.chunkCount === 0) {
               state.completedItemsInRun += 1;
               continue;
             }
@@ -2777,25 +3218,33 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
       }
     }
 
-    // Phase 2: Sequential solo AI generation for missing public Studio artifacts
+    // Phase 2: Strictly sequential AI generation (concurrency = 1, one doc & one artifact at a time)
     if ((scope === "ALL" || scope === "AI_ONLY") && !shouldAbort()) {
-      const docs = await prisma.document.findMany({
-        where: {
-          chunks: { some: {} },
-          ...(targetChapterId ? { chapterId: targetChapterId } : {}),
-          ...(targetDocumentId ? { id: targetDocumentId } : {}),
-        },
-        orderBy: { createdAt: "desc" },
-        select: {
-          id: true,
-          title: true,
-          authorId: true,
-          chapter: { select: { ueId: true } },
-        },
-      });
+      const [docs, statusMap] = await Promise.all([
+        prisma.document.findMany({
+          where: {
+            chunks: { some: {} },
+            ...(targetChapterId ? { chapterId: targetChapterId } : {}),
+            ...(targetDocumentId ? { id: targetDocumentId } : {}),
+          },
+          orderBy: { createdAt: "asc" },
+          select: {
+            id: true,
+            title: true,
+            authorId: true,
+            chapter: { select: { ueId: true } },
+          },
+        }),
+        getDocumentStatusMap(),
+      ]);
 
       for (const doc of docs) {
         if (shouldAbort() || generatedCount >= maxItems) break;
+        if (statusMap.get(doc.id)?.processingStatus === "ERROR") {
+          continue;
+        }
+
+        let docChunks: SourceChunk[] | null = null;
 
         for (const spec of TARGET_NIGHTLY_KINDS) {
           if (shouldAbort() || generatedCount >= maxItems) break;
@@ -2809,14 +3258,26 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
           }
 
           try {
-            const chunks = await gatherStudioSourceChunks({
-              ueId: doc.chapter.ueId,
-              documentIds: [doc.id],
-              fullDocument: true,
-            });
-            if (chunks.length === 0) {
+            if (!docChunks) {
+              docChunks = await gatherStudioSourceChunks({
+                ueId: doc.chapter.ueId,
+                documentIds: [doc.id],
+                fullDocument: true,
+              });
+            }
+
+            // Safety check: verify non-empty usable text before ANY Ollama call
+            if (docChunks.length === 0 || !hasUsableChunksText(docChunks)) {
+              console.error(
+                `[NightlyAI] Document "${doc.title}" (${doc.id}) sans texte exploitable (PDF scanné ou vide) : marquage en ERROR et arrêt de la génération IA pour ce fichier.`
+              );
+              await setDocumentProcessingStatus(
+                doc.id,
+                "ERROR",
+                "PDF scanné ou sans texte exploitable (OCR requis)"
+              );
               state.completedItemsInRun += 1;
-              continue;
+              break;
             }
 
             state.currentPhase = "AI_GENERATION";
@@ -2829,7 +3290,7 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
             const t0 = Date.now();
             const generated = await generateStudioArtifact({
               kind: spec.kind,
-              chunks,
+              chunks: docChunks,
               isPublic: true,
               title: `${spec.label} — ${doc.title}`,
               shouldStop: shouldAbort,
@@ -2843,8 +3304,13 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
             });
             const elapsedMs = Date.now() - t0;
 
+            if (generated.emptySourceText) {
+              state.completedItemsInRun += 1;
+              break;
+            }
+
             if (generated.usedAi) {
-              if (elapsedMs > 2000 && elapsedMs < 900000) {
+              if (elapsedMs > 2000 && elapsedMs < OLLAMA_TIMEOUT_MS * 3) {
                 state.avgMsPerAiArtifact = Math.round(
                   state.avgMsPerAiArtifact * 0.7 + elapsedMs * 0.3
                 );

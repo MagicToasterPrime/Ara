@@ -119,19 +119,21 @@ model Chapter {
 }
 
 model Document {
-  id         String           @id @default(cuid())
-  chapterId  String
-  authorId   String
-  title      String
-  fileName   String
-  localPath  String
-  mimeType   String           @default("application/pdf")
-  fileSize   Int              @default(0)
-  category   DocumentCategory @default(STUDENT_NOTE)
-  isPinned   Boolean          @default(false)
-  isIndexed  Boolean          @default(false)
-  pageCount  Int              @default(1)
-  createdAt  DateTime         @default(now())
+  id               String           @id @default(cuid())
+  chapterId        String
+  authorId         String
+  title            String
+  fileName         String
+  localPath        String
+  mimeType         String           @default("application/pdf")
+  fileSize         Int              @default(0)
+  category         DocumentCategory @default(STUDENT_NOTE)
+  isPinned         Boolean          @default(false)
+  isIndexed        Boolean          @default(false)
+  processingStatus String           @default("PENDING")
+  processingError  String?
+  pageCount        Int              @default(1)
+  createdAt        DateTime         @default(now())
 
   chapter Chapter          @relation(fields: [chapterId], references: [id], onDelete: Cascade)
   author  User             @relation(fields: [authorId], references: [id], onDelete: Cascade)

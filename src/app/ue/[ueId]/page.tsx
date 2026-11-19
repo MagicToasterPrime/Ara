@@ -39,6 +39,7 @@ import {
   X,
 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
+import { BulkPdfUploader } from "@/components/BulkPdfUploader";
 import { useSpix } from "@/components/SpixContext";
 import { UEDiscussionPanel } from "@/components/UEDiscussionPanel";
 import { NotebookStudioPanel } from "@/components/NotebookStudioPanel";
@@ -77,6 +78,8 @@ interface DocItem {
   category: "OFFICIAL_COURSE" | "STUDENT_NOTE";
   isPinned: boolean;
   isIndexed: boolean;
+  processingStatus?: "PENDING" | "READY" | "ERROR";
+  processingError?: string | null;
   pageCount: number;
   createdAt: string;
   upvoteCount: number;
@@ -213,17 +216,14 @@ function UEWorkspaceContent() {
   // Upload form
   const [uploadOpen, setUploadOpen] = useState(false);
   const [uploadChapterId, setUploadChapterId] = useState("");
-  const [uploadTitle, setUploadTitle] = useState("");
   const [uploadCategory, setUploadCategory] = useState<
     "OFFICIAL_COURSE" | "STUDENT_NOTE"
   >("STUDENT_NOTE");
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const [uploadFeedback, setUploadFeedback] = useState<string | null>(null);
   const [lastUploadedDoc, setLastUploadedDoc] = useState<{
     docTitle: string;
     docId: string;
     scheduledNightly: boolean;
+    uploadedCount?: number;
   } | null>(null);
   const [studioFocusDocId, setStudioFocusDocId] = useState<string | null>(null);
 
@@ -694,55 +694,6 @@ function UEWorkspaceContent() {
     }
   }
 
-  async function handleUpload(e: React.FormEvent) {
-    e.preventDefault();
-    if (!uploadChapterId || !uploadFile || uploading) return;
-
-    setUploading(true);
-    setUploadFeedback(null);
-
-    try {
-      const formData = new FormData();
-      formData.append("chapterId", uploadChapterId);
-      formData.append("title", uploadTitle.trim());
-      formData.append("category", uploadCategory);
-      formData.append("file", uploadFile);
-
-      const res = await fetch("/api/documents", {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = (await res.json().catch(() => ({}))) as {
-        error?: string;
-        document?: { id: string; title: string };
-        scheduledNightly?: boolean;
-      };
-
-      if (!res.ok) {
-        setUploadFeedback(data.error || "Échec de l'upload.");
-        return;
-      }
-
-      if (data.document) {
-        setLastUploadedDoc({
-          docTitle: data.document.title,
-          docId: data.document.id,
-          scheduledNightly: Boolean(data.scheduledNightly),
-        });
-      }
-
-      setUploadTitle("");
-      setUploadFile(null);
-      setUploadOpen(false);
-      await fetchUE();
-    } catch {
-      setUploadFeedback("Erreur réseau lors de l'envoi du PDF.");
-    } finally {
-      setUploading(false);
-    }
-  }
-
   async function handleToggleUpvote(docId: string) {
     const res = await fetch(`/api/documents/${docId}/upvote`, {
       method: "POST",
@@ -908,16 +859,28 @@ function UEWorkspaceContent() {
                   VALIDÉ PAR RESP. UE
                 </span>
               )}
-              {!isNote && (
+              {doc.processingStatus === "ERROR" ? (
                 <span
-                  className={`px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
-                    doc.isIndexed
-                      ? "bg-badge-bg text-badge-text"
-                      : "border border-border bg-paper text-stone"
-                  }`}
+                  title={
+                    doc.processingError ||
+                    "PDF scanné ou sans texte exploitable (exclu du batch IA)"
+                  }
+                  className="border border-carmine/50 bg-carmine/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-carmine"
                 >
-                  {doc.isIndexed ? "RAG INDEXÉ" : "NON INDEXÉ"}
+                  ERREUR EXTRACTION
                 </span>
+              ) : (
+                !isNote && (
+                  <span
+                    className={`px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${
+                      doc.isIndexed
+                        ? "bg-badge-bg text-badge-text"
+                        : "border border-border bg-paper text-stone"
+                    }`}
+                  >
+                    {doc.isIndexed ? "RAG INDEXÉ" : "PRÊT BATCH NUIT"}
+                  </span>
+                )
               )}
             </div>
             <p className="mt-1 font-mono text-[11px] uppercase tracking-wider text-stone">
@@ -1324,7 +1287,7 @@ function UEWorkspaceContent() {
               className="inline-flex items-center gap-1.5 border border-ink bg-ink px-3.5 py-2 font-mono text-xs uppercase tracking-wider text-card hover:bg-ink/90"
             >
               <Upload className="h-3.5 w-3.5" />
-              <span>DÉPOSER UN PDF</span>
+              <span>DÉPOSER DES PDF</span>
             </button>
           )}
         </div>
@@ -1410,134 +1373,37 @@ function UEWorkspaceContent() {
           </datalist>
 
           {uploadOpen && (
-            <form
-              onSubmit={handleUpload}
-              className="ara-animate-in border border-ink bg-card p-5"
-            >
-              <div className="mb-4 flex items-center justify-between border-b border-border pb-3">
-                <span className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-                  TÉLÉVERSER UN DOCUMENT PDF (INDEXATION RAG AUTOMATIQUE)
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setUploadOpen(false)}
-                  className="text-stone hover:text-ink"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-
-              {uploadFeedback && (
-                <div className="mb-4 border border-carmine/40 bg-carmine/10 px-3 py-2 font-mono text-xs text-carmine">
-                  {uploadFeedback}
-                </div>
-              )}
-
-              <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
-                <div>
-                  <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
-                    CHAPITRE CIBLE
-                  </label>
-                  <select
-                    required
-                    value={uploadChapterId}
-                    onChange={(e) => setUploadChapterId(e.target.value)}
-                    className="w-full border border-border bg-paper px-3 py-2 text-sm text-ink focus:border-ink focus:outline-none"
-                  >
-                    {ue.chapters.length === 0 && (
-                      <option value="">Aucun chapitre</option>
-                    )}
-                    {themeGroups.map((grp) => (
-                      <optgroup key={grp.key} label={grp.label}>
-                        {flatChapters
-                          .filter((item) => item.themeLabel === grp.label)
-                          .map((item) => (
-                            <option
-                              key={item.chapter.id}
-                              value={item.chapter.id}
-                            >
-                              {"↳ ".repeat(item.depth)}
-                              {item.chapter.title}
-                            </option>
-                          ))}
-                      </optgroup>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
-                    CATÉGORIE
-                  </label>
-                  <select
-                    value={uploadCategory}
-                    onChange={(e) =>
-                      setUploadCategory(
-                        e.target.value === "OFFICIAL_COURSE"
-                          ? "OFFICIAL_COURSE"
-                          : "STUDENT_NOTE"
-                      )
-                    }
-                    className="w-full border border-border bg-paper px-3 py-2 font-mono text-xs uppercase tracking-wider text-ink focus:border-ink focus:outline-none"
-                  >
-                    <option value="STUDENT_NOTE">NOTE ÉTUDIANTE</option>
-                    {canManage && (
-                      <option value="OFFICIAL_COURSE">COURS OFFICIEL</option>
-                    )}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
-                    TITRE DU DOCUMENT
-                  </label>
-                  <input
-                    type="text"
-                    value={uploadTitle}
-                    onChange={(e) => setUploadTitle(e.target.value)}
-                    placeholder="Ex : Ostéologie membre thoracique"
-                    className="w-full border border-border bg-paper px-3 py-2 text-sm text-ink focus:border-ink focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
-                    FICHIER PDF
-                  </label>
-                  <input
-                    type="file"
-                    required
-                    accept="application/pdf,.pdf"
-                    onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
-                    className="w-full border border-border bg-paper px-2 py-1.5 font-mono text-xs text-ink"
-                  />
-                </div>
-              </div>
-
-              <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
-                <p className="font-mono text-[10px] uppercase tracking-wider text-stone">
-                  TEXTE EXTRAIT À L&apos;ENVOI · INDEXATION RAG &amp; CONTENUS IA EN
-                  FOND LA NUIT (00H–07H) SAUF SI GÉNÉRÉS PAR LA COMMU
-                </p>
-
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setUploadOpen(false)}
-                    className="border border-border bg-paper px-4 py-2 font-mono text-xs uppercase tracking-wider text-ink"
-                  >
-                    ANNULER
-                  </button>
-                  <button
-                    type="submit"
-                    disabled={uploading || !uploadFile || !uploadChapterId}
-                    className="border border-ink bg-ink px-5 py-2 font-mono text-xs uppercase tracking-wider text-card disabled:opacity-50"
-                  >
-                    {uploading ? "INDEXATION & ENVOI..." : "PUBLIER LE PDF"}
-                  </button>
-                </div>
-              </div>
-            </form>
+            <BulkPdfUploader
+              chapterGroups={themeGroups.map((grp) => ({
+                key: grp.key,
+                label: grp.label,
+                chapters: flatChapters
+                  .filter((item) => item.themeLabel === grp.label)
+                  .map((item) => ({
+                    id: item.chapter.id,
+                    title: item.chapter.title,
+                    depth: item.depth,
+                  })),
+              }))}
+              defaultChapterId={uploadChapterId || ue.chapters[0]?.id || ""}
+              canManage={canManage}
+              defaultCategory={uploadCategory}
+              onClose={() => setUploadOpen(false)}
+              onUploaded={async ({ uploadedCount, firstDoc }) => {
+                if (firstDoc) {
+                  setLastUploadedDoc({
+                    docTitle:
+                      uploadedCount > 1
+                        ? `${uploadedCount} documents PDF (dont « ${firstDoc.title} »)`
+                        : firstDoc.title,
+                    docId: firstDoc.id,
+                    scheduledNightly: firstDoc.scheduledNightly,
+                    uploadedCount,
+                  });
+                }
+                await fetchUE();
+              }}
+            />
           )}
 
           {lastUploadedDoc && (
@@ -1547,11 +1413,13 @@ function UEWorkspaceContent() {
             >
               <div>
                 <p className="font-mono text-xs font-bold uppercase tracking-wider text-forest">
-                  COURS PUBLIÉ &amp; INDEXÉ : « {lastUploadedDoc.docTitle} »
+                  {(lastUploadedDoc.uploadedCount || 1) > 1
+                    ? `LOT PUBLIÉ : ${lastUploadedDoc.docTitle}`
+                    : `COURS PUBLIÉ : « ${lastUploadedDoc.docTitle} »`}
                 </p>
                 <p className="mt-0.5 font-mono text-[10px] uppercase tracking-wider text-ink">
                   {lastUploadedDoc.scheduledNightly
-                    ? "GÉNÉRATION IA PROGRAMMÉE AUX HEURES CREUSES (00H–07H) SAUF SI GÉNÉRÉE EN PUBLIC PAR LA COMMU D'ICI LÀ."
+                    ? "PRÊT POUR LE BATCH DE NUIT (00H–07H) : INDEXATION RAG & GÉNÉRATION IA SÉQUENTIELLES."
                     : "DOCUMENT PRÊT DANS L'UE."}
                 </p>
               </div>

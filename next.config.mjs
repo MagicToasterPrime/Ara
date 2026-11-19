@@ -4,6 +4,9 @@ const nextConfig = {
   poweredByHeader: false,
   experimental: {
     serverComponentsExternalPackages: ["pdf-parse", "bcryptjs"],
+    serverActions: {
+      bodySizeLimit: "300mb",
+    },
   },
   async headers() {
     return [

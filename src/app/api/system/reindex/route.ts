@@ -2,9 +2,15 @@ import fsp from "node:fs/promises";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
+import {
+  ensureDocumentStatusSchema,
+  setDocumentProcessingStatus,
+} from "@/lib/document-status";
 import { checkOllamaHealth, indexDocumentPages } from "@/lib/ollama";
 import { extractPdfPages } from "@/lib/pdf";
 import { resolveDocumentFilePath } from "@/lib/storage";
+
+export const dynamic = "force-dynamic";
 
 export async function POST() {
   const user = await getCurrentUser();
@@ -29,9 +35,13 @@ export async function POST() {
     );
   }
 
+  await ensureDocumentStatusSchema();
+
   const documents = await prisma.document.findMany({
+    orderBy: { createdAt: "asc" },
     select: {
       id: true,
+      title: true,
       localPath: true,
     },
   });
@@ -39,11 +49,31 @@ export async function POST() {
   let indexedCount = 0;
   let failedCount = 0;
 
+  // Strictly sequential processing (concurrency = 1)
   for (const doc of documents) {
     try {
       const resolvedPath = resolveDocumentFilePath(doc.localPath);
       const buffer = await fsp.readFile(resolvedPath);
       const extracted = await extractPdfPages(buffer);
+
+      if (extracted.parseError || !extracted.hasExtractableText) {
+        const reason = extracted.parseError
+          ? `PDF corrompu ou illisible (${extracted.parseError})`
+          : "PDF scanné ou sans texte exploitable (OCR requis)";
+        console.error(
+          `[Reindex] Document "${doc.title}" (${doc.id}) ignoré : ${reason}. Aucun appel Ollama effectué.`
+        );
+        await prisma.document.update({
+          where: { id: doc.id },
+          data: {
+            isIndexed: false,
+            ...(extracted.pageCount > 0 ? { pageCount: extracted.pageCount } : {}),
+          },
+        });
+        await setDocumentProcessingStatus(doc.id, "ERROR", reason);
+        failedCount += 1;
+        continue;
+      }
 
       await prisma.document.update({
         where: { id: doc.id },

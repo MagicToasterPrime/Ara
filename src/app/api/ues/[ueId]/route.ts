@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { canManageUE, getCurrentUser } from "@/lib/auth";
 import { normalizeClassLevel } from "@/lib/class-levels";
 import { getUeChapterHierarchyMap } from "@/lib/chapter-hierarchy";
+import { getDocumentStatusMap } from "@/lib/document-status";
 import { resolveDocumentFilePath } from "@/lib/storage";
 import { getUeMeta, setUeMeta } from "@/lib/ue-meta";
 
@@ -95,10 +96,14 @@ export async function GET(
     channels = [createdChannel];
   }
 
-  const [isManager, meta, hierarchyMap] = await Promise.all([
+  const allUeDocIds = ue.chapters.flatMap((c) => c.documents.map((d) => d.id));
+  const [isManager, meta, hierarchyMap, docStatusMap] = await Promise.all([
     canManageUE(user.id, user.globalRole, ue.id),
     getUeMeta(ue.id),
     getUeChapterHierarchyMap(ue.id),
+    allUeDocIds.length > 0
+      ? getDocumentStatusMap(allUeDocIds)
+      : Promise.resolve(new Map()),
   ]);
 
   const chapters = ue.chapters.map((chapter) => {
@@ -110,23 +115,29 @@ export async function GET(
       theme: h?.theme || "",
       parentId: h?.parentId || null,
       order: chapter.order,
-      documents: chapter.documents.map((doc) => ({
-        id: doc.id,
-        chapterId: doc.chapterId,
-        authorId: doc.authorId,
-        author: doc.author,
-        title: doc.title,
-        fileName: doc.fileName,
-        mimeType: doc.mimeType,
-        fileSize: doc.fileSize,
-        category: doc.category,
-        isPinned: doc.isPinned,
-        isIndexed: doc.isIndexed,
-        pageCount: doc.pageCount,
-        createdAt: doc.createdAt,
-        upvoteCount: doc.upvotes.length,
-        hasUpvoted: doc.upvotes.some((u) => u.userId === user.id),
-      })),
+      documents: chapter.documents.map((doc) => {
+        const st = docStatusMap.get(doc.id);
+        return {
+          id: doc.id,
+          chapterId: doc.chapterId,
+          authorId: doc.authorId,
+          author: doc.author,
+          title: doc.title,
+          fileName: doc.fileName,
+          mimeType: doc.mimeType,
+          fileSize: doc.fileSize,
+          category: doc.category,
+          isPinned: doc.isPinned,
+          isIndexed: doc.isIndexed,
+          processingStatus:
+            st?.processingStatus || (doc.isIndexed ? "READY" : "PENDING"),
+          processingError: st?.processingError ?? null,
+          pageCount: doc.pageCount,
+          createdAt: doc.createdAt,
+          upvoteCount: doc.upvotes.length,
+          hasUpvoted: doc.upvotes.some((u) => u.userId === user.id),
+        };
+      }),
     };
   });
 

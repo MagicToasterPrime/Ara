@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "Document" ADD COLUMN IF NOT EXISTS "processingStatus" TEXT NOT NULL DEFAULT 'PENDING';
+ALTER TABLE "Document" ADD COLUMN IF NOT EXISTS "processingError" TEXT;

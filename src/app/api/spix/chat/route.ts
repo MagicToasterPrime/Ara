@@ -7,7 +7,14 @@ import {
   formatVectorLiteral,
   generateEmbedding,
   getOllamaConfig,
+  getOllamaInferenceOptions,
+  OLLAMA_STRICT_SYSTEM_RULE,
+  OLLAMA_TIMEOUT_MS,
+  ollamaPostStream,
+  withOllamaLock,
 } from "@/lib/ollama";
+
+export const dynamic = "force-dynamic";
 
 interface RagChunkRow {
   id: string;
@@ -325,7 +332,7 @@ export async function POST(req: Request) {
       }
     }
 
-    const contextBlock =
+    const rawContextBlock =
       visualNote +
       (finalChunks.length > 0
         ? finalChunks
@@ -336,6 +343,12 @@ export async function POST(req: Request) {
             .join("\n\n---\n\n")
         : "Aucun extrait de document PDF indexé trouvé pour ce périmètre.");
 
+    // Keep context well inside num_ctx (8192)
+    const contextBlock =
+      rawContextBlock.length > 14000
+        ? rawContextBlock.slice(0, 14000)
+        : rawContextBlock;
+
     const systemPrompt = `Tu es Spix, l'assistant académique intelligent local de la plateforme Ara.
 CONTEXTE UTILISATEUR ACTUEL :
 ${contextAwarenessLine}
@@ -345,36 +358,65 @@ CONSIGNES :
 - Base-toi prioritairement sur les extraits fournis ci-dessous.
 - Cite chaque source utilisée exactement au format [NOM_FICHIER.PDF · P.X].
 - Si les extraits ne contiennent pas l'information demandée, indique-le honnêtement.
+- ${OLLAMA_STRICT_SYSTEM_RULE}
 
 EXTRAITS DOCUMENTAIRES :
 ${contextBlock}`;
 
-    const { host, model } = getOllamaConfig();
+    const { model } = getOllamaConfig();
 
-    const ollamaRes = await fetch(`${host}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        stream: true,
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...history.map((m) => ({
-            role: m.role === "assistant" ? "assistant" : "user",
-            content: m.content,
-          })),
-          { role: "user", content: question },
-        ],
-      }),
+    // Acquire global sequential Ollama lock (concurrency = 1) for the lifetime of this stream
+    let releaseLock: () => void = () => {};
+    let lockReleased = false;
+    const safeReleaseLock = () => {
+      if (lockReleased) return;
+      lockReleased = true;
+      releaseLock();
+    };
+
+    const lockAcquired = new Promise<void>((resolve) => {
+      void withOllamaLock(
+        () =>
+          new Promise<void>((done) => {
+            releaseLock = done;
+            resolve();
+          })
+      );
     });
+    await lockAcquired;
 
-    if (!ollamaRes.ok || !ollamaRes.body) {
-      const errorText = await ollamaRes.text().catch(() => "");
+    let ollamaRes;
+    try {
+      ollamaRes = await ollamaPostStream(
+        "/api/chat",
+        {
+          model,
+          stream: true,
+          options: getOllamaInferenceOptions(),
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...history.map((m) => ({
+              role: m.role === "assistant" ? "assistant" : "user",
+              content: m.content,
+            })),
+            { role: "user", content: question },
+          ],
+        },
+        OLLAMA_TIMEOUT_MS,
+        req.signal
+      );
+    } catch (streamInitErr) {
+      safeReleaseLock();
+      throw streamInitErr;
+    }
+
+    if (!ollamaRes.ok || !ollamaRes.stream) {
+      safeReleaseLock();
       return NextResponse.json(
         {
           error: "OLLAMA_ERROR",
           message:
-            errorText ||
+            ollamaRes.errorText ||
             `Erreur Ollama (HTTP ${ollamaRes.status}) pour le modèle ${model}.`,
         },
         { status: 502 }
@@ -383,7 +425,7 @@ ${contextBlock}`;
 
     const encoder = new TextEncoder();
     const decoder = new TextDecoder();
-    const reader = ollamaRes.body.getReader();
+    const reader = ollamaRes.stream.getReader();
 
     const stream = new ReadableStream({
       async start(controller) {
@@ -435,8 +477,13 @@ ${contextBlock}`;
             )
           );
         } finally {
+          safeReleaseLock();
           controller.close();
         }
+      },
+      cancel() {
+        ollamaRes.abort();
+        safeReleaseLock();
       },
     });
 

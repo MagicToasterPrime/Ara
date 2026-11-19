@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
+import { setDocumentProcessingStatus } from "@/lib/document-status";
 import {
   ensureStudioSchema,
   gatherStudioSourceChunks,
   generateStudioArtifact,
   hasExistingPublicArtifact,
+  hasUsableChunksText,
   type PageImageInput,
   type StudioArtifactKind,
 } from "@/lib/studio";
@@ -169,11 +171,21 @@ export async function POST(req: Request) {
       fullDocument: preResolvedIsPublic,
     });
 
-    if (chunks.length === 0) {
+    if (chunks.length === 0 || !hasUsableChunksText(chunks)) {
+      if (effectiveDocIds && effectiveDocIds.length === 1) {
+        console.error(
+          `[Studio POST] Document ${effectiveDocIds[0]} sans texte exploitable : marquage en ERROR.`
+        );
+        await setDocumentProcessingStatus(
+          effectiveDocIds[0],
+          "ERROR",
+          "PDF scanné ou sans texte exploitable (OCR requis)"
+        ).catch(() => null);
+      }
       return NextResponse.json(
         {
           error:
-            "Aucun extrait PDF disponible pour cette sélection. Déposez au moins un document PDF dans une UE.",
+            "Aucun texte PDF exploitable pour cette sélection (PDF vide ou scanné sans couche texte).",
         },
         { status: 400 }
       );

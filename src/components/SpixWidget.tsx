@@ -66,7 +66,7 @@ export function SpixWidget() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [ollamaOnline, setOllamaOnline] = useState<boolean | null>(null);
   const [ollamaHost, setOllamaHost] = useState("127.0.0.1:11434");
-  const [ollamaModel, setOllamaModel] = useState("qwen2.5:7b");
+  const [ollamaModel, setOllamaModel] = useState("gemma3:12b");
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 

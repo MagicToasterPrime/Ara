@@ -139,8 +139,10 @@ AUTH_SECRET="${AUTH_SEC}"
 AUTH_TRUST_HOST="true"
 NEXTAUTH_URL="${TARGET_NEXTAUTH_URL}"
 OLLAMA_HOST="http://127.0.0.1:11434"
-OLLAMA_MODEL="qwen2.5:3b"
+OLLAMA_MODEL="gemma3:12b"
 OLLAMA_EMBED_MODEL="nomic-embed-text"
+OLLAMA_NUM_THREAD="4"
+OLLAMA_TIMEOUT_MS="1200000"
 UPLOAD_DIR="./storage/uploads"
 PORT="3000"
 EOF
@@ -194,6 +196,8 @@ if systemctl list-unit-files | grep -q "ollama.service"; then
   cat > /etc/systemd/system/ollama.service.d/override.conf <<'EOF'
 [Service]
 Environment="OLLAMA_HOST=127.0.0.1:11434"
+Environment="OLLAMA_NUM_PARALLEL=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
 EOF
   systemctl daemon-reload
   systemctl enable --now ollama
@@ -215,8 +219,8 @@ done
 if curl -sf http://127.0.0.1:11434/api/tags &>/dev/null; then
   log_info "Téléchargement du modèle d'embeddings : ${OLLAMA_EMBED_MODEL:-nomic-embed-text}..."
   ollama pull "${OLLAMA_EMBED_MODEL:-nomic-embed-text}"
-  log_info "Téléchargement du modèle conversationnel : ${OLLAMA_MODEL:-qwen2.5:3b}..."
-  ollama pull "${OLLAMA_MODEL:-qwen2.5:3b}"
+  log_info "Téléchargement du modèle conversationnel : ${OLLAMA_MODEL:-gemma3:12b}..."
+  ollama pull "${OLLAMA_MODEL:-gemma3:12b}"
   log_ok "Modèles Ollama téléchargés et isolés sur 127.0.0.1:11434."
 else
   log_warn "Impossible de joindre Ollama pour télécharger les modèles. Ara fonctionnera normalement sans IA jusqu'au démarrage d'Ollama."
@@ -296,7 +300,7 @@ ${CADDY_SITE} {
 	encode gzip zstd
 
 	request_body {
-		max_size 100MB
+		max_size 300MB
 	}
 
 	header {
@@ -307,7 +311,13 @@ ${CADDY_SITE} {
 		-Server
 	}
 
-	reverse_proxy 127.0.0.1:${PORT:-3000}
+	reverse_proxy 127.0.0.1:${PORT:-3000} {
+		transport http {
+			read_timeout 25m
+			write_timeout 25m
+			response_header_timeout 25m
+		}
+	}
 }
 EOF
   systemctl enable --now caddy
@@ -388,7 +398,7 @@ fi
 echo "  Stockage PDF     : ${APP_DIR}/storage/uploads (chmod 750)"
 echo "  Sauvegardes      : ${APP_DIR}/storage/backups (tous les jours à 03h30, 7j)"
 echo "  Base de données  : Docker 'ara-postgres' (PostgreSQL 16 + pgvector sur 127.0.0.1)"
-echo "  IA Spix          : Ollama (${OLLAMA_MODEL:-qwen2.5:3b}) isolé sur 127.0.0.1:11434"
+echo "  IA Spix          : Ollama (${OLLAMA_MODEL:-gemma3:12b}) isolé sur 127.0.0.1:11434"
 echo "  Sécurité         : UFW + Fail2ban + X-Robots-Tag noindex + robots.txt anti-IA"
 echo ""
 echo "  Astuce confidentialité :"

@@ -122,6 +122,8 @@ async function startEmbeddedPgvector() {
     ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "bestStreak" INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lastRevisionDate" TEXT;
     ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "totalRevisionPoints" INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE "Document" ADD COLUMN IF NOT EXISTS "processingStatus" TEXT NOT NULL DEFAULT 'PENDING';
+    ALTER TABLE "Document" ADD COLUMN IF NOT EXISTS "processingError" TEXT;
     CREATE TABLE IF NOT EXISTS "DailyRevisionSession" (
       "id" TEXT NOT NULL,
       "userId" TEXT NOT NULL,

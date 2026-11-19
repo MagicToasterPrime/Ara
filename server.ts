@@ -24,6 +24,7 @@ const globalForSocket = globalThis as typeof globalThis & {
   __araSocketIo?: SocketIOServer;
   __araNightlyWorkerStarted?: boolean;
   __araDailyQuizSchedulerStarted?: boolean;
+  __araDailyQuizRunning?: boolean;
   __araLastForced6AmDateKey?: string;
 };
 
@@ -56,6 +57,12 @@ app.prepare().then(() => {
     res.setHeader("Cross-Origin-Opener-Policy", "same-origin");
     handler(req, res);
   });
+
+  // Allow long-running Ollama CPU generation (>= 20 min) & 300 MB bulk PDF uploads
+  httpServer.requestTimeout = 1_500_000;
+  httpServer.headersTimeout = 1_500_000;
+  httpServer.timeout = 1_500_000;
+  httpServer.keepAliveTimeout = 65_000;
 
   const io = new SocketIOServer(httpServer, {
     path: "/api/socketio",
@@ -293,6 +300,8 @@ app.prepare().then(() => {
       globalForSocket.__araDailyQuizSchedulerStarted = true;
 
       const ensureDailyQuizReady = async () => {
+        if (globalForSocket.__araDailyQuizRunning) return;
+        globalForSocket.__araDailyQuizRunning = true;
         try {
           const hour = getParisHour();
           const todayKey = getLocalDateKey();
@@ -315,6 +324,8 @@ app.prepare().then(() => {
           }
         } catch (err) {
           console.warn("[DailyQuiz] Scheduler warning:", err);
+        } finally {
+          globalForSocket.__araDailyQuizRunning = false;
         }
       };
 

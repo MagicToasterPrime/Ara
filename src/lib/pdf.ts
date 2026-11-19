@@ -2,11 +2,15 @@ export interface ExtractedPdfPage {
   pageNumber: number;
   text: string;
   imageCount?: number;
+  rawTextLength?: number;
 }
 
 export interface ExtractedPdfResult {
   pageCount: number;
   pages: ExtractedPdfPage[];
+  hasExtractableText: boolean;
+  totalTextChars: number;
+  parseError?: string;
 }
 
 interface PdfPageData {
@@ -20,6 +24,44 @@ interface PdfPageData {
 
 // PDF.js drawing operator codes for embedded raster/inline images
 const IMAGE_OPS = new Set([82, 83, 84, 85, 86, 87, 88]);
+
+/**
+ * Minimum number of real alphanumeric characters required across a PDF
+ * to consider it text-exploitable (below this, the PDF is likely a pure image scan).
+ */
+export const MIN_USABLE_TEXT_CHARS = 30;
+
+export function stripVisualMarkers(text: string): string {
+  return text.replace(/\[REP[ÈE]RE VISUEL[^\]]*\]/gi, " ");
+}
+
+export function getMeaningfulTextLength(text: string): number {
+  const withoutTags = stripVisualMarkers(text);
+  const alnum = withoutTags.match(/[a-zA-ZÀ-ÿ0-9]/g);
+  return alnum ? alnum.length : 0;
+}
+
+export function hasUsableText(
+  text: string,
+  minChars = MIN_USABLE_TEXT_CHARS
+): boolean {
+  return getMeaningfulTextLength(text) >= minChars;
+}
+
+export function hasUsableExtractedText(
+  pages: Array<{ text: string; rawTextLength?: number }>,
+  minChars = MIN_USABLE_TEXT_CHARS
+): boolean {
+  let total = 0;
+  for (const page of pages) {
+    total +=
+      typeof page.rawTextLength === "number"
+        ? page.rawTextLength
+        : getMeaningfulTextLength(page.text || "");
+    if (total >= minChars) return true;
+  }
+  return false;
+}
 
 function extractFigureLegendHints(pageText: string): string[] {
   const matches: string[] = [];
@@ -82,22 +124,26 @@ export async function extractPdfPages(
         }
 
         const baseText = pieces.join(" ").replace(/\s+/g, " ").trim();
+        const rawTextLength = getMeaningfulTextLength(baseText);
         const figureHints = extractFigureLegendHints(baseText);
 
+        // Only attach visual markers when the page has real text; avoid generating
+        // synthetic-only chunks on scanned image-only pages.
         let enrichedText = baseText;
-        if (imageCount > 0 || figureHints.length > 0) {
+        if (rawTextLength > 0 && (imageCount > 0 || figureHints.length > 0)) {
           const visualTag = `[REPÈRE VISUEL PAGE ${pageNum} : ${imageCount} image(s)/figure(s) détectée(s)${
             figureHints.length > 0
               ? ` · Légendes : ${figureHints.join(" | ")}`
               : ""
           }]`;
-          enrichedText = baseText ? `${baseText}\n${visualTag}` : visualTag;
+          enrichedText = `${baseText}\n${visualTag}`;
         }
 
         pages.push({
           pageNumber: pageNum,
           text: enrichedText,
           imageCount,
+          rawTextLength,
         });
         return enrichedText;
       },
@@ -105,12 +151,52 @@ export async function extractPdfPages(
 
     const pageCount = Math.max(data.numpages || pages.length || 1, 1);
     if (pages.length === 0 && data.text?.trim()) {
-      pages.push({ pageNumber: 1, text: data.text.trim() });
+      const cleaned = data.text.trim();
+      pages.push({
+        pageNumber: 1,
+        text: cleaned,
+        rawTextLength: getMeaningfulTextLength(cleaned),
+      });
     }
 
-    return { pageCount, pages };
+    const totalTextChars = pages.reduce(
+      (sum, p) => sum + (p.rawTextLength ?? getMeaningfulTextLength(p.text)),
+      0
+    );
+    const hasExtractableText = totalTextChars >= MIN_USABLE_TEXT_CHARS;
+
+    if (!hasExtractableText) {
+      console.error(
+        `[PDF] Extraction vide : aucun texte exploitable détecté (${totalTextChars} caractères alphanumériques sur ${pageCount} page(s) — PDF probablement scanné sans couche OCR).`
+      );
+      return {
+        pageCount,
+        pages: [],
+        hasExtractableText: false,
+        totalTextChars,
+      };
+    }
+
+    const nonEmptyPages = pages.filter(
+      (p) => (p.rawTextLength ?? getMeaningfulTextLength(p.text)) > 0
+    );
+
+    return {
+      pageCount,
+      pages: nonEmptyPages,
+      hasExtractableText: true,
+      totalTextChars,
+    };
   } catch (error) {
+    const parseError =
+      error instanceof Error ? error.message : "PDF corrompu ou illisible";
     console.error("[PDF] Extraction error:", error);
-    return { pageCount: 1, pages: [] };
+    return {
+      pageCount: 0,
+      pages: [],
+      hasExtractableText: false,
+      totalTextChars: 0,
+      parseError,
+    };
   }
 }

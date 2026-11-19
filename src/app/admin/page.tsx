@@ -775,7 +775,11 @@ export default function AdminPage() {
                             ? ` · EXÉCUTION EN COURS (${queue.worker.completedItemsInRun}/${queue.worker.totalItemsInRun})`
                             : ` · COUVERTURE BASE (${
                                 queue.counts.indexedDocuments
-                              }/${queue.counts.totalDocuments} PDF INDEXÉS · ${
+                              }/${queue.counts.totalDocuments} PDF INDEXÉS${
+                                queue.counts.errorDocuments > 0
+                                  ? ` · ${queue.counts.errorDocuments} EN ERREUR`
+                                  : ""
+                              } · ${
                                 queue.counts.completedPublicAiArtifacts
                               }/${queue.counts.totalExpectedAiArtifacts} CONTENUS IA)`}
                         </span>

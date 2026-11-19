@@ -1,12 +1,38 @@
 import crypto from "node:crypto";
-import os from "node:os";
+import http from "node:http";
+import https from "node:https";
 import { prisma } from "@/lib/prisma";
-import type { ExtractedPdfPage } from "@/lib/pdf";
+import { setDocumentProcessingStatus } from "@/lib/document-status";
+import {
+  hasUsableExtractedText,
+  hasUsableText,
+  type ExtractedPdfPage,
+} from "@/lib/pdf";
+
+export const DEFAULT_OLLAMA_MODEL = "gemma3:12b";
+
+/**
+ * Minimum 20 minutes (1200 seconds) timeout for all Ollama HTTP calls
+ * so large handouts can be processed reliably on a 4 vCPU / 16 GB RAM CPU VM.
+ */
+export const OLLAMA_TIMEOUT_MS = Math.max(
+  1_200_000,
+  Number.parseInt(process.env.OLLAMA_TIMEOUT_MS || "1200000", 10) || 1_200_000
+);
+
+export const OLLAMA_DEFAULT_OPTIONS = {
+  num_thread: 4,
+  temperature: 0.2,
+  num_ctx: 8192,
+} as const;
+
+export const OLLAMA_STRICT_SYSTEM_RULE =
+  "Ne recopie jamais de texte générique ou d'exemple de structure. Chaque question, proposition de réponse et explication doit être intégralement rédigée en français à partir des faits précis du document fourni.";
 
 export function getOllamaConfig() {
   return {
     host: (process.env.OLLAMA_HOST || "http://127.0.0.1:11434").replace(/\/$/, ""),
-    model: process.env.OLLAMA_MODEL || "qwen2.5:3b",
+    model: process.env.OLLAMA_MODEL || DEFAULT_OLLAMA_MODEL,
     embedModel: process.env.OLLAMA_EMBED_MODEL || "nomic-embed-text",
   };
 }
@@ -16,8 +42,27 @@ export function getOptimalOllamaThreads(): number {
   if (Number.isFinite(configured) && configured >= 1) {
     return configured;
   }
-  const detected = os.cpus()?.length || 4;
-  return Math.max(2, Math.min(16, detected));
+  return OLLAMA_DEFAULT_OPTIONS.num_thread;
+}
+
+export function getOllamaInferenceOptions(overrides?: {
+  num_predict?: number;
+  repeat_penalty?: number;
+  temperature?: number;
+  num_ctx?: number;
+  num_thread?: number;
+}) {
+  return {
+    num_thread: overrides?.num_thread ?? getOptimalOllamaThreads(),
+    temperature: overrides?.temperature ?? OLLAMA_DEFAULT_OPTIONS.temperature,
+    num_ctx: overrides?.num_ctx ?? OLLAMA_DEFAULT_OPTIONS.num_ctx,
+    ...(overrides?.num_predict !== undefined
+      ? { num_predict: overrides.num_predict }
+      : {}),
+    ...(overrides?.repeat_penalty !== undefined
+      ? { repeat_penalty: overrides.repeat_penalty }
+      : {}),
+  };
 }
 
 export function getParisHour(date = new Date()): number {
@@ -38,6 +83,10 @@ const globalForOllamaLock = globalThis as typeof globalThis & {
   __araOllamaQueueTail?: Promise<void>;
 };
 
+/**
+ * Global strict sequential mutex (concurrency = 1) for ALL Ollama API calls.
+ * Prevents parallel LLM / embedding / vision invocations on CPU-bound VMs.
+ */
 export function withOllamaLock<T>(task: () => Promise<T>): Promise<T> {
   const tail = globalForOllamaLock.__araOllamaQueueTail || Promise.resolve();
   const run = tail.then(task, task);
@@ -46,6 +95,292 @@ export function withOllamaLock<T>(task: () => Promise<T>): Promise<T> {
     () => undefined
   );
   return run;
+}
+
+export interface OllamaJsonResponse<T> {
+  ok: boolean;
+  status: number;
+  data: T | null;
+  errorText: string;
+}
+
+/**
+ * Native node:http/https JSON POST client for Ollama with full >= 1200s timeout support.
+ * Avoids Node's undici fetch default 300s headersTimeout/bodyTimeout ceiling.
+ */
+export function ollamaPostJson<T>(
+  endpointPath: string,
+  payload: Record<string, unknown>,
+  timeoutMs = OLLAMA_TIMEOUT_MS
+): Promise<OllamaJsonResponse<T>> {
+  const effectiveTimeout = Math.max(timeoutMs, OLLAMA_TIMEOUT_MS);
+  const { host } = getOllamaConfig();
+  const url = new URL(
+    endpointPath.startsWith("/") ? `${host}${endpointPath}` : `${host}/${endpointPath}`
+  );
+  const bodyString = JSON.stringify(payload);
+  const transport = url.protocol === "https:" ? https : http;
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finishResolve = (val: OllamaJsonResponse<T>) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(wallTimer);
+      resolve(val);
+    };
+    const finishReject = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(wallTimer);
+      reject(err);
+    };
+
+    const req = transport.request(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(bodyString, "utf8"),
+        },
+        timeout: effectiveTimeout,
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () => {
+          const status = res.statusCode ?? 0;
+          const rawText = Buffer.concat(chunks).toString("utf8");
+          if (status < 200 || status >= 300) {
+            finishResolve({
+              ok: false,
+              status,
+              data: null,
+              errorText: rawText,
+            });
+            return;
+          }
+          try {
+            const parsed = JSON.parse(rawText) as T;
+            finishResolve({
+              ok: true,
+              status,
+              data: parsed,
+              errorText: "",
+            });
+          } catch {
+            finishResolve({
+              ok: false,
+              status,
+              data: null,
+              errorText: "Réponse JSON invalide reçue d'Ollama.",
+            });
+          }
+        });
+        res.on("error", (err) => finishReject(err));
+      }
+    );
+
+    const wallTimer = setTimeout(() => {
+      req.destroy(
+        new Error(
+          `Timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`
+        )
+      );
+    }, effectiveTimeout);
+
+    req.setTimeout(effectiveTimeout, () => {
+      req.destroy(
+        new Error(
+          `Socket timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`
+        )
+      );
+    });
+
+    req.on("error", (err) => finishReject(err));
+    req.write(bodyString);
+    req.end();
+  });
+}
+
+export interface OllamaStreamResponse {
+  ok: boolean;
+  status: number;
+  stream: ReadableStream<Uint8Array> | null;
+  errorText: string;
+  abort: () => void;
+}
+
+/**
+ * Native node:http/https streaming POST client for Ollama with full >= 1200s timeout support.
+ */
+export function ollamaPostStream(
+  endpointPath: string,
+  payload: Record<string, unknown>,
+  timeoutMs = OLLAMA_TIMEOUT_MS,
+  externalSignal?: AbortSignal
+): Promise<OllamaStreamResponse> {
+  const effectiveTimeout = Math.max(timeoutMs, OLLAMA_TIMEOUT_MS);
+  const { host } = getOllamaConfig();
+  const url = new URL(
+    endpointPath.startsWith("/") ? `${host}${endpointPath}` : `${host}/${endpointPath}`
+  );
+  const bodyString = JSON.stringify(payload);
+  const transport = url.protocol === "https:" ? https : http;
+
+  return new Promise((resolve, reject) => {
+    let headerSettled = false;
+    let cleanedUp = false;
+
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      clearTimeout(wallTimer);
+      if (externalSignal) {
+        externalSignal.removeEventListener("abort", onExternalAbort);
+      }
+    };
+
+    const req = transport.request(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(bodyString, "utf8"),
+        },
+        timeout: effectiveTimeout,
+      },
+      (res) => {
+        const status = res.statusCode ?? 0;
+        if (status < 200 || status >= 300) {
+          const errChunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => errChunks.push(chunk));
+          res.on("end", () => {
+            cleanup();
+            if (!headerSettled) {
+              headerSettled = true;
+              resolve({
+                ok: false,
+                status,
+                stream: null,
+                errorText: Buffer.concat(errChunks).toString("utf8"),
+                abort: () => req.destroy(),
+              });
+            }
+          });
+          res.on("error", (err) => {
+            cleanup();
+            if (!headerSettled) {
+              headerSettled = true;
+              reject(err);
+            }
+          });
+          return;
+        }
+
+        const webStream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            let streamClosed = false;
+            const safeClose = () => {
+              if (streamClosed) return;
+              streamClosed = true;
+              cleanup();
+              try {
+                controller.close();
+              } catch {
+                // Already closed
+              }
+            };
+            const safeError = (err: unknown) => {
+              if (streamClosed) return;
+              streamClosed = true;
+              cleanup();
+              try {
+                controller.error(err);
+              } catch {
+                // Already errored/closed
+              }
+            };
+
+            res.on("data", (chunk: Buffer) => {
+              if (!streamClosed) {
+                try {
+                  controller.enqueue(new Uint8Array(chunk));
+                } catch {
+                  // Consumer cancelled
+                }
+              }
+            });
+            res.on("end", safeClose);
+            res.on("close", safeClose);
+            res.on("error", safeError);
+          },
+          cancel() {
+            cleanup();
+            req.destroy();
+          },
+        });
+
+        if (!headerSettled) {
+          headerSettled = true;
+          resolve({
+            ok: true,
+            status,
+            stream: webStream,
+            errorText: "",
+            abort: () => {
+              cleanup();
+              req.destroy();
+            },
+          });
+        }
+      }
+    );
+
+    const onExternalAbort = () => {
+      cleanup();
+      req.destroy(new Error("Requête Ollama annulée."));
+    };
+
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        onExternalAbort();
+      } else {
+        externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+      }
+    }
+
+    const wallTimer = setTimeout(() => {
+      cleanup();
+      req.destroy(
+        new Error(
+          `Timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`
+        )
+      );
+    }, effectiveTimeout);
+
+    req.setTimeout(effectiveTimeout, () => {
+      cleanup();
+      req.destroy(
+        new Error(
+          `Socket timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`
+        )
+      );
+    });
+
+    req.on("error", (err) => {
+      cleanup();
+      if (!headerSettled) {
+        headerSettled = true;
+        reject(err);
+      }
+    });
+
+    req.write(bodyString);
+    req.end();
+  });
 }
 
 export interface OllamaHealth {
@@ -60,7 +395,7 @@ export interface OllamaHealth {
 export async function checkOllamaHealth(): Promise<OllamaHealth> {
   const { host, model, embedModel } = getOllamaConfig();
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 2500);
+  const timer = setTimeout(() => controller.abort(), 5000);
 
   try {
     const res = await fetch(`${host}/api/tags`, {
@@ -101,38 +436,41 @@ export async function checkOllamaHealth(): Promise<OllamaHealth> {
 }
 
 export async function generateEmbedding(text: string): Promise<number[] | null> {
-  const { host, embedModel } = getOllamaConfig();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
-
-  try {
-    const res = await fetch(`${host}/api/embeddings`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: embedModel,
-        prompt: text,
-        options: {
-          num_thread: getOptimalOllamaThreads(),
-        },
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      return null;
-    }
-
-    const data = (await res.json()) as { embedding?: number[] };
-    if (!Array.isArray(data.embedding) || data.embedding.length !== 768) {
-      return null;
-    }
-    return data.embedding;
-  } catch {
+  if (!text || !text.trim()) {
     return null;
-  } finally {
-    clearTimeout(timer);
   }
+
+  return withOllamaLock(async () => {
+    const { embedModel } = getOllamaConfig();
+    try {
+      const res = await ollamaPostJson<{ embedding?: number[] }>(
+        "/api/embeddings",
+        {
+          model: embedModel,
+          prompt: text,
+          options: {
+            num_thread: getOptimalOllamaThreads(),
+          },
+        },
+        OLLAMA_TIMEOUT_MS
+      );
+
+      if (!res.ok || !res.data) {
+        return null;
+      }
+
+      if (
+        !Array.isArray(res.data.embedding) ||
+        res.data.embedding.length !== 768
+      ) {
+        return null;
+      }
+      return res.data.embedding;
+    } catch (err) {
+      console.warn("[Ollama] Embedding request error:", err);
+      return null;
+    }
+  });
 }
 
 export function chunkPageText(
@@ -174,13 +512,30 @@ export function formatVectorLiteral(embedding: number[]): string {
 export async function storeDocumentChunksUnindexed(
   documentId: string,
   pages: ExtractedPdfPage[]
-): Promise<{ chunkCount: number }> {
+): Promise<{ chunkCount: number; hasUsableText: boolean }> {
   await prisma.documentChunk.deleteMany({
     where: { documentId },
   });
 
+  if (!hasUsableExtractedText(pages)) {
+    console.error(
+      `[Ollama] Document ${documentId} sans texte exploitable (PDF scanné ou vide) : marquage en ERROR.`
+    );
+    await prisma.document.update({
+      where: { id: documentId },
+      data: { isIndexed: false },
+    });
+    await setDocumentProcessingStatus(
+      documentId,
+      "ERROR",
+      "PDF scanné ou sans texte exploitable (OCR requis)"
+    );
+    return { chunkCount: 0, hasUsableText: false };
+  }
+
   const rawChunks: Array<{ content: string; pageNumber: number }> = [];
   for (const page of pages) {
+    if (!hasUsableText(page.text, 5)) continue;
     const pieces = chunkPageText(page.text, 800, 100);
     for (const piece of pieces) {
       rawChunks.push({
@@ -190,22 +545,37 @@ export async function storeDocumentChunksUnindexed(
     }
   }
 
-  if (rawChunks.length > 0) {
-    await prisma.documentChunk.createMany({
-      data: rawChunks.map((chunk) => ({
-        documentId,
-        content: chunk.content,
-        pageNumber: chunk.pageNumber,
-      })),
+  if (rawChunks.length === 0) {
+    console.error(
+      `[Ollama] Document ${documentId} : 0 chunk généré après nettoyage — marquage en ERROR.`
+    );
+    await prisma.document.update({
+      where: { id: documentId },
+      data: { isIndexed: false },
     });
+    await setDocumentProcessingStatus(
+      documentId,
+      "ERROR",
+      "PDF scanné ou sans texte exploitable (OCR requis)"
+    );
+    return { chunkCount: 0, hasUsableText: false };
   }
+
+  await prisma.documentChunk.createMany({
+    data: rawChunks.map((chunk) => ({
+      documentId,
+      content: chunk.content,
+      pageNumber: chunk.pageNumber,
+    })),
+  });
 
   await prisma.document.update({
     where: { id: documentId },
     data: { isIndexed: false },
   });
+  await setDocumentProcessingStatus(documentId, "PENDING", null);
 
-  return { chunkCount: rawChunks.length };
+  return { chunkCount: rawChunks.length, hasUsableText: true };
 }
 
 export async function embedExistingDocumentChunks(
@@ -223,6 +593,7 @@ export async function embedExistingDocumentChunks(
   chunkCount: number;
   embeddedCount: number;
   stopped: boolean;
+  emptyTextError?: boolean;
 }> {
   const rows = await prisma.$queryRaw<
     Array<{ id: string; content: string; hasEmbedding: boolean }>
@@ -233,12 +604,30 @@ export async function embedExistingDocumentChunks(
     ORDER BY "pageNumber" ASC
   `;
 
-  if (rows.length === 0) {
+  const combinedText = rows.map((r) => r.content).join(" ");
+  if (rows.length === 0 || !hasUsableText(combinedText)) {
+    console.error(
+      `[Ollama] Indexation annulée pour le document ${documentId} : texte extrait vide ou PDF scanné (aucun appel Ollama).`
+    );
+    if (rows.length > 0) {
+      await prisma.documentChunk.deleteMany({ where: { documentId } });
+    }
     await prisma.document.update({
       where: { id: documentId },
       data: { isIndexed: false },
     });
-    return { indexed: false, chunkCount: 0, embeddedCount: 0, stopped: false };
+    await setDocumentProcessingStatus(
+      documentId,
+      "ERROR",
+      "PDF scanné ou sans texte exploitable (OCR requis)"
+    );
+    return {
+      indexed: false,
+      chunkCount: 0,
+      embeddedCount: 0,
+      stopped: false,
+      emptyTextError: true,
+    };
   }
 
   let embeddedCount = rows.filter((r) => Boolean(r.hasEmbedding)).length;
@@ -273,6 +662,11 @@ export async function embedExistingDocumentChunks(
     where: { id: documentId },
     data: { isIndexed },
   });
+  await setDocumentProcessingStatus(
+    documentId,
+    isIndexed ? "READY" : "PENDING",
+    null
+  );
 
   return {
     indexed: isIndexed,
@@ -286,13 +680,30 @@ export async function indexDocumentPages(
   documentId: string,
   pages: ExtractedPdfPage[],
   onProgress?: (doneChunks: number, totalChunks: number) => void
-): Promise<{ indexed: boolean; chunkCount: number }> {
+): Promise<{ indexed: boolean; chunkCount: number; emptyTextError?: boolean }> {
   await prisma.documentChunk.deleteMany({
     where: { documentId },
   });
 
+  if (!hasUsableExtractedText(pages)) {
+    console.error(
+      `[Ollama] Ré-indexation annulée pour le document ${documentId} : PDF scanné ou sans texte exploitable.`
+    );
+    await prisma.document.update({
+      where: { id: documentId },
+      data: { isIndexed: false },
+    });
+    await setDocumentProcessingStatus(
+      documentId,
+      "ERROR",
+      "PDF scanné ou sans texte exploitable (OCR requis)"
+    );
+    return { indexed: false, chunkCount: 0, emptyTextError: true };
+  }
+
   const rawChunks: Array<{ content: string; pageNumber: number }> = [];
   for (const page of pages) {
+    if (!hasUsableText(page.text, 5)) continue;
     const pieces = chunkPageText(page.text, 800, 100);
     for (const piece of pieces) {
       rawChunks.push({
@@ -307,7 +718,12 @@ export async function indexDocumentPages(
       where: { id: documentId },
       data: { isIndexed: false },
     });
-    return { indexed: false, chunkCount: 0 };
+    await setDocumentProcessingStatus(
+      documentId,
+      "ERROR",
+      "PDF scanné ou sans texte exploitable (OCR requis)"
+    );
+    return { indexed: false, chunkCount: 0, emptyTextError: true };
   }
 
   const health = await checkOllamaHealth();
@@ -323,6 +739,7 @@ export async function indexDocumentPages(
       where: { id: documentId },
       data: { isIndexed: false },
     });
+    await setDocumentProcessingStatus(documentId, "PENDING", null);
     return { indexed: false, chunkCount: rawChunks.length };
   }
 
@@ -357,6 +774,11 @@ export async function indexDocumentPages(
     where: { id: documentId },
     data: { isIndexed },
   });
+  await setDocumentProcessingStatus(
+    documentId,
+    isIndexed ? "READY" : "PENDING",
+    null
+  );
 
   return { indexed: isIndexed, chunkCount: rawChunks.length };
 }
@@ -365,46 +787,48 @@ export async function describeImageWithOllama(
   imageBase64: string,
   promptContext?: string
 ): Promise<string | null> {
-  const health = await checkOllamaHealth();
-  if (!health.online) return null;
+  return withOllamaLock(async () => {
+    const health = await checkOllamaHealth();
+    if (!health.online) return null;
 
-  const configuredVision = process.env.OLLAMA_VISION_MODEL?.trim();
-  const visionModel =
-    (configuredVision &&
-      health.models.find((m) => m.startsWith(configuredVision))) ||
-    health.models.find((m) =>
-      /(vl|llava|vision|moondream|minicpm|gemma3|bakllava)/i.test(m)
+    const configuredVision = process.env.OLLAMA_VISION_MODEL?.trim();
+    const visionModel =
+      (configuredVision &&
+        health.models.find((m) => m.startsWith(configuredVision))) ||
+      health.models.find((m) =>
+        /(vl|llava|vision|moondream|minicpm|gemma3|bakllava)/i.test(m)
+      );
+
+    if (!visionModel) {
+      return null;
+    }
+
+    const cleanBase64 = imageBase64.replace(
+      /^data:image\/[a-zA-Z+]+;base64,/,
+      ""
     );
 
-  if (!visionModel) {
-    return null;
-  }
+    try {
+      const res = await ollamaPostJson<{ response?: string }>(
+        "/api/generate",
+        {
+          model: visionModel,
+          system: `Tu es un enseignant universitaire vétérinaire qui analyse des figures et schémas de cours. ${OLLAMA_STRICT_SYSTEM_RULE}`,
+          prompt: `Analyse cette page/figure de cours universitaire en français. Décris les schémas, organes, courbes, relations fléchées et légendes visibles.${
+            promptContext ? ` Contexte demandé : ${promptContext}` : ""
+          }`,
+          images: [cleanBase64],
+          stream: false,
+          options: getOllamaInferenceOptions(),
+        },
+        OLLAMA_TIMEOUT_MS
+      );
 
-  const cleanBase64 = imageBase64.replace(/^data:image\/[a-zA-Z+]+;base64,/, "");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 16000);
-
-  try {
-    const res = await fetch(`${health.host}/api/generate`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: visionModel,
-        prompt: `Analyse cette page/figure de cours universitaire en français. Décris les schémas, organes, courbes, relations fléchées et légendes visibles.${
-          promptContext ? ` Contexte demandé : ${promptContext}` : ""
-        }`,
-        images: [cleanBase64],
-        stream: false,
-      }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) return null;
-    const data = (await res.json()) as { response?: string };
-    return data.response?.trim() || null;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
+      if (!res.ok || !res.data) return null;
+      return res.data.response?.trim() || null;
+    } catch (err) {
+      console.warn("[Ollama] Vision analysis error:", err);
+      return null;
+    }
+  });
 }

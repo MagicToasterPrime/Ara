@@ -96,10 +96,51 @@ main() {
     timedatectl set-timezone Europe/Paris 2>/dev/null || true
   fi
 
-  # Bascule automatique vers qwen2.5:3b (plus rapide et mieux calibré sur CPU)
-  if grep -qE '^OLLAMA_MODEL="?qwen2\.5:7b"?$' "${APP_DIR}/.env"; then
-    sed -i 's|^OLLAMA_MODEL=.*|OLLAMA_MODEL="qwen2.5:3b"|' "${APP_DIR}/.env"
-    log_ok "Modèle Ollama configuré sur qwen2.5:3b dans .env."
+  # Bascule automatique vers gemma3:12b (fidélité optimale pour le batch nocturne)
+  if grep -qE '^OLLAMA_MODEL="?(qwen2\.5:7b|qwen2\.5:3b)"?$' "${APP_DIR}/.env"; then
+    sed -i 's|^OLLAMA_MODEL=.*|OLLAMA_MODEL="gemma3:12b"|' "${APP_DIR}/.env"
+    log_ok "Modèle Ollama configuré sur gemma3:12b dans .env."
+  fi
+  if ! grep -q '^OLLAMA_NUM_THREAD=' "${APP_DIR}/.env"; then
+    echo 'OLLAMA_NUM_THREAD="4"' >> "${APP_DIR}/.env"
+  fi
+  if ! grep -q '^OLLAMA_TIMEOUT_MS=' "${APP_DIR}/.env"; then
+    echo 'OLLAMA_TIMEOUT_MS="1200000"' >> "${APP_DIR}/.env"
+  fi
+
+  # Protection concurrence = 1 côté systemd Ollama
+  if systemctl list-unit-files | grep -q "ollama.service"; then
+    mkdir -p /etc/systemd/system/ollama.service.d
+    cat > /etc/systemd/system/ollama.service.d/override.conf <<'EOF'
+[Service]
+Environment="OLLAMA_HOST=127.0.0.1:11434"
+Environment="OLLAMA_NUM_PARALLEL=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+EOF
+    systemctl daemon-reload
+    systemctl restart ollama || true
+    local OLLAMA_WAIT=10
+    until curl -sf http://127.0.0.1:11434/api/tags &>/dev/null || [[ "${OLLAMA_WAIT}" -le 0 ]]; do
+      OLLAMA_WAIT=$((OLLAMA_WAIT - 1))
+      sleep 1
+    done
+  fi
+
+  # Mise à jour Caddy : 300MB pour le bulk upload + timeouts 25m pour Ollama CPU
+  if [[ -f /etc/caddy/Caddyfile ]]; then
+    local CADDY_CHANGED=false
+    if grep -q 'max_size 100MB' /etc/caddy/Caddyfile; then
+      sed -i 's/max_size 100MB/max_size 300MB/g' /etc/caddy/Caddyfile
+      CADDY_CHANGED=true
+    fi
+    if ! grep -q 'response_header_timeout' /etc/caddy/Caddyfile && grep -qE '^\s*reverse_proxy 127\.0\.0\.1:[0-9]+\s*$' /etc/caddy/Caddyfile; then
+      sed -i -E 's|^(\s*reverse_proxy 127\.0\.0\.1:[0-9]+)\s*$|\1 {\n\t\ttransport http {\n\t\t\tread_timeout 25m\n\t\t\twrite_timeout 25m\n\t\t\tresponse_header_timeout 25m\n\t\t}\n\t}|' /etc/caddy/Caddyfile
+      CADDY_CHANGED=true
+    fi
+    if [[ "${CADDY_CHANGED}" == "true" ]]; then
+      systemctl reload caddy || systemctl restart caddy || true
+      log_ok "Caddy mis à jour (max_size 300MB, timeouts proxy 25m)."
+    fi
   fi
 
   mkdir -p "${APP_DIR}/storage/uploads" "${APP_DIR}/storage/backups"
@@ -110,7 +151,7 @@ main() {
   set +a
 
   if command -v ollama &>/dev/null && curl -sf http://127.0.0.1:11434/api/tags &>/dev/null; then
-    local TARGET_MODEL="${OLLAMA_MODEL:-qwen2.5:3b}"
+    local TARGET_MODEL="${OLLAMA_MODEL:-gemma3:12b}"
     if ! ollama list 2>/dev/null | grep -qF "${TARGET_MODEL}"; then
       log_info "Téléchargement du modèle Ollama ${TARGET_MODEL}..."
       ollama pull "${TARGET_MODEL}" || log_warn "Échec du pull ${TARGET_MODEL}, conservation du modèle local."

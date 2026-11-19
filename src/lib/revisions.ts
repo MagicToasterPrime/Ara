@@ -3,9 +3,13 @@ import { prisma } from "@/lib/prisma";
 import {
   checkOllamaHealth,
   getOllamaConfig,
-  getOptimalOllamaThreads,
+  getOllamaInferenceOptions,
+  OLLAMA_STRICT_SYSTEM_RULE,
+  OLLAMA_TIMEOUT_MS,
+  ollamaPostJson,
   withOllamaLock,
 } from "@/lib/ollama";
+import { hasUsableText } from "@/lib/pdf";
 import { getAllUeMetaMap } from "@/lib/ue-meta";
 import { getUserAccountMeta } from "@/lib/user-schema";
 
@@ -407,10 +411,47 @@ export function shuffleOptionsWithIndices(
   };
 }
 
+const GENERIC_PLACEHOLDER_PATTERNS: RegExp[] = [
+  /^r[eé]ponse\s+courte(?:\s*\d+)?$/i,
+  /^option\s+courte(?:\s*[a-d0-9])?$/i,
+  /^[eé]l[eé]ment\s+court(?:\s*\d+)?$/i,
+  /^proposition\s*(?:[a-d0-9]|exemple)$/i,
+  /^question\s+exemple\b/i,
+  /quel\s+terme\s+d[eé]signe\s+l['’]agent\s+ou\s+le\s+concept\s+cl[eé]\s+de\s+cette\s+[eé]tape/i,
+  /^question\s+(?:directe|courte)\s+(?:sur\s+une\s+valeur|appelant\s+un\s+terme)/i,
+  /^parmi\s+ces\s+(?:[eé]l[eé]ments\s+concernant\s+ce\s+m[eé]canisme|propositions\s+sur\s+\[notion\])/i,
+  /^justification\s+concise(?:\s+sourc[eé]e)?\.?$/i,
+  /^r[eé]ponse\s+(?:pr[eé]cise\s+et\s+concise\s+issue\s+du\s+cours|cl[eé]\s*:\s*explication\s+concise)/i,
+  /^rep[eè]re\s+cl[eé]\.?$/i,
+  /^motcl[eé]\d*$/i,
+  /^titre\s+court\s+du\s+sch[eé]ma$/i,
+  /^sous-titre\s+acad[eé]mique$/i,
+  /^[eé]l[eé]ment\s+r[eé]el\s+[ab]$/i,
+  /^donn[eé]e\s+r[eé]elle\s+[ab]\d$/i,
+  /^caract[eé]ristique\s+[12]$/i,
+  /^autre\s+(?:sous-partie\s+th[eé]matique|terme)$/i,
+  /^terme\s+cl[eé]$/i,
+  /\[notion\]/i,
+];
+
+export function hasGenericPlaceholderLeak(text?: string | null): boolean {
+  if (!text) return false;
+  const normalized = text.replace(/\*\*/g, "").replace(/\s+/g, " ").trim();
+  if (!normalized) return false;
+  return GENERIC_PLACEHOLDER_PATTERNS.some((re) => re.test(normalized));
+}
+
 export function isLowQualityExcerptQuestion(
   prompt: string,
-  options?: string[]
+  options?: string[],
+  answerOrBack?: string
 ): boolean {
+  if (hasGenericPlaceholderLeak(prompt)) {
+    return true;
+  }
+  if (answerOrBack && hasGenericPlaceholderLeak(answerOrBack)) {
+    return true;
+  }
   if (
     /correspond exactement au cours|directement tir[eé]e du cours|quelle phrase figure dans le cours|notion cl[eé].*quel [eé]l[eé]ment/i.test(
       prompt
@@ -423,6 +464,9 @@ export function isLowQualityExcerptQuestion(
   let longOptionCount = 0;
   for (const opt of options) {
     const clean = opt.trim();
+    if (hasGenericPlaceholderLeak(clean)) {
+      return true;
+    }
     if (
       /hors p[eé]rim[eè]tre|ne figure pas dans|assertion contradictoire|affirmation invers[eé]e|n'est pas abord[eé]e/i.test(
         clean
@@ -1225,6 +1269,117 @@ export function buildFactQuestionsFromChunks(
   return out.slice(0, targetCount);
 }
 
+const REVISION_ENRICHMENT_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    qcu: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description:
+            "Question interrogative directe, précise et contextualisée basée exclusivement sur l'extrait 1",
+        },
+        options: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Exactement 4 propositions courtes (1 à 8 mots), homogènes, sans lettre préfixe, issues du domaine de l'extrait 1",
+        },
+        correctIndices: {
+          type: "array",
+          items: { type: "integer" },
+          description:
+            "Tableau contenant l'unique indice (0 à 3) de la bonne réponse dans options",
+        },
+        explanation: {
+          type: "string",
+          description:
+            "Explication pédagogique concise fondée uniquement sur les faits de l'extrait 1",
+        },
+      },
+      required: ["prompt", "options", "correctIndices", "explanation"],
+    },
+    qcm: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description:
+            "Question à choix multiples précise portant sur les notions réelles de l'extrait 2",
+        },
+        options: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Exactement 4 propositions courtes (1 à 10 mots), sans lettre préfixe, dont 2 ou 3 sont exactes selon l'extrait 2",
+        },
+        correctIndices: {
+          type: "array",
+          items: { type: "integer" },
+          description:
+            "Tableau contenant les 2 ou 3 indices (0 à 3) des propositions exactes",
+        },
+        explanation: {
+          type: "string",
+          description:
+            "Explication pédagogique concise fondée uniquement sur les faits de l'extrait 2",
+        },
+      },
+      required: ["prompt", "options", "correctIndices", "explanation"],
+    },
+    qroc: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description:
+            "Question ouverte courte et précise portant sur un terme, une valeur ou un mécanisme exact de l'extrait 3",
+        },
+        correctAnswer: {
+          type: "string",
+          description:
+            "Réponse attendue en 1 à 4 mots exacts tirée directement de l'extrait 3",
+        },
+        acceptedKeywords: {
+          type: "array",
+          items: { type: "string" },
+          description:
+            "Mots-clés scientifiques et synonymes acceptés tirés de l'extrait 3",
+        },
+        explanation: {
+          type: "string",
+          description:
+            "Explication pédagogique concise fondée uniquement sur les faits de l'extrait 3",
+        },
+      },
+      required: ["prompt", "correctAnswer", "acceptedKeywords", "explanation"],
+    },
+    flashcard: {
+      type: "object",
+      properties: {
+        prompt: {
+          type: "string",
+          description:
+            "Question recto directe en une phrase portant sur un fait précis de l'extrait 4",
+        },
+        flashcardBack: {
+          type: "string",
+          description:
+            "Réponse verso exacte et concise (1 à 2 phrases) issue uniquement de l'extrait 4",
+        },
+        explanation: {
+          type: "string",
+          description:
+            "Repère pédagogique concis tiré des faits de l'extrait 4",
+        },
+      },
+      required: ["prompt", "flashcardBack", "explanation"],
+    },
+  },
+  required: ["qcu", "qcm", "qroc", "flashcard"],
+};
+
 async function tryOllamaQuizEnrichment(
   qcuChunk: SampledChunk,
   qcmChunk: SampledChunk,
@@ -1241,24 +1396,29 @@ async function tryOllamaQuizEnrichment(
   qroc?: Partial<RevisionQuestion>;
   flashcard?: Partial<RevisionQuestion>;
 } | null> {
+  const ex1 = selectHighValueText(qcuChunk.content, 800);
+  const ex2 = selectHighValueText(qcmChunk.content, 800);
+  const ex3 = selectHighValueText(qrocChunk.content, 800);
+  const ex4 = selectHighValueText(flashcardChunk.content, 800);
+
+  if (!hasUsableText(`${ex1} ${ex2} ${ex3} ${ex4}`)) {
+    console.error(
+      "[Revisions] Enrichissement IA annulé : extraits sources vides ou non exploitables."
+    );
+    return null;
+  }
+
   return withOllamaLock(async () => {
     const health = await checkOllamaHealth();
     if (!health.online) return null;
 
-    const { host, model } = getOllamaConfig();
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 90000);
-
-    const ex1 = selectHighValueText(qcuChunk.content, 520);
-    const ex2 = selectHighValueText(qcmChunk.content, 520);
-    const ex3 = selectHighValueText(qrocChunk.content, 520);
-    const ex4 = selectHighValueText(flashcardChunk.content, 520);
+    const { model } = getOllamaConfig();
 
     const chapterFocus = meta?.chapterTitle
       ? `CHAPITRE CIBLÉ : « ${meta.chapterTitle} » (${qcuChunk.ueCode}).\n`
       : "";
     const freshnessBlock = meta?.freshnessSeed
-      ? `CONSIGNE DE FRAÎCHEUR (${meta.freshnessSeed}) : Crée des questions TOUTES NEUVES et originales sous un angle différent.\n`
+      ? `CONSIGNE DE FRAÎCHEUR (${meta.freshnessSeed}) : Rédige des questions originales sous un angle nouveau.\n`
       : "";
     const avoidBlock =
       meta?.avoidPrompts && meta.avoidPrompts.length > 0
@@ -1267,77 +1427,71 @@ async function tryOllamaQuizEnrichment(
             .join("\n- ")}\n`
         : "";
 
-    const prompt = `Tu es un générateur de révisions de niveau NotebookLM pour étudiants vétérinaires.
-${chapterFocus}${freshnessBlock}${avoidBlock}Génère strictement un objet JSON valide avec 4 exercices TOUT NEUFS basés sur les VALEURS, NOTIONS, DÉFINITIONS et MÉCANISMES extraits de ces 4 passages du chapitre.
+    const systemPrompt = `Tu es un enseignant universitaire vétérinaire chargé de créer un QCU, un QCM, une QROC et une flashcard de révision à partir de quatre extraits de cours.
+${OLLAMA_STRICT_SYSTEM_RULE}`;
 
-RÈGLES ABSOLUES :
-1. NE JAMAIS recopier une phrase du polycopié en option de réponse ou demander « quelle affirmation figure dans le cours ».
-2. QCU : pose une question directe et précise sur une valeur chiffrée (%, taille, date, seuil), un mécanisme ou une définition. Les 4 options doivent être COURTES (1 à 8 mots, homogènes) comme : ["Moins de 5%", "Environ 10 à 15%", "Plus de 90%", "Exactement 50%"]. Varie l'indice de la bonne réponse (pas toujours 0).
-3. QCM : question à 2 ou 3 bonnes réponses, options courtes et précises (maximum 10 mots par option).
-4. QROC : question ouverte courte dont la réponse attendue tient en 1 à 4 mots exacts.
-5. FLASHCARD : Recto = une seule question courte et directe (ex : "Quelle est la plage de taille caractéristique d'un érythrocyte chez les mammifères ?"). Verso = réponse exacte et concise (1 à 2 phrases avec la valeur/notion clé).
+    const prompt = `${chapterFocus}${freshnessBlock}${avoidBlock}À partir des quatre extraits ci-dessous, produis un objet JSON respectant strictement le schéma attendu avec les 4 champs racines : "qcu", "qcm", "qroc" et "flashcard".
 
-EXTRAIT 1 (QCU) [${qcuChunk.ueCode} · ${qcuChunk.chapterTitle}]:
+DESCRIPTION DES CHAMPS ET RÈGLES PÉDAGOGIQUES :
+1. INTERDIT de recopier des phrases complètes du polycopié en propositions de réponse ou de demander quelle affirmation figure dans le cours.
+2. Champ "qcu" (basé sur l'EXTRAIT 1) :
+   - "prompt" : une question directe, autonome et précise testant un chiffre, un seuil, une définition ou un mécanisme réel de l'extrait 1.
+   - "options" : un tableau de 4 propositions courtes (1 à 8 mots chacune), homogènes, plausibles, sans préfixe alphabétique.
+   - "correctIndices" : un tableau contenant l'unique indice (0 à 3) de la bonne réponse, en variant la position.
+   - "explanation" : justification factuelle concise tirée de l'extrait 1.
+3. Champ "qcm" (basé sur l'EXTRAIT 2) :
+   - "prompt" : une question à choix multiples contextualisée sur le mécanisme ou la notion de l'extrait 2.
+   - "options" : un tableau de 4 propositions courtes (1 à 10 mots chacune), sans préfixe alphabétique.
+   - "correctIndices" : un tableau contenant exactement 2 ou 3 indices (0 à 3) des propositions exactes.
+   - "explanation" : justification factuelle concise tirée de l'extrait 2.
+4. Champ "qroc" (basé sur l'EXTRAIT 3) :
+   - "prompt" : une question ouverte courte et précise appelant un terme scientifique, une valeur ou un mécanisme concret de l'extrait 3.
+   - "correctAnswer" : la réponse exacte attendue en 1 à 4 mots issus de l'extrait 3.
+   - "acceptedKeywords" : liste de mots-clés scientifiques et synonymes pertinents tirés de l'extrait 3.
+   - "explanation" : justification factuelle concise tirée de l'extrait 3.
+5. Champ "flashcard" (basé sur l'EXTRAIT 4) :
+   - "prompt" : une question recto directe en une seule phrase portant sur un fait précis de l'extrait 4.
+   - "flashcardBack" : la réponse verso exacte et concise (1 à 2 phrases) issue de l'extrait 4.
+   - "explanation" : repère pédagogique issu de l'extrait 4.
+
+EXTRAIT 1 (pour qcu) [${qcuChunk.ueCode} · ${qcuChunk.chapterTitle}]:
 ${ex1}
 
-EXTRAIT 2 (QCM) [${qcmChunk.ueCode} · ${qcmChunk.chapterTitle}]:
+EXTRAIT 2 (pour qcm) [${qcmChunk.ueCode} · ${qcmChunk.chapterTitle}]:
 ${ex2}
 
-EXTRAIT 3 (QROC) [${qrocChunk.ueCode} · ${qrocChunk.chapterTitle}]:
+EXTRAIT 3 (pour qroc) [${qrocChunk.ueCode} · ${qrocChunk.chapterTitle}]:
 ${ex3}
 
-EXTRAIT 4 (FLASHCARD) [${flashcardChunk.ueCode} · ${flashcardChunk.chapterTitle}]:
-${ex4}
-
-Réponds STRICTEMENT en JSON :
-{
-  "qcu": {
-    "prompt": "Question directe sur une valeur ou notion clé ?",
-    "options": ["Option courte A", "Option courte B", "Option courte C", "Option courte D"],
-    "correctIndices": [2],
-    "explanation": "Justification concise sourcée."
-  },
-  "qcm": {
-    "prompt": "Parmi ces propositions sur [notion], lesquelles sont exactes ?",
-    "options": ["Élément court 1", "Élément court 2", "Élément court 3", "Élément court 4"],
-    "correctIndices": [0, 2],
-    "explanation": "Justification concise."
-  },
-  "qroc": {
-    "prompt": "Question courte appelant un terme, chiffre ou mécanisme précis ?",
-    "correctAnswer": "Réponse courte",
-    "acceptedKeywords": ["motcle1", "motcle2"],
-    "explanation": "Justification concise."
-  },
-  "flashcard": {
-    "prompt": "Question directe et courte (1 phrase) sur une valeur ou notion ?",
-    "flashcardBack": "Réponse précise et concise issue du cours.",
-    "explanation": "Repère clé."
-  }
-}`;
+EXTRAIT 4 (pour flashcard) [${flashcardChunk.ueCode} · ${flashcardChunk.chapterTitle}]:
+${ex4}`;
 
     try {
-      const res = await fetch(`${host}/api/generate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model,
-          prompt,
-          format: "json",
-          stream: false,
-          options: {
-            temperature: 0.35,
-            num_ctx: 4096,
-            num_predict: 1600,
-            num_thread: getOptimalOllamaThreads(),
-          },
-        }),
-        signal: controller.signal,
-      });
+      const requestBody = {
+        model,
+        system: systemPrompt,
+        prompt,
+        format: REVISION_ENRICHMENT_SCHEMA as unknown,
+        stream: false,
+        options: getOllamaInferenceOptions({ num_predict: 1800 }),
+      };
 
-      if (!res.ok) return null;
-      const data = (await res.json()) as { response?: string };
-      if (!data.response) return null;
+      let res = await ollamaPostJson<{ response?: string }>(
+        "/api/generate",
+        requestBody,
+        OLLAMA_TIMEOUT_MS
+      );
+
+      // Compatibility fallback if an older Ollama server (< 0.5) rejects JSON Schema objects in `format`
+      if (!res.ok && res.status === 400) {
+        res = await ollamaPostJson<{ response?: string }>(
+          "/api/generate",
+          { ...requestBody, format: "json" },
+          OLLAMA_TIMEOUT_MS
+        );
+      }
+
+      if (!res.ok || !res.data?.response) return null;
 
       const parsed = parseOllamaJsonWithRecovery<{
         qcu?: {
@@ -1363,7 +1517,7 @@ Réponds STRICTEMENT en JSON :
           flashcardBack?: string;
           explanation?: string;
         };
-      }>(data.response);
+      }>(res.data.response);
 
       if (!parsed) return null;
 
@@ -1382,7 +1536,8 @@ Réponds STRICTEMENT en JSON :
         parsed.qcu.correctIndices.length >= 1 &&
         parsed.qcu.correctIndices[0] >= 0 &&
         parsed.qcu.correctIndices[0] < 4 &&
-        !isLowQualityExcerptQuestion(parsed.qcu.prompt, parsed.qcu.options)
+        !isLowQualityExcerptQuestion(parsed.qcu.prompt, parsed.qcu.options) &&
+        !hasGenericPlaceholderLeak(parsed.qcu.explanation)
       ) {
         const shuffledQcu = shuffleOptionsWithIndices(
           parsed.qcu.options.map((o) => String(o).trim()),
@@ -1402,7 +1557,8 @@ Réponds STRICTEMENT en JSON :
         Array.isArray(parsed.qcm.options) &&
         parsed.qcm.options.length === 4 &&
         Array.isArray(parsed.qcm.correctIndices) &&
-        !isLowQualityExcerptQuestion(parsed.qcm.prompt, parsed.qcm.options)
+        !isLowQualityExcerptQuestion(parsed.qcm.prompt, parsed.qcm.options) &&
+        !hasGenericPlaceholderLeak(parsed.qcm.explanation)
       ) {
         const validIndices = Array.from(
           new Set(
@@ -1431,13 +1587,18 @@ Réponds STRICTEMENT en JSON :
         parsed.qroc?.prompt &&
         typeof parsed.qroc.correctAnswer === "string" &&
         parsed.qroc.correctAnswer.trim().length > 0 &&
-        !isLowQualityExcerptQuestion(parsed.qroc.prompt)
+        !isLowQualityExcerptQuestion(
+          parsed.qroc.prompt,
+          undefined,
+          parsed.qroc.correctAnswer
+        ) &&
+        !hasGenericPlaceholderLeak(parsed.qroc.explanation)
       ) {
         const mainAnswer = parsed.qroc.correctAnswer.trim();
         const rawKeywords = Array.isArray(parsed.qroc.acceptedKeywords)
           ? parsed.qroc.acceptedKeywords
               .map((k) => String(k).trim())
-              .filter((k) => k.length > 0)
+              .filter((k) => k.length > 0 && !hasGenericPlaceholderLeak(k))
           : [];
         const keywordSet = Array.from(new Set([mainAnswer, ...rawKeywords]));
 
@@ -1454,7 +1615,12 @@ Réponds STRICTEMENT en JSON :
         parsed.flashcard?.prompt &&
         typeof parsed.flashcard.flashcardBack === "string" &&
         parsed.flashcard.flashcardBack.trim().length > 0 &&
-        !isLowQualityExcerptQuestion(parsed.flashcard.prompt)
+        !isLowQualityExcerptQuestion(
+          parsed.flashcard.prompt,
+          undefined,
+          parsed.flashcard.flashcardBack
+        ) &&
+        !hasGenericPlaceholderLeak(parsed.flashcard.explanation)
       ) {
         result.flashcard = {
           prompt: parsed.flashcard.prompt.trim(),
@@ -1465,10 +1631,9 @@ Réponds STRICTEMENT en JSON :
       }
 
       return result;
-    } catch {
+    } catch (err) {
+      console.warn("[Revisions] Ollama enrichment error:", err);
       return null;
-    } finally {
-      clearTimeout(timer);
     }
   });
 }
@@ -1874,8 +2039,13 @@ export async function getOrGenerateSharedDailyQuiz(options?: {
       : null;
 
     if (existing) {
-      const hasStaleCopyPaste = existing.questions.some((q) =>
-        isLowQualityExcerptQuestion(q.prompt, q.options)
+      const hasStaleCopyPaste = existing.questions.some(
+        (q) =>
+          isLowQualityExcerptQuestion(
+            q.prompt,
+            q.options,
+            q.correctAnswer || q.flashcardBack
+          ) || hasGenericPlaceholderLeak(q.explanation)
       );
       const needsAiUpgrade =
         !existing.generatedByAi && (await checkOllamaHealth()).online;
