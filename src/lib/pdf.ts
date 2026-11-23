@@ -15,15 +15,15 @@ export interface ExtractedPdfResult {
 
 interface PdfPageData {
   getTextContent: () => Promise<{
-    items: Array<{ str?: string; hasEOL?: boolean }>;
-  }>;
-  getOperatorList?: () => Promise<{
-    fnArray?: number[];
+    items: Array<{
+      str?: string;
+      width?: number;
+      height?: number;
+      transform?: number[];
+      hasEOL?: boolean;
+    }>;
   }>;
 }
-
-// PDF.js drawing operator codes for embedded raster/inline images
-const IMAGE_OPS = new Set([82, 83, 84, 85, 86, 87, 88]);
 
 /**
  * Minimum number of real alphanumeric characters required across a PDF
@@ -75,6 +75,27 @@ function extractFigureLegendHints(pageText: string): string[] {
   return matches;
 }
 
+export function normalizePdfExtractedText(raw: string): string {
+  return raw
+    .replace(/\r\n?/g, "\n")
+    .replace(/\uFFFD/g, "")
+    .replace(/\uFB00/g, "ff")
+    .replace(/\uFB01/g, "fi")
+    .replace(/\uFB02/g, "fl")
+    .replace(/\uFB03/g, "ffi")
+    .replace(/\uFB04/g, "ffl")
+    .replace(/[\uFB05\uFB06]/g, "st")
+    .replace(/([a-zA-ZÀ-ÿœŒ])[\u01AF\u01B0]([a-zA-ZÀ-ÿœŒ])/g, "$1ff$2")
+    .replace(/(^|[\s(['"«-])[\u01AF\u01B0]([a-zà-ÿœ]{2,})/g, "$1ff$2")
+    .replace(/^[ \t]*[\uE000-\uF8FF]+[ \t]*/gm, "• ")
+    .replace(/[\uE000-\uF8FF]+/g, " ")
+    .replace(/([a-zA-ZÀ-ÿœŒ]{2,})-[ \t]*\n[ \t]*([a-zà-ÿœ]{2,})/g, "$1$2")
+    .replace(/[ \t]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 export async function extractPdfPages(
   buffer: Buffer
 ): Promise<ExtractedPdfResult> {
@@ -94,48 +115,224 @@ export async function extractPdfPages(
         currentIndex += 1;
         const pageNum = currentIndex;
         const textContent = await pageData.getTextContent();
-        let lastText = "";
-        const pieces: string[] = [];
+
+        interface ReconstructedLine {
+          raw: string;
+          breakBefore: "" | "\n" | "\n\n";
+          fontWeights: Map<number, number>;
+        }
+
+        const lines: ReconstructedLine[] = [];
+        const pageFontWeights: Array<{ size: number; weight: number }> = [];
+        let currentLine: ReconstructedLine | null = null;
+        let lastY: number | null = null;
+        let lastEndX: number | null = null;
+        let lastFontSize = 10;
+
+        const pushCurrentLine = () => {
+          if (currentLine) {
+            lines.push(currentLine);
+            currentLine = null;
+          }
+        };
+
         for (const item of textContent.items) {
           const str = item.str ?? "";
-          if (str) {
-            pieces.push(str);
-            lastText = str;
-          }
-          if (item.hasEOL && lastText !== "\n") {
-            pieces.push("\n");
-          }
-        }
+          const hasTransform =
+            Array.isArray(item.transform) &&
+            item.transform.length >= 6 &&
+            Number.isFinite(item.transform[4]) &&
+            Number.isFinite(item.transform[5]);
 
-        let imageCount = 0;
-        if (typeof pageData.getOperatorList === "function") {
-          try {
-            const opList = await pageData.getOperatorList();
-            if (Array.isArray(opList?.fnArray)) {
-              for (const fn of opList.fnArray) {
-                if (IMAGE_OPS.has(fn)) {
-                  imageCount += 1;
-                }
+          const x = hasTransform ? item.transform![4] : 0;
+          const y = hasTransform ? item.transform![5] : 0;
+          const rawFontSize = hasTransform
+            ? Math.hypot(item.transform![0] || 0, item.transform![1] || 0) ||
+              Math.abs(item.transform![3] || 0) ||
+              item.height ||
+              10
+            : item.height || 10;
+          const fontSize =
+            Number.isFinite(rawFontSize) && rawFontSize > 0 ? rawFontSize : 10;
+
+          if (!str) {
+            if (item.hasEOL && currentLine) {
+              pushCurrentLine();
+              lastY = null;
+              lastEndX = null;
+            }
+            continue;
+          }
+
+          const isWhitespaceOnly = str.trim().length === 0;
+          if (isWhitespaceOnly) {
+            if (
+              currentLine &&
+              (!hasTransform ||
+                lastY === null ||
+                Math.abs(y - lastY) <=
+                  Math.max(2.2, Math.min(fontSize, lastFontSize) * 0.38))
+            ) {
+              if (!currentLine.raw.endsWith(" ")) {
+                currentLine.raw += " ";
+              }
+              if (hasTransform) {
+                lastEndX = x + (item.width || 0);
               }
             }
-          } catch {
-            // Operator list inspection optional
+            if (item.hasEOL && currentLine) {
+              pushCurrentLine();
+              lastY = null;
+              lastEndX = null;
+            }
+            continue;
+          }
+
+          let startedNewLine = false;
+          let breakBefore: "" | "\n" | "\n\n" = "";
+
+          if (!currentLine) {
+            startedNewLine = true;
+            breakBefore = lines.length > 0 ? "\n" : "";
+          } else if (hasTransform && lastY !== null) {
+            const dy = Math.abs(y - lastY);
+            const lineThreshold = Math.max(
+              2.2,
+              Math.min(fontSize, lastFontSize) * 0.38
+            );
+            if (dy > lineThreshold) {
+              pushCurrentLine();
+              startedNewLine = true;
+              breakBefore =
+                dy > Math.max(fontSize, lastFontSize) * 1.75 ? "\n\n" : "\n";
+            }
+          }
+
+          if (startedNewLine || !currentLine) {
+            currentLine = {
+              raw: "",
+              breakBefore,
+              fontWeights: new Map(),
+            };
+            lastEndX = null;
+          } else if (hasTransform && lastEndX !== null) {
+            const gap = x - lastEndX;
+            if (gap > fontSize * 2.5) {
+              currentLine.raw += " | ";
+            } else if (
+              gap > fontSize * 0.14 &&
+              !currentLine.raw.endsWith(" ") &&
+              !str.startsWith(" ")
+            ) {
+              currentLine.raw += " ";
+            }
+          } else if (
+            !hasTransform &&
+            currentLine.raw.length > 0 &&
+            !currentLine.raw.endsWith(" ") &&
+            !str.startsWith(" ")
+          ) {
+            currentLine.raw += " ";
+          }
+
+          currentLine.raw += str;
+
+          const nonSpaceLen = str.replace(/\s+/g, "").length;
+          if (nonSpaceLen > 0) {
+            const bucket = Math.round(fontSize * 10) / 10;
+            currentLine.fontWeights.set(
+              bucket,
+              (currentLine.fontWeights.get(bucket) || 0) + nonSpaceLen
+            );
+            pageFontWeights.push({ size: bucket, weight: nonSpaceLen });
+          }
+
+          if (hasTransform) {
+            lastY = y;
+            lastEndX = x + (item.width || 0);
+            lastFontSize = fontSize;
+          }
+
+          if (item.hasEOL) {
+            pushCurrentLine();
+            lastY = null;
+            lastEndX = null;
+          }
+        }
+        pushCurrentLine();
+
+        let medianFontSize = 10;
+        if (pageFontWeights.length > 0) {
+          pageFontWeights.sort((a, b) => a.size - b.size);
+          const totalWeight = pageFontWeights.reduce(
+            (sum, entry) => sum + entry.weight,
+            0
+          );
+          let cumulative = 0;
+          for (const entry of pageFontWeights) {
+            cumulative += entry.weight;
+            if (cumulative >= totalWeight * 0.5) {
+              medianFontSize = entry.size;
+              break;
+            }
           }
         }
 
-        const baseText = pieces.join(" ").replace(/\s+/g, " ").trim();
+        let assembled = "";
+        let pendingBreak: "" | "\n" | "\n\n" = "";
+        for (const line of lines) {
+          const normLine = normalizePdfExtractedText(line.raw);
+          if (!normLine) {
+            if (assembled) {
+              pendingBreak =
+                line.breakBefore === "\n\n" ? "\n\n" : pendingBreak || "\n";
+            }
+            continue;
+          }
+
+          let dominantFontSize = medianFontSize;
+          let maxFontWeight = -1;
+          for (const [size, weight] of Array.from(line.fontWeights.entries())) {
+            if (weight > maxFontWeight) {
+              maxFontWeight = weight;
+              dominantFontSize = size;
+            }
+          }
+
+          const letterCount = (normLine.match(/[a-zA-ZÀ-ÿœŒ]/g) || []).length;
+          const isHeading =
+            normLine.length <= 110 &&
+            letterCount >= 3 &&
+            !/^[•\-|]/.test(normLine) &&
+            !/\.{3}|…/.test(normLine) &&
+            dominantFontSize >= medianFontSize * 1.26 &&
+            dominantFontSize >= 13;
+
+          const formattedLine = isHeading ? `### ${normLine}` : normLine;
+          if (!assembled) {
+            assembled = formattedLine;
+          } else {
+            const sep =
+              pendingBreak === "\n\n" || line.breakBefore === "\n\n"
+                ? "\n\n"
+                : line.breakBefore || "\n";
+            assembled += `${sep}${formattedLine}`;
+          }
+          pendingBreak = "";
+        }
+
+        const baseText = normalizePdfExtractedText(assembled);
         const rawTextLength = getMeaningfulTextLength(baseText);
         const figureHints = extractFigureLegendHints(baseText);
+        const imageCount = figureHints.length;
 
-        // Only attach visual markers when the page has real text; avoid generating
-        // synthetic-only chunks on scanned image-only pages.
+        // Only attach visual markers when the page has real text and legend hints;
+        // avoid calling pageData.getOperatorList() which triggers FontLoader/Image crashes in pdf.js under Node.js.
         let enrichedText = baseText;
-        if (rawTextLength > 0 && (imageCount > 0 || figureHints.length > 0)) {
-          const visualTag = `[REPÈRE VISUEL PAGE ${pageNum} : ${imageCount} image(s)/figure(s) détectée(s)${
-            figureHints.length > 0
-              ? ` · Légendes : ${figureHints.join(" | ")}`
-              : ""
-          }]`;
+        if (rawTextLength > 0 && figureHints.length > 0) {
+          const visualTag = `[REPÈRE VISUEL PAGE ${pageNum} : ${imageCount} image(s)/figure(s) détectée(s) · Légendes : ${figureHints.join(
+            " | "
+          )}]`;
           enrichedText = `${baseText}\n${visualTag}`;
         }
 
@@ -151,7 +348,7 @@ export async function extractPdfPages(
 
     const pageCount = Math.max(data.numpages || pages.length || 1, 1);
     if (pages.length === 0 && data.text?.trim()) {
-      const cleaned = data.text.trim();
+      const cleaned = normalizePdfExtractedText(data.text);
       pages.push({
         pageNumber: 1,
         text: cleaned,

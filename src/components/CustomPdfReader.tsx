@@ -84,7 +84,7 @@ export function CustomPdfReader({
   onCreateQuizFromCapture,
   onClose,
 }: CustomPdfReaderProps) {
-  const { triggerSpixImagePrompt } = useSpix();
+  const { triggerSpixImagePrompt, userAiAndSpixEnabled } = useSpix();
 
   const [pdfDoc, setPdfDoc] = useState<PDFDocumentProxy | null>(null);
   const [totalPages, setTotalPages] = useState<number>(pageCountHint);
@@ -943,23 +943,25 @@ export function CustomPdfReader({
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() => {
-                triggerSpixImagePrompt({
-                  imageDataUrl: capturedImageUrl,
-                  prompt: `Explique en détail cette figure / cet extrait issu de « ${title} » (page ${currentPage}).`,
-                  pageNumber: currentPage,
-                });
-                setCaptureRectPx(null);
-                setCapturedImageUrl(null);
-                setCaptureMode(false);
-              }}
-              className="inline-flex items-center gap-1 border border-ink bg-ink px-2.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90"
-            >
-              <Sparkles className="h-3 w-3" />
-              <span>EXPLIQUER AVEC SPIX</span>
-            </button>
+            {userAiAndSpixEnabled && (
+              <button
+                type="button"
+                onClick={() => {
+                  triggerSpixImagePrompt({
+                    imageDataUrl: capturedImageUrl,
+                    prompt: `Explique en détail cette figure / cet extrait issu de « ${title} » (page ${currentPage}).`,
+                    pageNumber: currentPage,
+                  });
+                  setCaptureRectPx(null);
+                  setCapturedImageUrl(null);
+                  setCaptureMode(false);
+                }}
+                className="inline-flex items-center gap-1 border border-ink bg-ink px-2.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90"
+              >
+                <Sparkles className="h-3 w-3" />
+                <span>EXPLIQUER AVEC SPIX</span>
+              </button>
+            )}
 
             {onCreateQuizFromCapture && (
               <button

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { signIn } from "next-auth/react";
-import { ArrowRight, Clock, ShieldCheck, UserPlus } from "lucide-react";
+import { ArrowRight, Clock, KeyRound, ShieldCheck, UserPlus } from "lucide-react";
 import {
   CLASS_LEVELS,
   CLASS_LEVEL_LABELS,
@@ -17,6 +17,8 @@ export default function RegisterPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [classLevel, setClassLevel] = useState<ClassLevel>("PACENV");
+  const [inviteCode, setInviteCode] = useState("");
+  const [inviteCodeEnabled, setInviteCodeEnabled] = useState(false);
   const [hasUsers, setHasUsers] = useState<boolean | null>(null);
   const [pendingApproval, setPendingApproval] = useState(false);
   const [registeredInfo, setRegisteredInfo] = useState<{
@@ -30,11 +32,16 @@ export default function RegisterPage() {
   useEffect(() => {
     fetch("/api/auth/register", { cache: "no-store" })
       .then((res) => (res.ok ? res.json() : null))
-      .then((data: { hasUsers?: boolean } | null) => {
-        if (data && typeof data.hasUsers === "boolean") {
-          setHasUsers(data.hasUsers);
+      .then(
+        (data: { hasUsers?: boolean; inviteCodeEnabled?: boolean } | null) => {
+          if (data && typeof data.hasUsers === "boolean") {
+            setHasUsers(data.hasUsers);
+          }
+          if (data && typeof data.inviteCodeEnabled === "boolean") {
+            setInviteCodeEnabled(data.inviteCodeEnabled);
+          }
         }
-      })
+      )
       .catch(() => {});
   }, []);
 
@@ -52,6 +59,7 @@ export default function RegisterPage() {
           email: email.trim().toLowerCase(),
           password,
           classLevel,
+          inviteCode: inviteCode.trim() || undefined,
         }),
       });
 
@@ -139,13 +147,18 @@ export default function RegisterPage() {
             <Clock className="mt-0.5 h-4 w-4 shrink-0 text-amber" />
             <div>
               <p className="font-mono text-[11px] font-semibold uppercase tracking-wider">
-                VALIDATION ADMIN REQUISE
+                {inviteCodeEnabled
+                  ? "VALIDATION ADMIN OU CODE D'ACCÈS"
+                  : "VALIDATION ADMIN REQUISE"}
               </p>
               <p className="mt-0.5 text-xs leading-relaxed text-stone">
                 Pour protéger l&apos;espace de la promotion, chaque nouveau compte
-                doit être validé par un administrateur (
-                <span className="font-mono text-ink">YEAR_ADMIN</span>) avant de
-                pouvoir se connecter.
+                est soumis à validation par un administrateur (
+                <span className="font-mono text-ink">YEAR_ADMIN</span>) —{" "}
+                <span className="text-ink">
+                  ou activé immédiatement si vous renseignez un code
+                  d&apos;invitation valide.
+                </span>
               </p>
             </div>
           </div>
@@ -280,6 +293,30 @@ export default function RegisterPage() {
                 </p>
               </div>
 
+              {hasUsers !== false && (
+                <div>
+                  <label className="mb-1.5 flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wider text-stone">
+                    <KeyRound className="h-3.5 w-3.5 text-stone" />
+                    <span>CODE D&apos;ACCÈS PROMOTION (OPTIONNEL · ACCÈS IMMÉDIAT)</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={inviteCode}
+                    onChange={(e) => setInviteCode(e.target.value.toUpperCase())}
+                    placeholder="Ex: ARA-VET2026 (laisser vide pour validation manuelle)"
+                    autoComplete="off"
+                    className="w-full border border-border bg-paper px-3 py-2.5 font-mono text-sm uppercase tracking-wider text-ink placeholder:font-sans placeholder:normal-case placeholder:tracking-normal placeholder:text-stone/60 focus:border-ink focus:outline-none"
+                  />
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-stone">
+                    {inviteCode.trim().length > 0
+                      ? "Avec un code d'accès valide, votre compte sera activé immédiatement sans attendre la validation d'un administrateur."
+                      : inviteCodeEnabled
+                      ? "Un code d'invitation promotion est actuellement actif. Saisissez-le pour accéder directement à la plateforme sans attente."
+                      : "Optionnel : si votre délégué ou administrateur vous a transmis un code d'invitation, saisissez-le pour accéder directement à la plateforme."}
+                  </p>
+                </div>
+              )}
+
               <div>
                 <label className="mb-1.5 block font-mono text-[11px] uppercase tracking-wider text-stone">
                   MOT DE PASSE (6 CARACTÈRES MIN.)
@@ -305,6 +342,8 @@ export default function RegisterPage() {
                     ? "CRÉATION EN COURS..."
                     : hasUsers === false
                     ? "VALIDER L'INSCRIPTION"
+                    : inviteCode.trim().length > 0
+                    ? "CRÉER ET ACCÉDER AU SITE"
                     : "DEMANDER L'INSCRIPTION"}
                 </span>
                 <ArrowRight className="h-3.5 w-3.5" />

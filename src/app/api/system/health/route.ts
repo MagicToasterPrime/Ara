@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { checkOllamaHealth } from "@/lib/ollama";
 import { getStorageStats } from "@/lib/storage";
+import { getSystemSettings } from "@/lib/system-settings";
 import {
   ensureUserAccountSchema,
   getAllUsersAccountMeta,
@@ -16,9 +17,10 @@ export async function GET() {
 
   await ensureUserAccountSchema();
 
-  const [ollama, storage, counts, metaMap] = await Promise.all([
+  const [ollama, storage, settings, counts, metaMap] = await Promise.all([
     checkOllamaHealth(),
     getStorageStats(),
+    getSystemSettings(),
     Promise.all([
       prisma.user.count(),
       prisma.uE.count(),
@@ -77,9 +79,15 @@ export async function GET() {
     };
   });
 
+  const publicSettings =
+    user.globalRole === "YEAR_ADMIN"
+      ? settings
+      : { ...settings, inviteCode: "" };
+
   return NextResponse.json({
     ollama,
     storage,
+    settings: publicSettings,
     stats: {
       userCount,
       ueCount,

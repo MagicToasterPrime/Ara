@@ -13,7 +13,9 @@ import {
 } from "@/lib/studio";
 import {
   getSystemSettings,
+  normalizeInviteCode,
   updateSystemSettings,
+  type SiteAnnouncementType,
 } from "@/lib/system-settings";
 
 async function buildAdminQueueResponse(notice?: string) {
@@ -65,8 +67,14 @@ export async function POST(req: Request) {
         | "STOP"
         | "TOGGLE_24H"
         | "TOGGLE_DAILY_QUIZ"
-        | "REGENERATE_DAILY_QUIZ";
+        | "REGENERATE_DAILY_QUIZ"
+        | "TOGGLE_USER_AI"
+        | "UPDATE_ANNOUNCEMENT"
+        | "UPDATE_INVITE_CODE";
       enabled?: boolean;
+      announcementType?: SiteAnnouncementType;
+      announcementMessage?: string;
+      inviteCode?: string;
       chapterId?: string;
       documentId?: string;
     };
@@ -107,6 +115,104 @@ export async function POST(req: Request) {
       const notice = enabled
         ? "Quiz journalier activé pour toute la promotion (génération automatique à 06h00 et au premier accès)."
         : "Quiz journalier désactivé : la génération automatique de 06h00 est mise en pause et la bannière est masquée sur l'accueil.";
+
+      return NextResponse.json(await buildAdminQueueResponse(notice));
+    }
+
+    if (action === "TOGGLE_USER_AI") {
+      const enabled = Boolean(body.enabled);
+      await updateSystemSettings({ userAiAndSpixEnabled: enabled });
+
+      const notice = enabled
+        ? "Génération IA par les utilisateurs et assistant Spix activés."
+        : "Génération IA par les utilisateurs et assistant Spix désactivés : les fiches, flashcards et quiz déjà générés restent consultables.";
+
+      return NextResponse.json(await buildAdminQueueResponse(notice));
+    }
+
+    if (action === "UPDATE_ANNOUNCEMENT") {
+      const enabled = Boolean(body.enabled);
+      const validType: SiteAnnouncementType | undefined =
+        body.announcementType === "IMPORTANT" ||
+        body.announcementType === "INFO" ||
+        body.announcementType === "PREVENTION"
+          ? body.announcementType
+          : undefined;
+      const trimmedMsg =
+        typeof body.announcementMessage === "string"
+          ? body.announcementMessage.trim()
+          : undefined;
+
+      const currentSettings = await getSystemSettings();
+      const effectiveMsg =
+        trimmedMsg !== undefined
+          ? trimmedMsg
+          : currentSettings.announcementMessage.trim();
+
+      if (enabled && !effectiveMsg) {
+        return NextResponse.json(
+          {
+            error: "ANNOUNCEMENT_EMPTY",
+            message:
+              "Saisissez un message d'annonce avant de publier la bannière.",
+          },
+          { status: 400 }
+        );
+      }
+
+      const updated = await updateSystemSettings({
+        announcementEnabled: enabled,
+        ...(validType ? { announcementType: validType } : {}),
+        ...(trimmedMsg !== undefined
+          ? { announcementMessage: trimmedMsg }
+          : {}),
+      });
+
+      const typeLabel =
+        updated.announcementType === "IMPORTANT"
+          ? "Important (Rouge)"
+          : updated.announcementType === "PREVENTION"
+          ? "Prévention (Orange)"
+          : "Information (Bleu)";
+
+      const notice = enabled
+        ? `Annonce [${typeLabel}] publiée en bannière sur tout le site.`
+        : "Bannière d'annonce globale désactivée sur le site.";
+
+      return NextResponse.json(await buildAdminQueueResponse(notice));
+    }
+
+    if (action === "UPDATE_INVITE_CODE") {
+      const enabled = Boolean(body.enabled);
+      const normalizedCode =
+        typeof body.inviteCode === "string"
+          ? normalizeInviteCode(body.inviteCode)
+          : undefined;
+
+      const currentSettings = await getSystemSettings();
+      const effectiveCode =
+        normalizedCode !== undefined
+          ? normalizedCode
+          : currentSettings.inviteCode;
+
+      if (enabled && !effectiveCode) {
+        return NextResponse.json(
+          {
+            error:
+              "Veuillez saisir ou générer un code d'accès avant de l'activer.",
+          },
+          { status: 400 }
+        );
+      }
+
+      const updated = await updateSystemSettings({
+        inviteCodeEnabled: enabled,
+        ...(normalizedCode !== undefined ? { inviteCode: normalizedCode } : {}),
+      });
+
+      const notice = updated.inviteCodeEnabled
+        ? `Code d'accès direct activé (${updated.inviteCode}) — les nouveaux inscrits avec ce code sont validés immédiatement.`
+        : "Code d'accès direct désactivé — validation manuelle requise pour les nouvelles inscriptions.";
 
       return NextResponse.json(await buildAdminQueueResponse(notice));
     }

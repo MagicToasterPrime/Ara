@@ -44,6 +44,8 @@ interface SpixContextValue {
   setPageContext: (ctx: SpixPageContext) => void;
   isOpen: boolean;
   setIsOpen: (open: boolean | ((prev: boolean) => boolean)) => void;
+  userAiAndSpixEnabled: boolean;
+  setUserAiAndSpixEnabled: (enabled: boolean) => void;
   registerDocNavigator: (fn: DocNavigator | null) => void;
   navigateToDocPage: (
     documentId: string,
@@ -66,6 +68,7 @@ export function SpixProvider({ children }: { children: ReactNode }) {
     mode: "GLOBAL",
   });
   const [isOpen, setIsOpen] = useState(false);
+  const [userAiAndSpixEnabled, setUserAiAndSpixEnabled] = useState(true);
   const [pendingImagePrompt, setPendingImagePrompt] =
     useState<SpixPendingImagePrompt | null>(null);
   const navigatorRef = useRef<DocNavigator | null>(null);
@@ -116,6 +119,8 @@ export function SpixProvider({ children }: { children: ReactNode }) {
         setPageContext,
         isOpen,
         setIsOpen,
+        userAiAndSpixEnabled,
+        setUserAiAndSpixEnabled,
         registerDocNavigator,
         navigateToDocPage,
         pendingImagePrompt,

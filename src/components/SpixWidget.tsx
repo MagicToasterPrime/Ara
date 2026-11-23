@@ -53,6 +53,8 @@ export function SpixWidget() {
     pageContext,
     isOpen,
     setIsOpen,
+    userAiAndSpixEnabled,
+    setUserAiAndSpixEnabled,
     navigateToDocPage,
     pendingImagePrompt,
     clearPendingImagePrompt,
@@ -88,11 +90,20 @@ export function SpixWidget() {
             host: string;
             configuredModel: string;
           };
+          settings?: {
+            userAiAndSpixEnabled?: boolean;
+          };
         };
         if (active && data.ollama) {
           setOllamaOnline(data.ollama.online);
           setOllamaHost(data.ollama.host.replace(/^https?:\/\//, ""));
           setOllamaModel(data.ollama.configuredModel);
+        }
+        if (
+          active &&
+          typeof data.settings?.userAiAndSpixEnabled === "boolean"
+        ) {
+          setUserAiAndSpixEnabled(data.settings.userAiAndSpixEnabled);
         }
       } catch {
         if (active) setOllamaOnline(false);
@@ -163,6 +174,12 @@ export function SpixWidget() {
     customPrompt?: string
   ) {
     if (isStreaming) return;
+    if (!userAiAndSpixEnabled) {
+      setErrorBanner(
+        "La génération IA et l'assistant Spix sont temporairement désactivés par l'administration."
+      );
+      return;
+    }
     setErrorBanner(null);
 
     const scopeLabel =
@@ -176,10 +193,10 @@ export function SpixWidget() {
       kind === "SVG_DIAGRAM"
         ? "Générer un schéma vectoriel .svg"
         : kind === "FLASHCARDS"
-        ? "Générer un paquet de flashcards"
+        ? "Générer un paquet de flashcards complètes"
         : kind === "QUIZ"
-        ? "Générer un quiz ciblé"
-        : "Générer une fiche synthèse";
+        ? "Générer un quiz complet"
+        : "Générer une fiche de révision complète";
 
     const userText = customPrompt?.trim() || kindActionName;
     const assistantId = `a-${Date.now()}`;
@@ -239,9 +256,13 @@ export function SpixWidget() {
       const data = (await res.json().catch(() => ({}))) as {
         artifact?: { title: string; contentJson: string };
         error?: string;
+        code?: string;
       };
 
       if (!res.ok || !data.artifact) {
+        if (res.status === 403 || data.code === "USER_AI_DISABLED") {
+          setUserAiAndSpixEnabled(false);
+        }
         const msg =
           data.error || "Impossible de générer cette ressource Studio.";
         setMessages((prev) =>
@@ -287,6 +308,12 @@ export function SpixWidget() {
   ) {
     const trimmed = promptText.trim();
     if (!trimmed || isStreaming) return;
+    if (!userAiAndSpixEnabled) {
+      setErrorBanner(
+        "L'assistant Spix et la génération IA sont temporairement désactivés par l'administration."
+      );
+      return;
+    }
 
     const lower = trimmed.toLowerCase();
     if (
@@ -383,6 +410,8 @@ export function SpixWidget() {
         };
         if (errData.error === "OLLAMA_OFFLINE") {
           setOllamaOnline(false);
+        } else if (res.status === 403 || errData.error === "SPIX_DISABLED") {
+          setUserAiAndSpixEnabled(false);
         }
         const msg =
           errData.message || `Serveur Ollama hors-ligne (${ollamaHost})`;
@@ -589,8 +618,23 @@ export function SpixWidget() {
             )}
           </div>
 
+          {/* Admin Disabled Banner */}
+          {!userAiAndSpixEnabled && (
+            <div className="flex items-start gap-2 border-b border-carmine/40 bg-carmine/10 px-4 py-2.5 text-xs text-ink">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-carmine" />
+              <p className="font-mono text-[10px] leading-relaxed text-ink">
+                <strong className="uppercase text-carmine">
+                  SPIX &amp; LA GÉNÉRATION IA À LA DEMANDE SONT TEMPORAIREMENT
+                  DÉSACTIVÉS PAR L&apos;ADMINISTRATION
+                </strong>{" "}
+                — Les fiches, flashcards et quiz déjà générés restent
+                intégralement consultables dans vos UE.
+              </p>
+            </div>
+          )}
+
           {/* Offline Banner */}
-          {ollamaOnline === false && (
+          {userAiAndSpixEnabled && ollamaOnline === false && (
             <div className="flex items-center gap-2 border-b border-border bg-paper px-4 py-2 text-xs text-ink">
               <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-amber" />
               <span className="font-mono text-[10px] uppercase tracking-wider">
@@ -640,7 +684,7 @@ export function SpixWidget() {
                       key={s}
                       type="button"
                       onClick={() => sendQuestion(s)}
-                      disabled={isStreaming}
+                      disabled={isStreaming || !userAiAndSpixEnabled}
                       className="block w-full border border-border bg-paper px-3 py-2 text-left font-mono text-[11px] text-ink transition-colors hover:border-ink hover:bg-pinned disabled:opacity-50"
                     >
                       → {s}
@@ -729,7 +773,7 @@ export function SpixWidget() {
             <div className="mb-2 flex flex-wrap gap-1">
               <button
                 type="button"
-                disabled={isStreaming}
+                disabled={isStreaming || !userAiAndSpixEnabled}
                 onClick={() => triggerStudio("SVG_DIAGRAM", question)}
                 className="inline-flex items-center gap-1 border border-border bg-card px-2 py-1 font-mono text-[9px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
               >
@@ -738,7 +782,7 @@ export function SpixWidget() {
               </button>
               <button
                 type="button"
-                disabled={isStreaming}
+                disabled={isStreaming || !userAiAndSpixEnabled}
                 onClick={() => triggerStudio("FLASHCARDS", question)}
                 className="inline-flex items-center gap-1 border border-border bg-card px-2 py-1 font-mono text-[9px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
               >
@@ -747,7 +791,7 @@ export function SpixWidget() {
               </button>
               <button
                 type="button"
-                disabled={isStreaming}
+                disabled={isStreaming || !userAiAndSpixEnabled}
                 onClick={() => triggerStudio("QUIZ", question)}
                 className="inline-flex items-center gap-1 border border-border bg-card px-2 py-1 font-mono text-[9px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
               >
@@ -756,7 +800,7 @@ export function SpixWidget() {
               </button>
               <button
                 type="button"
-                disabled={isStreaming}
+                disabled={isStreaming || !userAiAndSpixEnabled}
                 onClick={() => triggerStudio("SUMMARY", question)}
                 className="inline-flex items-center gap-1 border border-border bg-card px-2 py-1 font-mono text-[9px] uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
               >
@@ -770,18 +814,22 @@ export function SpixWidget() {
                 value={question}
                 onChange={(e) => setQuestion(e.target.value)}
                 placeholder={
-                  effectiveScope === "DOCUMENT"
+                  !userAiAndSpixEnabled
+                    ? "Spix temporairement mis en pause par l'administration"
+                    : effectiveScope === "DOCUMENT"
                     ? `Question sur ce cours (p.${pageContext.currentPage || 1})...`
                     : effectiveScope === "UE"
                     ? `Question sur ${pageContext.ueCode || "cette UE"}...`
                     : "Poser une question à Spix..."
                 }
-                disabled={isStreaming}
+                disabled={isStreaming || !userAiAndSpixEnabled}
                 className="flex-1 border border-border bg-card px-3 py-2 text-xs text-ink placeholder:text-stone focus:border-ink focus:outline-none disabled:opacity-60"
               />
               <button
                 type="submit"
-                disabled={isStreaming || !question.trim()}
+                disabled={
+                  isStreaming || !userAiAndSpixEnabled || !question.trim()
+                }
                 className="inline-flex items-center justify-center border border-ink bg-ink px-3 py-2 font-mono text-xs uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
               >
                 {isStreaming ? (
@@ -801,18 +849,29 @@ export function SpixWidget() {
         onClick={() => setIsOpen((prev) => !prev)}
         aria-label="Ouvrir l'assistant Spix"
         title={
-          pageContext.mode === "DOCUMENT"
+          !userAiAndSpixEnabled
+            ? "Spix (temporairement désactivé par l'administration)"
+            : pageContext.mode === "DOCUMENT"
             ? `Spix (Cours : ${pageContext.documentTitle || "PDF"} · p.${pageContext.currentPage || 1})`
             : pageContext.mode === "UE"
             ? `Spix (UE : ${pageContext.ueCode || ""})`
             : "Spix (Assistant IA)"
         }
-        className="fixed bottom-5 right-5 z-50 flex h-14 w-14 items-center justify-center border border-ink bg-ink text-card transition-colors hover:bg-ink/90 sm:bottom-6 sm:right-6"
-        style={{ borderTop: `3px solid ${accentColor}` }}
+        className="fixed bottom-5 right-5 z-50 flex h-14 w-14 flex-col items-center justify-center border border-ink bg-ink text-card transition-colors hover:bg-ink/90 sm:bottom-6 sm:right-6"
+        style={{
+          borderTop: `3px solid ${
+            !userAiAndSpixEnabled ? "#C83E4D" : accentColor
+          }`,
+        }}
       >
         <span className="font-mono text-xs font-bold uppercase tracking-wider">
           SPIX
         </span>
+        {!userAiAndSpixEnabled && (
+          <span className="mt-0.5 bg-carmine px-1 font-mono text-[7px] font-bold uppercase tracking-wider text-card">
+            PAUSE
+          </span>
+        )}
       </button>
     </>
   );

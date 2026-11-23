@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import bcrypt from "bcryptjs";
 import { prisma } from "@/lib/prisma";
+import { getSystemSettings, normalizeInviteCode } from "@/lib/system-settings";
 import {
   ensureUserAccountSchema,
   isValidClassLevel,
@@ -10,15 +11,21 @@ import {
 export async function GET() {
   try {
     await ensureUserAccountSchema();
-    const userCount = await prisma.user.count();
+    const [userCount, settings] = await Promise.all([
+      prisma.user.count(),
+      getSystemSettings(),
+    ]);
     return NextResponse.json({
       hasUsers: userCount > 0,
       userCount,
+      inviteCodeEnabled: Boolean(
+        settings.inviteCodeEnabled && settings.inviteCode.trim().length > 0
+      ),
     });
   } catch (error) {
     console.error("[Register GET] Error:", error);
     return NextResponse.json(
-      { hasUsers: false, userCount: 0 },
+      { hasUsers: false, userCount: 0, inviteCodeEnabled: false },
       { status: 200 }
     );
   }
@@ -33,11 +40,13 @@ export async function POST(req: Request) {
       email?: string;
       password?: string;
       classLevel?: string;
+      inviteCode?: string;
     };
 
     const name = body.name?.trim() || "";
     const email = body.email?.trim().toLowerCase() || "";
     const password = body.password || "";
+    const providedInviteCode = normalizeInviteCode(body.inviteCode);
 
     if (!name || !email || password.length < 6) {
       return NextResponse.json(
@@ -61,6 +70,26 @@ export async function POST(req: Request) {
 
     const classLevel = normalizeClassLevel(body.classLevel);
 
+    let hasValidInviteCode = false;
+    if (providedInviteCode.length > 0) {
+      const settings = await getSystemSettings();
+      const expectedCode = normalizeInviteCode(settings.inviteCode);
+      if (
+        !settings.inviteCodeEnabled ||
+        !expectedCode ||
+        providedInviteCode !== expectedCode
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              "Code d'accès invalide ou inactif. Vérifiez le code saisi ou laissez ce champ vide pour demander une validation manuelle par l'administrateur.",
+          },
+          { status: 400 }
+        );
+      }
+      hasValidInviteCode = true;
+    }
+
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) {
       return NextResponse.json(
@@ -75,7 +104,7 @@ export async function POST(req: Request) {
       const existingCount = await tx.user.count();
       const isFirstUser = existingCount === 0;
       const globalRole = isFirstUser ? "YEAR_ADMIN" : "STUDENT";
-      const approved = isFirstUser;
+      const approved = isFirstUser || hasValidInviteCode;
 
       const created = await tx.user.create({
         data: {

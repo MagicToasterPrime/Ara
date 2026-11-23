@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useSession } from "next-auth/react";
 import {
+  AlertTriangle,
   BookOpen,
   FileCode2,
   FileText,
@@ -15,6 +16,7 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
+import { useSpix } from "@/components/SpixContext";
 import { StudioArtifactViewer } from "@/components/StudioArtifactViewer";
 import { renderPdfPageToDataUrl } from "@/lib/pdf-client";
 import type {
@@ -77,11 +79,14 @@ export function NotebookStudioPanel({
   onOpenSource,
 }: NotebookStudioPanelProps) {
   const { data: session } = useSession();
+  const { userAiAndSpixEnabled: globalAiEnabled, setUserAiAndSpixEnabled } =
+    useSpix();
   const [selectedDocIds, setSelectedDocIds] = useState<string[]>(() =>
     documents.map((d) => d.id)
   );
   const [prompt, setPrompt] = useState("");
-  const [wantPublic, setWantPublic] = useState(false);
+  const [wantPublic, setWantPublic] = useState(true);
+  const [userAiEnabled, setUserAiEnabled] = useState(true);
   const [generatingKind, setGeneratingKind] =
     useState<StudioArtifactKind | null>(null);
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
@@ -119,10 +124,15 @@ export function NotebookStudioPanel({
       const data = (await res.json()) as {
         artifacts?: StudioArtifactRow[];
         publicCoverage?: Array<{ documentId: string; kind: string }>;
+        userAiAndSpixEnabled?: boolean;
       };
       const list = data.artifacts || [];
       setArtifacts(list);
       setPublicCoverage(data.publicCoverage || []);
+      if (typeof data.userAiAndSpixEnabled === "boolean") {
+        setUserAiEnabled(data.userAiAndSpixEnabled);
+        setUserAiAndSpixEnabled(data.userAiAndSpixEnabled);
+      }
       setActiveArtifact((prev) => {
         if (focusDocumentId) {
           const match = list.find((a) => a.documentId === focusDocumentId);
@@ -170,8 +180,10 @@ export function NotebookStudioPanel({
     return selectedDocIds.some((docId) => !hasPublicKindForDoc(docId, kind));
   }
 
+  const canGenerateAi = userAiEnabled && globalAiEnabled;
+
   async function handleGenerate(kind: StudioArtifactKind) {
-    if (generatingKind) return;
+    if (generatingKind || !canGenerateAi) return;
     setGeneratingKind(kind);
     setError(null);
     setAutoPublishNotice(null);
@@ -210,8 +222,13 @@ export function NotebookStudioPanel({
         autoPublishedFirst?: boolean;
         usedAi?: boolean;
         error?: string;
+        code?: string;
       };
       if (!res.ok || !data.artifact) {
+        if (res.status === 403 || data.code === "USER_AI_DISABLED") {
+          setUserAiEnabled(false);
+          setUserAiAndSpixEnabled(false);
+        }
         setError(data.error || "Erreur lors de la génération.");
         return;
       }
@@ -252,7 +269,7 @@ export function NotebookStudioPanel({
   }
 
   async function handleRegenerate(art: StudioArtifactRow) {
-    if (generatingKind || regeneratingId) return;
+    if (generatingKind || regeneratingId || !canGenerateAi) return;
     setRegeneratingId(art.id);
     setError(null);
     setAutoPublishNotice(null);
@@ -275,8 +292,13 @@ export function NotebookStudioPanel({
         artifact?: StudioArtifactRow;
         usedAi?: boolean;
         error?: string;
+        code?: string;
       };
       if (!res.ok || !data.artifact) {
+        if (res.status === 403 || data.code === "USER_AI_DISABLED") {
+          setUserAiEnabled(false);
+          setUserAiAndSpixEnabled(false);
+        }
         setError(data.error || "Erreur lors de la régénération.");
         return;
       }
@@ -450,10 +472,16 @@ export function NotebookStudioPanel({
                       <div className="mt-2 flex flex-wrap items-center gap-1.5">
                         <button
                           type="button"
-                          disabled={Boolean(generatingKind || regeneratingId)}
+                          disabled={
+                            !canGenerateAi || Boolean(generatingKind || regeneratingId)
+                          }
                           onClick={() => handleRegenerate(art)}
                           className="inline-flex items-center gap-1 border border-border bg-paper px-2 py-0.5 font-mono text-[9px] uppercase text-ink hover:border-ink disabled:opacity-50"
-                          title="Régénérer avec le nouveau moteur IA"
+                          title={
+                            canGenerateAi
+                              ? "Régénérer avec le nouveau moteur IA"
+                              : "Génération IA désactivée par l'administration"
+                          }
                         >
                           <RefreshCw
                             className={`h-2.5 w-2.5 ${
@@ -510,7 +538,7 @@ export function NotebookStudioPanel({
             <div className="flex items-center gap-2">
               <Sparkles className="h-4 w-4 text-ink" />
               <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
-                STUDIO IA · GÉNÉRATION ORIENTÉE COMPRÉHENSION
+                STUDIO IA · MODE COURS COMPLET PERMANENT
               </span>
             </div>
             <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
@@ -519,6 +547,20 @@ export function NotebookStudioPanel({
               {selectedDocIds.length > 1 ? "S" : ""}
             </span>
           </div>
+
+          {!canGenerateAi && (
+            <div className="mb-3 flex items-start gap-2.5 border border-carmine/40 bg-carmine/10 px-3.5 py-2.5 font-mono text-[11px] leading-relaxed text-ink">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-carmine" />
+              <span>
+                <strong className="uppercase text-carmine">
+                  GÉNÉRATION IA PAR LES UTILISATEURS TEMPORAIREMENT DÉSACTIVÉE
+                  PAR L&apos;ADMINISTRATION
+                </strong>{" "}
+                — Toutes les fiches, flashcards et quiz enregistrés restent
+                consultables ci-dessous.
+              </span>
+            </div>
+          )}
 
           {error && (
             <div className="mb-3 border border-carmine/40 bg-carmine/10 px-3 py-2 font-mono text-xs text-carmine">
@@ -577,25 +619,30 @@ export function NotebookStudioPanel({
               <span>PARTAGER AVEC LA PROMO ({ueCode})</span>
             </label>
             <span className="font-mono text-[10px] text-stone">
-              <strong className="text-ink">PUBLIC</strong> = 95% du cours (30 Q
-              / 60 cartes / fiche complète) ·{" "}
-              <strong className="text-ink">PRIVÉ</strong> = 5% ultra-ciblé.
+              <strong className="text-ink">
+                MODE COURS COMPLET TOUJOURS ACTIF
+              </strong>{" "}
+              : analyse l&apos;intégralité du polycopié (PUBLIC = partagé à
+              l&apos;UE · PRIVÉ = visible par vous seul).
             </span>
           </div>
 
-          {generatingKind &&
-            (wantPublic || selectionMissingPublicKind(generatingKind)) && (
-              <div className="mb-3 border border-amber/60 bg-pinned px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-ink">
-                LECTURE DE TOUT LE POLYCOPIÉ PAR TRANCHES DE PAGES : SUR UN GROS
-                POLY CELA PEUT DURER PLUSIEURS DIZAINES DE MINUTES (TRAITEMENT
-                CÔTÉ SERVEUR, 100% LOCAL)...
-              </div>
-            )}
+          {generatingKind && (
+            <div className="mb-3 border border-amber/60 bg-pinned px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-ink">
+              LECTURE DE TOUT LE POLYCOPIÉ PAR TRANCHES DE PAGES : SUR UN GROS
+              POLY CELA PEUT DURER PLUSIEURS DIZAINES DE MINUTES (TRAITEMENT
+              CÔTÉ SERVEUR, 100% LOCAL)...
+            </div>
+          )}
 
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
             <button
               type="button"
-              disabled={Boolean(generatingKind) || selectedDocIds.length === 0}
+              disabled={
+                !canGenerateAi ||
+                Boolean(generatingKind) ||
+                selectedDocIds.length === 0
+              }
               onClick={() => handleGenerate("QUIZ")}
               className="flex flex-col items-center justify-center gap-1 border border-ink bg-ink px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
             >
@@ -605,24 +652,24 @@ export function NotebookStudioPanel({
                 ) : (
                   <ListChecks className="h-3.5 w-3.5" />
                 )}
-                <span>
-                  {wantPublic || selectionMissingPublicKind("QUIZ")
-                    ? "QUIZ COMPLET (30 Q)"
-                    : "QUIZ CIBLÉ (6 Q)"}
-                </span>
+                <span>QUIZ COMPLET</span>
               </span>
               <span className="text-[8px] opacity-80">
                 {selectionMissingPublicKind("QUIZ")
-                  ? "AUTO-PUBLIC"
+                  ? "AUTO-PUBLIC · COURS COMPLET"
                   : wantPublic
-                  ? "PUBLIC"
-                  : "PRIVÉ 5%"}
+                  ? "PUBLIC · COURS COMPLET"
+                  : "PRIVÉ · COURS COMPLET"}
               </span>
             </button>
 
             <button
               type="button"
-              disabled={Boolean(generatingKind) || selectedDocIds.length === 0}
+              disabled={
+                !canGenerateAi ||
+                Boolean(generatingKind) ||
+                selectedDocIds.length === 0
+              }
               onClick={() => handleGenerate("FLASHCARDS")}
               className="flex flex-col items-center justify-center gap-1 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
             >
@@ -632,11 +679,7 @@ export function NotebookStudioPanel({
                 ) : (
                   <Layers className="h-3.5 w-3.5" />
                 )}
-                <span>
-                  {wantPublic || selectionMissingPublicKind("FLASHCARDS")
-                    ? "60 FLASHCARDS"
-                    : "10 FLASHCARDS"}
-                </span>
+                <span>FLASHCARDS COMPLÈTES</span>
               </span>
               <span
                 className={`text-[8px] ${
@@ -646,16 +689,20 @@ export function NotebookStudioPanel({
                 }`}
               >
                 {selectionMissingPublicKind("FLASHCARDS")
-                  ? "AUTO-PUBLIC"
+                  ? "AUTO-PUBLIC · COURS COMPLET"
                   : wantPublic
-                  ? "PUBLIC"
-                  : "PRIVÉ 5%"}
+                  ? "PUBLIC · COURS COMPLET"
+                  : "PRIVÉ · COURS COMPLET"}
               </span>
             </button>
 
             <button
               type="button"
-              disabled={Boolean(generatingKind) || selectedDocIds.length === 0}
+              disabled={
+                !canGenerateAi ||
+                Boolean(generatingKind) ||
+                selectedDocIds.length === 0
+              }
               onClick={() => handleGenerate("SUMMARY")}
               className="flex flex-col items-center justify-center gap-1 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
             >
@@ -665,11 +712,7 @@ export function NotebookStudioPanel({
                 ) : (
                   <BookOpen className="h-3.5 w-3.5" />
                 )}
-                <span>
-                  {wantPublic || selectionMissingPublicKind("SUMMARY")
-                    ? "FICHE COURS (95%)"
-                    : "FICHE CIBLÉE (5%)"}
-                </span>
+                <span>FICHE COURS COMPLÈTE</span>
               </span>
               <span
                 className={`text-[8px] ${
@@ -679,16 +722,20 @@ export function NotebookStudioPanel({
                 }`}
               >
                 {selectionMissingPublicKind("SUMMARY")
-                  ? "AUTO-PUBLIC"
+                  ? "AUTO-PUBLIC · COURS COMPLET"
                   : wantPublic
-                  ? "PUBLIC"
-                  : "PRIVÉ 5%"}
+                  ? "PUBLIC · COURS COMPLET"
+                  : "PRIVÉ · COURS COMPLET"}
               </span>
             </button>
 
             <button
               type="button"
-              disabled={Boolean(generatingKind) || selectedDocIds.length === 0}
+              disabled={
+                !canGenerateAi ||
+                Boolean(generatingKind) ||
+                selectedDocIds.length === 0
+              }
               onClick={() => handleGenerate("SVG_DIAGRAM")}
               className="flex flex-col items-center justify-center gap-1 border border-border bg-paper px-3 py-2.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink hover:bg-pinned disabled:opacity-50"
             >
@@ -708,10 +755,10 @@ export function NotebookStudioPanel({
                 }`}
               >
                 {selectionMissingPublicKind("SVG_DIAGRAM")
-                  ? "AUTO-PUBLIC"
+                  ? "AUTO-PUBLIC · COURS COMPLET"
                   : wantPublic
-                  ? "PUBLIC"
-                  : "PRIVÉ"}
+                  ? "PUBLIC · COURS COMPLET"
+                  : "PRIVÉ · COURS COMPLET"}
               </span>
             </button>
           </div>
@@ -731,7 +778,9 @@ export function NotebookStudioPanel({
                 </span>
                 <button
                   type="button"
-                  disabled={Boolean(generatingKind || regeneratingId)}
+                  disabled={
+                    !canGenerateAi || Boolean(generatingKind || regeneratingId)
+                  }
                   onClick={() => handleRegenerate(activeArtifact)}
                   className="inline-flex items-center gap-1.5 border border-ink bg-card px-2.5 py-1 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:bg-pinned disabled:opacity-50"
                 >

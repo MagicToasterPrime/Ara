@@ -16,14 +16,21 @@ import {
 } from "lucide-react";
 import { GlobalSearchModal } from "@/components/GlobalSearchModal";
 import { OnboardingModal } from "@/components/OnboardingModal";
+import { useSpix } from "@/components/SpixContext";
 import { SpixWidget } from "@/components/SpixWidget";
+import { ANNOUNCEMENT_VARIANTS } from "@/lib/announcement-ui";
+import type { SystemSettings } from "@/lib/system-settings";
 
 export function AppShell({ children }: { children: ReactNode }) {
   const { data: session, status } = useSession();
   const pathname = usePathname();
   const router = useRouter();
+  const { setUserAiAndSpixEnabled } = useSpix();
   const [searchOpen, setSearchOpen] = useState(false);
   const [onboardingOpen, setOnboardingOpen] = useState(false);
+  const [systemSettings, setSystemSettings] = useState<SystemSettings | null>(
+    null
+  );
 
   useEffect(() => {
     if (status === "unauthenticated") {
@@ -35,16 +42,43 @@ export function AppShell({ children }: { children: ReactNode }) {
     if (status !== "authenticated") return;
     let active = true;
     fetch("/api/system/health", { cache: "no-store" })
-      .then((res) => {
-        if (active && res.status === 401) {
+      .then(async (res) => {
+        if (!active) return;
+        if (res.status === 401) {
           void signOut({ callbackUrl: "/login" });
+          return;
+        }
+        if (res.ok) {
+          const data = (await res.json().catch(() => null)) as {
+            settings?: SystemSettings;
+          } | null;
+          if (active && data?.settings) {
+            setSystemSettings(data.settings);
+            setUserAiAndSpixEnabled(data.settings.userAiAndSpixEnabled);
+          }
         }
       })
       .catch(() => {});
     return () => {
       active = false;
     };
-  }, [status, pathname]);
+  }, [status, pathname, setUserAiAndSpixEnabled]);
+
+  useEffect(() => {
+    function handleSettingsEvent(e: Event) {
+      const custom = e as CustomEvent<SystemSettings>;
+      if (custom.detail) {
+        setSystemSettings(custom.detail);
+        setUserAiAndSpixEnabled(custom.detail.userAiAndSpixEnabled);
+      }
+    }
+    window.addEventListener("ara-system-settings-updated", handleSettingsEvent);
+    return () =>
+      window.removeEventListener(
+        "ara-system-settings-updated",
+        handleSettingsEvent
+      );
+  }, [setUserAiAndSpixEnabled]);
 
   useEffect(() => {
     function handleShortcut(e: KeyboardEvent) {
@@ -238,6 +272,35 @@ export function AppShell({ children }: { children: ReactNode }) {
           </div>
         </nav>
       </header>
+
+      {/* Global Site Announcement Banner */}
+      {systemSettings?.announcementEnabled &&
+        systemSettings.announcementMessage.trim().length > 0 &&
+        (() => {
+          const variant =
+            ANNOUNCEMENT_VARIANTS[systemSettings.announcementType] ||
+            ANNOUNCEMENT_VARIANTS.INFO;
+          const BannerIcon = variant.Icon;
+          return (
+            <div className="mx-auto w-full max-w-[1440px] px-4 pt-4 sm:px-6">
+              <div
+                role="status"
+                className={`ara-animate-in flex flex-wrap items-center gap-3 border px-4 py-3 ${variant.containerClass}`}
+                style={{ borderLeft: `4px solid ${variant.hex}` }}
+              >
+                <span
+                  className={`inline-flex shrink-0 items-center gap-1.5 px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${variant.badgeClass}`}
+                >
+                  <BannerIcon className="h-3 w-3" />
+                  <span>{variant.badge}</span>
+                </span>
+                <p className="min-w-0 flex-1 whitespace-pre-wrap text-xs font-medium leading-relaxed text-ink">
+                  {systemSettings.announcementMessage}
+                </p>
+              </div>
+            </div>
+          );
+        })()}
 
       {/* Main Content */}
       <main className="mx-auto w-full max-w-[1440px] flex-1 px-4 py-6 sm:px-6">

@@ -8,6 +8,7 @@ import {
   type RevisionAnswerValue,
   type RevisionQuestion,
 } from "@/lib/revisions";
+import { getSystemSettings } from "@/lib/system-settings";
 
 interface ChapterBreakdownItem {
   chapterTitle: string;
@@ -150,10 +151,12 @@ export async function POST(req: Request) {
         Math.min(90, Number(body.durationMinutes || 20))
       );
 
+      const settings = await getSystemSettings();
       const questions = await generateQuizQuestions({
         userId: user.id,
         ueId,
         count,
+        skipAi: !settings.userAiAndSpixEnabled,
       });
 
       if (questions.length === 0) {

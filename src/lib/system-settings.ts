@@ -1,19 +1,50 @@
 import { prisma } from "@/lib/prisma";
 
+export type SiteAnnouncementType = "IMPORTANT" | "INFO" | "PREVENTION";
+
 export interface SystemSettings {
   continuousGeneration24h: boolean;
   dailyQuizEnabled: boolean;
+  userAiAndSpixEnabled: boolean;
+  announcementEnabled: boolean;
+  announcementType: SiteAnnouncementType;
+  announcementMessage: string;
+  inviteCodeEnabled: boolean;
+  inviteCode: string;
 }
 
 export const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   continuousGeneration24h: false,
   dailyQuizEnabled: true,
+  userAiAndSpixEnabled: true,
+  announcementEnabled: false,
+  announcementType: "INFO",
+  announcementMessage: "",
+  inviteCodeEnabled: false,
+  inviteCode: "",
 };
 
 const SETTING_KEYS = {
   continuousGeneration24h: "continuousGeneration24h",
   dailyQuizEnabled: "dailyQuizEnabled",
+  userAiAndSpixEnabled: "userAiAndSpixEnabled",
+  announcementEnabled: "announcementEnabled",
+  announcementType: "announcementType",
+  announcementMessage: "announcementMessage",
+  inviteCodeEnabled: "INVITE_CODE_ENABLED",
+  inviteCode: "INVITE_CODE",
 } as const;
+
+export function normalizeInviteCode(raw: string | undefined): string {
+  return typeof raw === "string" ? raw.trim().toUpperCase().slice(0, 64) : "";
+}
+
+function parseAnnouncementType(raw: string | undefined): SiteAnnouncementType {
+  if (raw === "IMPORTANT" || raw === "INFO" || raw === "PREVENTION") {
+    return raw;
+  }
+  return DEFAULT_SYSTEM_SETTINGS.announcementType;
+}
 
 const globalForSettings = globalThis as typeof globalThis & {
   __araSystemSettingsSchemaEnsured?: boolean;
@@ -70,7 +101,16 @@ export async function getSystemSettings(): Promise<SystemSettings> {
   try {
     const rows = await prisma.$queryRaw<Array<{ key: string; value: string }>>`
       SELECT "key", "value" FROM "SystemSetting"
-      WHERE "key" IN (${SETTING_KEYS.continuousGeneration24h}, ${SETTING_KEYS.dailyQuizEnabled})
+      WHERE "key" IN (
+        ${SETTING_KEYS.continuousGeneration24h},
+        ${SETTING_KEYS.dailyQuizEnabled},
+        ${SETTING_KEYS.userAiAndSpixEnabled},
+        ${SETTING_KEYS.announcementEnabled},
+        ${SETTING_KEYS.announcementType},
+        ${SETTING_KEYS.announcementMessage},
+        ${SETTING_KEYS.inviteCodeEnabled},
+        ${SETTING_KEYS.inviteCode}
+      )
     `;
     const map = new Map<string, string>();
     for (const row of rows) {
@@ -85,6 +125,25 @@ export async function getSystemSettings(): Promise<SystemSettings> {
         map.get(SETTING_KEYS.dailyQuizEnabled),
         DEFAULT_SYSTEM_SETTINGS.dailyQuizEnabled
       ),
+      userAiAndSpixEnabled: parseBool(
+        map.get(SETTING_KEYS.userAiAndSpixEnabled),
+        DEFAULT_SYSTEM_SETTINGS.userAiAndSpixEnabled
+      ),
+      announcementEnabled: parseBool(
+        map.get(SETTING_KEYS.announcementEnabled),
+        DEFAULT_SYSTEM_SETTINGS.announcementEnabled
+      ),
+      announcementType: parseAnnouncementType(
+        map.get(SETTING_KEYS.announcementType)
+      ),
+      announcementMessage:
+        map.get(SETTING_KEYS.announcementMessage) ??
+        DEFAULT_SYSTEM_SETTINGS.announcementMessage,
+      inviteCodeEnabled: parseBool(
+        map.get(SETTING_KEYS.inviteCodeEnabled),
+        DEFAULT_SYSTEM_SETTINGS.inviteCodeEnabled
+      ),
+      inviteCode: normalizeInviteCode(map.get(SETTING_KEYS.inviteCode)),
     };
     globalForSettings.__araSystemSettingsCache = settings;
     return settings;
@@ -110,6 +169,40 @@ export async function updateSystemSettings(
     entries.push([
       SETTING_KEYS.dailyQuizEnabled,
       patch.dailyQuizEnabled ? "true" : "false",
+    ]);
+  }
+  if (typeof patch.userAiAndSpixEnabled === "boolean") {
+    entries.push([
+      SETTING_KEYS.userAiAndSpixEnabled,
+      patch.userAiAndSpixEnabled ? "true" : "false",
+    ]);
+  }
+  if (typeof patch.announcementEnabled === "boolean") {
+    entries.push([
+      SETTING_KEYS.announcementEnabled,
+      patch.announcementEnabled ? "true" : "false",
+    ]);
+  }
+  if (
+    patch.announcementType === "IMPORTANT" ||
+    patch.announcementType === "INFO" ||
+    patch.announcementType === "PREVENTION"
+  ) {
+    entries.push([SETTING_KEYS.announcementType, patch.announcementType]);
+  }
+  if (typeof patch.announcementMessage === "string") {
+    entries.push([SETTING_KEYS.announcementMessage, patch.announcementMessage]);
+  }
+  if (typeof patch.inviteCodeEnabled === "boolean") {
+    entries.push([
+      SETTING_KEYS.inviteCodeEnabled,
+      patch.inviteCodeEnabled ? "true" : "false",
+    ]);
+  }
+  if (typeof patch.inviteCode === "string") {
+    entries.push([
+      SETTING_KEYS.inviteCode,
+      normalizeInviteCode(patch.inviteCode),
     ]);
   }
 

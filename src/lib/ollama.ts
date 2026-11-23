@@ -7,6 +7,7 @@ import { setDocumentProcessingStatus } from "@/lib/document-status";
 import {
   hasUsableExtractedText,
   hasUsableText,
+  normalizePdfExtractedText,
   type ExtractedPdfPage,
 } from "@/lib/pdf";
 
@@ -611,10 +612,10 @@ export async function generateEmbedding(text: string): Promise<number[] | null> 
 
 export function chunkPageText(
   text: string,
-  chunkSize = 800,
+  chunkSize = 900,
   overlap = 100
 ): string[] {
-  const cleaned = text.replace(/\s+/g, " ").trim();
+  const cleaned = normalizePdfExtractedText(text);
   if (!cleaned) return [];
   if (cleaned.length <= chunkSize) return [cleaned];
 
@@ -624,8 +625,19 @@ export function chunkPageText(
   while (start < cleaned.length) {
     let end = Math.min(start + chunkSize, cleaned.length);
     if (end < cleaned.length) {
+      const minBreak = start + Math.floor(chunkSize * 0.5);
+      const dblNl = cleaned.lastIndexOf("\n\n", end);
+      const singleNl = cleaned.lastIndexOf("\n", end);
+      const sentEnd = cleaned.lastIndexOf(". ", end);
       const lastSpace = cleaned.lastIndexOf(" ", end);
-      if (lastSpace > start + Math.floor(chunkSize * 0.5)) {
+
+      if (dblNl > minBreak) {
+        end = dblNl;
+      } else if (singleNl > minBreak) {
+        end = singleNl;
+      } else if (sentEnd > minBreak) {
+        end = sentEnd + 1;
+      } else if (lastSpace > minBreak) {
         end = lastSpace;
       }
     }
@@ -634,7 +646,13 @@ export function chunkPageText(
       chunks.push(piece);
     }
     if (end >= cleaned.length) break;
-    start = Math.max(end - overlap, start + 1);
+    const rawNextStart = Math.max(end - overlap, start + 1);
+    const alignedSpace = cleaned.indexOf(" ", rawNextStart);
+    const nextStart =
+      alignedSpace > rawNextStart && alignedSpace < end
+        ? alignedSpace + 1
+        : rawNextStart;
+    start = nextStart > start ? nextStart : start + 1;
   }
 
   return chunks;
@@ -672,7 +690,7 @@ export async function storeDocumentChunksUnindexed(
   const rawChunks: Array<{ content: string; pageNumber: number }> = [];
   for (const page of pages) {
     if (!hasUsableText(page.text, 5)) continue;
-    const pieces = chunkPageText(page.text, 800, 100);
+    const pieces = chunkPageText(page.text, 900, 100);
     for (const piece of pieces) {
       rawChunks.push({
         content: piece,
@@ -856,7 +874,7 @@ export async function indexDocumentPages(
   const rawChunks: Array<{ content: string; pageNumber: number }> = [];
   for (const page of pages) {
     if (!hasUsableText(page.text, 5)) continue;
-    const pieces = chunkPageText(page.text, 800, 100);
+    const pieces = chunkPageText(page.text, 900, 100);
     for (const piece of pieces) {
       rawChunks.push({
         content: piece,

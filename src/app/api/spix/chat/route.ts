@@ -14,6 +14,7 @@ import {
   ollamaPostStream,
   withOllamaLock,
 } from "@/lib/ollama";
+import { getSystemSettings } from "@/lib/system-settings";
 
 export const dynamic = "force-dynamic";
 
@@ -46,6 +47,18 @@ export async function POST(req: Request) {
   const user = await getCurrentUser();
   if (!user) {
     return NextResponse.json({ error: "Non authentifié" }, { status: 401 });
+  }
+
+  const settings = await getSystemSettings();
+  if (!settings.userAiAndSpixEnabled) {
+    return NextResponse.json(
+      {
+        error: "SPIX_DISABLED",
+        message:
+          "L'assistant Spix et la génération IA par les utilisateurs sont temporairement désactivés par l'administration.",
+      },
+      { status: 403 }
+    );
   }
 
   const health = await checkOllamaHealth();

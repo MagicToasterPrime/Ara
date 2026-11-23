@@ -4,13 +4,16 @@ import { getCurrentUser } from "@/lib/auth";
 import { setDocumentProcessingStatus } from "@/lib/document-status";
 import {
   ensureStudioSchema,
+  findValidPublicArtifactId,
   gatherStudioSourceChunks,
   generateStudioArtifact,
   hasExistingPublicArtifact,
   hasUsableChunksText,
+  isStalePublicArtifact,
   type PageImageInput,
   type StudioArtifactKind,
 } from "@/lib/studio";
+import { getSystemSettings } from "@/lib/system-settings";
 
 export async function GET(req: Request) {
   const user = await getCurrentUser();
@@ -24,7 +27,7 @@ export async function GET(req: Request) {
   const ueId = searchParams.get("ueId");
   const documentId = searchParams.get("documentId");
 
-  const [artifacts, publicRows] = await Promise.all([
+  const [rawArtifacts, publicRows, settings] = await Promise.all([
     prisma.studyArtifact.findMany({
       where: {
         ...(ueId ? { ueId } : {}),
@@ -48,23 +51,46 @@ export async function GET(req: Request) {
       select: {
         documentId: true,
         kind: true,
+        contentJson: true,
       },
     }),
+    getSystemSettings(),
   ]);
 
+  const artifacts = rawArtifacts.filter(
+    (a) => !(a.isPublic && isStalePublicArtifact(a.kind, a.contentJson))
+  );
+
   const publicCoverage = publicRows
-    .filter((r): r is { documentId: string; kind: string } =>
-      Boolean(r.documentId)
+    .filter(
+      (r): r is { documentId: string; kind: string; contentJson: string } =>
+        Boolean(r.documentId) && !isStalePublicArtifact(r.kind, r.contentJson)
     )
     .map((r) => ({ documentId: r.documentId, kind: r.kind }));
 
-  return NextResponse.json({ artifacts, publicCoverage });
+  return NextResponse.json({
+    artifacts,
+    publicCoverage,
+    userAiAndSpixEnabled: settings.userAiAndSpixEnabled,
+  });
 }
 
 export async function POST(req: Request) {
   const user = await getCurrentUser();
   if (!user) {
     return NextResponse.json({ error: "Non authentifié" }, { status: 401 });
+  }
+
+  const settings = await getSystemSettings();
+  if (!settings.userAiAndSpixEnabled) {
+    return NextResponse.json(
+      {
+        error:
+          "La génération de contenu IA par les utilisateurs est temporairement désactivée par l'administration. Les contenus déjà générés restent consultables.",
+        code: "USER_AI_DISABLED",
+      },
+      { status: 403 }
+    );
   }
 
   await ensureStudioSchema();
@@ -154,21 +180,12 @@ export async function POST(req: Request) {
       }
     }
 
-    const preAutoPublishedFirst = existingToReplace
-      ? false
-      : Boolean(primaryDocId && !alreadyHasPublic);
-    const preResolvedIsPublic = existingToReplace
-      ? Boolean(existingToReplace.isPublic || body.isPublic)
-      : preAutoPublishedFirst
-      ? true
-      : Boolean(body.isPublic);
-
     const chunks = await gatherStudioSourceChunks({
       ueId: effectiveUeId,
       documentIds: effectiveDocIds,
       pageNumber: body.pageNumber,
       prompt: effectivePrompt,
-      fullDocument: preResolvedIsPublic,
+      fullDocument: true,
     });
 
     if (chunks.length === 0 || !hasUsableChunksText(chunks)) {
@@ -218,9 +235,19 @@ export async function POST(req: Request) {
 
     const resolvedUeId = effectiveUeId || chunks[0]?.ueId || null;
 
-    const artifact = existingToReplace
+    let staleUpdateId: string | null = null;
+    if (!existingToReplace && resolvedIsPublic && primaryDocId) {
+      const { staleId } = await findValidPublicArtifactId(primaryDocId, kind);
+      if (staleId) {
+        staleUpdateId = staleId;
+      }
+    }
+
+    const updateTargetId = existingToReplace?.id || staleUpdateId;
+
+    const artifact = updateTargetId
       ? await prisma.studyArtifact.update({
-          where: { id: existingToReplace.id },
+          where: { id: updateTargetId },
           data: {
             title: generated.title,
             prompt: effectivePrompt?.trim() || null,

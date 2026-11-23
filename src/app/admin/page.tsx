@@ -3,18 +3,23 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSession } from "next-auth/react";
 import {
+  Check,
   CheckCircle2,
   Clock,
+  Copy,
   Database,
   Flame,
   HardDrive,
+  KeyRound,
   ListChecks,
   Loader2,
+  Megaphone,
   Pencil,
   Play,
   Plus,
   Power,
   RefreshCw,
+  Send,
   Server,
   ShieldAlert,
   Sparkles,
@@ -26,6 +31,10 @@ import {
 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import {
+  ANNOUNCEMENT_VARIANT_LIST,
+  ANNOUNCEMENT_VARIANTS,
+} from "@/lib/announcement-ui";
+import {
   CLASS_LEVELS,
   EXAM_TYPES,
   formatExamBadge,
@@ -33,6 +42,10 @@ import {
 } from "@/lib/class-levels";
 import type { SharedDailyQuizTodayStatus } from "@/lib/revisions";
 import type { BackgroundQueueSnapshot, IndexingQueueItem } from "@/lib/studio";
+import type {
+  SiteAnnouncementType,
+  SystemSettings,
+} from "@/lib/system-settings";
 
 const ACCENT_COLORS = [
   { label: "AMBRE", hex: "#D99B26" },
@@ -181,10 +194,28 @@ export default function AdminPage() {
   const [reindexMsg, setReindexMsg] = useState<string | null>(null);
   const [queueBusy, setQueueBusy] = useState(false);
   const [settingsBusy, setSettingsBusy] = useState<
-    "24H" | "DAILY_QUIZ" | "REGEN_DAILY" | null
+    | "24H"
+    | "DAILY_QUIZ"
+    | "REGEN_DAILY"
+    | "USER_AI"
+    | "ANNOUNCEMENT"
+    | "INVITE_CODE"
+    | null
   >(null);
   const [queueNotice, setQueueNotice] = useState<string | null>(null);
   const [queueError, setQueueError] = useState<string | null>(null);
+  const [announcementType, setAnnouncementType] =
+    useState<SiteAnnouncementType>("INFO");
+  const [announcementMessage, setAnnouncementMessage] = useState("");
+  const announcementInitializedRef = useRef(false);
+  const [inviteCodeDraft, setInviteCodeDraft] = useState("");
+  const [inviteCodeDirty, setInviteCodeDirty] = useState(false);
+  const inviteCodeDirtyRef = useRef(false);
+  const [inviteCodeCopied, setInviteCodeCopied] = useState(false);
+  const [inviteCodeFeedback, setInviteCodeFeedback] = useState<{
+    kind: "ok" | "err";
+    text: string;
+  } | null>(null);
 
   // UE Form
   const [editingUeId, setEditingUeId] = useState<string | null>(null);
@@ -206,6 +237,21 @@ export default function AdminPage() {
   const [roleUserId, setRoleUserId] = useState("");
   const [assigningRole, setAssigningRole] = useState(false);
 
+  const syncSettingsDrafts = useCallback(
+    (settings?: SystemSettings | null) => {
+      if (!settings) return;
+      if (!announcementInitializedRef.current) {
+        announcementInitializedRef.current = true;
+        setAnnouncementType(settings.announcementType || "INFO");
+        setAnnouncementMessage(settings.announcementMessage || "");
+      }
+      if (!inviteCodeDirtyRef.current) {
+        setInviteCodeDraft(settings.inviteCode || "");
+      }
+    },
+    []
+  );
+
   const fetchQueue = useCallback(async () => {
     try {
       const qRes = await fetch("/api/system/queue", { cache: "no-store" });
@@ -216,6 +262,7 @@ export default function AdminPage() {
         };
         if (qData.queue) {
           setQueue(qData.queue);
+          syncSettingsDrafts(qData.queue.settings);
         }
         if (qData.dailyQuiz) {
           setDailyQuizStatus(qData.dailyQuiz);
@@ -224,7 +271,7 @@ export default function AdminPage() {
     } catch {
       // Ignore transient polling failures
     }
-  }, []);
+  }, [syncSettingsDrafts]);
 
   const fetchAdminData = useCallback(async () => {
     try {
@@ -254,6 +301,7 @@ export default function AdminPage() {
         };
         if (qData.queue) {
           setQueue(qData.queue);
+          syncSettingsDrafts(qData.queue.settings);
         }
         if (qData.dailyQuiz) {
           setDailyQuizStatus(qData.dailyQuiz);
@@ -262,7 +310,7 @@ export default function AdminPage() {
     } finally {
       setLoading(false);
     }
-  }, [roleUeId, roleUserId]);
+  }, [roleUeId, roleUserId, syncSettingsDrafts]);
 
   useEffect(() => {
     void fetchAdminData();
@@ -272,6 +320,14 @@ export default function AdminPage() {
 
   const isContinuous24h = Boolean(queue?.settings?.continuousGeneration24h);
   const isDailyQuizEnabled = queue?.settings?.dailyQuizEnabled ?? true;
+  const isUserAiAndSpixEnabled =
+    queue?.settings?.userAiAndSpixEnabled ?? true;
+  const isAnnouncementEnabled = Boolean(queue?.settings?.announcementEnabled);
+  const isInviteCodeEnabled = Boolean(
+    queue?.settings?.inviteCodeEnabled &&
+      queue?.settings?.inviteCode?.trim().length > 0
+  );
+  const activeInviteCode = queue?.settings?.inviteCode?.trim() || "";
   const hasPendingWork = Boolean(
     queue &&
       (queue.counts.unindexedDocuments > 0 ||
@@ -346,7 +402,7 @@ export default function AdminPage() {
   }
 
   async function handleSystemSettingToggle(
-    kind: "24H" | "DAILY_QUIZ" | "REGEN_DAILY",
+    kind: "24H" | "DAILY_QUIZ" | "REGEN_DAILY" | "USER_AI",
     enabled?: boolean
   ) {
     setSettingsBusy(kind);
@@ -358,6 +414,8 @@ export default function AdminPage() {
           ? "TOGGLE_24H"
           : kind === "DAILY_QUIZ"
           ? "TOGGLE_DAILY_QUIZ"
+          : kind === "USER_AI"
+          ? "TOGGLE_USER_AI"
           : "REGENERATE_DAILY_QUIZ";
       const res = await fetch("/api/system/queue", {
         method: "POST",
@@ -382,12 +440,147 @@ export default function AdminPage() {
       }
       if (data.queue) {
         setQueue(data.queue);
+        if (typeof window !== "undefined" && data.queue.settings) {
+          window.dispatchEvent(
+            new CustomEvent("ara-system-settings-updated", {
+              detail: data.queue.settings,
+            })
+          );
+        }
       }
       if (data.dailyQuiz) {
         setDailyQuizStatus(data.dailyQuiz);
       }
       if (data.notice) {
         setQueueNotice(data.notice);
+      }
+    } finally {
+      setSettingsBusy(null);
+    }
+  }
+
+  async function handleSaveAnnouncement(enabled: boolean) {
+    setSettingsBusy("ANNOUNCEMENT");
+    setQueueError(null);
+    setQueueNotice(null);
+    try {
+      const res = await fetch("/api/system/queue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "UPDATE_ANNOUNCEMENT",
+          enabled,
+          announcementType,
+          announcementMessage: announcementMessage.trim(),
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        queue?: BackgroundQueueSnapshot;
+        notice?: string;
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setQueueError(
+          data.message || data.error || "Erreur lors de la publication."
+        );
+        return;
+      }
+      if (data.queue) {
+        setQueue(data.queue);
+        if (data.queue.settings) {
+          setAnnouncementType(data.queue.settings.announcementType);
+          setAnnouncementMessage(data.queue.settings.announcementMessage);
+          if (typeof window !== "undefined") {
+            window.dispatchEvent(
+              new CustomEvent("ara-system-settings-updated", {
+                detail: data.queue.settings,
+              })
+            );
+          }
+        }
+      }
+      if (data.notice) {
+        setQueueNotice(data.notice);
+      }
+    } finally {
+      setSettingsBusy(null);
+    }
+  }
+
+  function generateRandomInviteCode() {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let suffix = "";
+    if (typeof window !== "undefined" && window.crypto?.getRandomValues) {
+      const bytes = new Uint8Array(6);
+      window.crypto.getRandomValues(bytes);
+      for (let i = 0; i < bytes.length; i += 1) {
+        suffix += alphabet[bytes[i] % alphabet.length];
+      }
+    } else {
+      for (let i = 0; i < 6; i += 1) {
+        suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
+      }
+    }
+    setInviteCodeDraft(`ARA-${suffix}`);
+    inviteCodeDirtyRef.current = true;
+    setInviteCodeDirty(true);
+    setInviteCodeFeedback(null);
+  }
+
+  async function copyInviteCode() {
+    const valueToCopy = (
+      inviteCodeDraft.trim() ||
+      activeInviteCode ||
+      ""
+    ).toUpperCase();
+    if (!valueToCopy) return;
+    try {
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(valueToCopy);
+        setInviteCodeCopied(true);
+        setTimeout(() => setInviteCodeCopied(false), 2000);
+      }
+    } catch {
+      // Clipboard API unavailable
+    }
+  }
+
+  async function saveInviteCodeSettings(enabled: boolean) {
+    setSettingsBusy("INVITE_CODE");
+    setInviteCodeFeedback(null);
+    try {
+      const res = await fetch("/api/system/queue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "UPDATE_INVITE_CODE",
+          enabled,
+          inviteCode: inviteCodeDraft.trim().toUpperCase(),
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        queue?: BackgroundQueueSnapshot;
+        notice?: string;
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        const errMsg =
+          data.message ||
+          data.error ||
+          "Erreur lors de la mise à jour du code d'accès.";
+        setInviteCodeFeedback({ kind: "err", text: errMsg });
+        return;
+      }
+      if (data.queue) {
+        setQueue(data.queue);
+        inviteCodeDirtyRef.current = false;
+        setInviteCodeDirty(false);
+        setInviteCodeDraft(data.queue.settings?.inviteCode || "");
+      }
+      if (data.notice) {
+        setInviteCodeFeedback({ kind: "ok", text: data.notice });
       }
     } finally {
       setSettingsBusy(null);
@@ -889,6 +1082,206 @@ export default function AdminPage() {
                       </button>
                     </div>
                   </div>
+
+                  {/* Card 3: User AI Generation & Spix Toggle */}
+                  <div
+                    className="flex flex-col justify-between gap-3 border border-border bg-card p-4"
+                    style={{
+                      borderTop: `3px solid ${
+                        isUserAiAndSpixEnabled ? "#3B7A57" : "#C83E4D"
+                      }`,
+                    }}
+                  >
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                          <Sparkles
+                            className={`h-3.5 w-3.5 ${
+                              isUserAiAndSpixEnabled
+                                ? "text-forest"
+                                : "text-carmine"
+                            }`}
+                          />
+                          <span>GÉNÉRATION UTILISATEURS &amp; SPIX</span>
+                        </span>
+                        <span
+                          className={`border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
+                            isUserAiAndSpixEnabled
+                              ? "border-forest/40 bg-forest/10 text-forest"
+                              : "border-carmine/40 bg-carmine/10 text-carmine"
+                          }`}
+                        >
+                          {isUserAiAndSpixEnabled
+                            ? "ACTIVÉ · STUDIO & SPIX OUVERTS"
+                            : "DÉSACTIVÉ · LECTURE SEULE"}
+                        </span>
+                      </div>
+                      <p className="text-xs leading-relaxed text-stone">
+                        {isUserAiAndSpixEnabled
+                          ? "Les étudiants peuvent lancer des générations IA dans le Studio (mode cours complet permanent) et discuter avec Spix. La file serveur reste indépendante."
+                          : "Génération Studio par les utilisateurs, bouton « Expliquer avec Spix » et chat Spix bloqués (CPU préservé). Les fiches, flashcards et quiz existants restent lisibles."}
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
+                      <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                        STUDIO COURS COMPLET TOUJOURS ACTIF
+                      </span>
+                      <button
+                        type="button"
+                        disabled={settingsBusy !== null}
+                        onClick={() =>
+                          void handleSystemSettingToggle(
+                            "USER_AI",
+                            !isUserAiAndSpixEnabled
+                          )
+                        }
+                        className={`inline-flex items-center gap-1.5 border px-3.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider transition-colors disabled:opacity-50 ${
+                          isUserAiAndSpixEnabled
+                            ? "border-carmine bg-carmine/10 text-carmine hover:bg-carmine hover:text-card"
+                            : "border-forest bg-forest text-card hover:bg-forest/90"
+                        }`}
+                      >
+                        {settingsBusy === "USER_AI" ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Power className="h-3 w-3" />
+                        )}
+                        <span>
+                          {isUserAiAndSpixEnabled
+                            ? "DÉSACTIVER IA & SPIX"
+                            : "ACTIVER IA & SPIX"}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Card 4: Global Site Announcement Banner (Red / Blue / Orange) */}
+                  {(() => {
+                    const selectedVariant =
+                      ANNOUNCEMENT_VARIANTS[announcementType] ||
+                      ANNOUNCEMENT_VARIANTS.INFO;
+                    return (
+                      <div
+                        className="flex flex-col justify-between gap-3 border border-border bg-card p-4"
+                        style={{
+                          borderTop: `3px solid ${
+                            isAnnouncementEnabled
+                              ? selectedVariant.hex
+                              : "#DCDAD3"
+                          }`,
+                        }}
+                      >
+                        <div className="space-y-2.5">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="inline-flex items-center gap-1.5 font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                              <Megaphone className="h-3.5 w-3.5 text-ink" />
+                              <span>ANNONCE GLOBALE SITE WEB</span>
+                            </span>
+                            <span
+                              className={`border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
+                                isAnnouncementEnabled
+                                  ? selectedVariant.statusBadgeClass
+                                  : "border-border bg-paper text-stone"
+                              }`}
+                            >
+                              {isAnnouncementEnabled
+                                ? `DIFFUSÉE · ${selectedVariant.shortLabel}`
+                                : "INACTIVE (MASQUÉE)"}
+                            </span>
+                          </div>
+
+                          {/* 3 Type Buttons */}
+                          <div className="grid grid-cols-3 gap-1.5">
+                            {ANNOUNCEMENT_VARIANT_LIST.map((variant) => {
+                              const Icon = variant.Icon;
+                              const selected =
+                                announcementType === variant.type;
+                              return (
+                                <button
+                                  key={variant.type}
+                                  type="button"
+                                  onClick={() =>
+                                    setAnnouncementType(variant.type)
+                                  }
+                                  className={`inline-flex items-center justify-center gap-1 border px-2 py-1.5 font-mono text-[10px] font-bold uppercase tracking-wider transition-colors ${
+                                    selected
+                                      ? variant.activeButtonClass
+                                      : variant.idleButtonClass
+                                  }`}
+                                >
+                                  <Icon className="h-3 w-3" />
+                                  <span>{variant.buttonLabel}</span>
+                                </button>
+                              );
+                            })}
+                          </div>
+
+                          <textarea
+                            rows={2}
+                            value={announcementMessage}
+                            onChange={(e) =>
+                              setAnnouncementMessage(e.target.value)
+                            }
+                            placeholder="Ex : Maintenance Ollama prévue de 18h à 19h — ou — Nouveaux polycopiés UE-201 disponibles..."
+                            className="w-full border border-border bg-paper px-3 py-2 text-xs text-ink placeholder:text-stone focus:border-ink focus:outline-none"
+                          />
+
+                          {announcementMessage.trim().length > 0 && (
+                            <div
+                              className={`border px-3 py-2 text-xs ${selectedVariant.containerClass}`}
+                              style={{
+                                borderLeft: `4px solid ${selectedVariant.hex}`,
+                              }}
+                            >
+                              <span
+                                className={`mr-2 inline-block px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase tracking-wider ${selectedVariant.badgeClass}`}
+                              >
+                                APERÇU · {selectedVariant.badge}
+                              </span>
+                              <span className="text-ink">
+                                {announcementMessage.trim()}
+                              </span>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-3">
+                          {isAnnouncementEnabled && (
+                            <button
+                              type="button"
+                              disabled={settingsBusy !== null}
+                              onClick={() => void handleSaveAnnouncement(false)}
+                              className="inline-flex items-center gap-1.5 border border-carmine bg-carmine/10 px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-carmine hover:bg-carmine hover:text-card disabled:opacity-50"
+                            >
+                              <Power className="h-3 w-3" />
+                              <span>DÉSACTIVER L&apos;ANNONCE</span>
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            disabled={
+                              settingsBusy !== null ||
+                              !announcementMessage.trim()
+                            }
+                            onClick={() => void handleSaveAnnouncement(true)}
+                            className="inline-flex items-center gap-1.5 border border-ink bg-ink px-3.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
+                          >
+                            {settingsBusy === "ANNOUNCEMENT" ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <Send className="h-3 w-3" />
+                            )}
+                            <span>
+                              {isAnnouncementEnabled
+                                ? "METTRE À JOUR L'ANNONCE"
+                                : "PUBLIER L'ANNONCE"}
+                            </span>
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 
@@ -1399,6 +1792,138 @@ export default function AdminPage() {
                 ? `${pendingUsers.length} EN ATTENTE DE VALIDATION`
                 : "AUCUNE DEMANDE EN ATTENTE"}
             </span>
+          </div>
+
+          {/* Invite Code Card: Skip Manual Approval */}
+          <div
+            className="border border-border bg-card p-4"
+            style={{
+              borderTop: `3px solid ${
+                isInviteCodeEnabled ? "#2D6A4F" : "#DCDAD3"
+              }`,
+            }}
+          >
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border pb-3">
+              <div className="flex items-center gap-2">
+                <KeyRound
+                  className={`h-4 w-4 ${
+                    isInviteCodeEnabled ? "text-forest" : "text-stone"
+                  }`}
+                />
+                <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                  CODE D&apos;INVITATION / SKIP DE VÉRIFICATION MANUELLE
+                </span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                {inviteCodeDirty && (
+                  <span className="border border-amber bg-amber/15 px-2 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink">
+                    MODIFIÉ · NON ENREGISTRÉ
+                  </span>
+                )}
+                <span
+                  className={`border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
+                    isInviteCodeEnabled
+                      ? "border-forest/40 bg-forest/10 text-forest"
+                      : "border-border bg-paper text-stone"
+                  }`}
+                >
+                  {isInviteCodeEnabled
+                    ? `ACTIF · VALIDATION AUTOMATIQUE AVEC CODE (${activeInviteCode})`
+                    : "INACTIF · VALIDATION MANUELLE OBLIGATOIRE"}
+                </span>
+              </div>
+            </div>
+
+            <div className="mt-3 space-y-3">
+              <p className="text-xs leading-relaxed text-stone">
+                Lorsque ce code est actif, les nouveaux étudiants qui le saisissent
+                sur <span className="font-mono text-ink">/register</span> contournent
+                la file d&apos;attente : leur compte est approuvé et connecté
+                immédiatement. Laissez le champ vide sur{" "}
+                <span className="font-mono text-ink">/register</span> pour conserver
+                une validation manuelle.
+              </p>
+
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  value={inviteCodeDraft}
+                  onChange={(e) => {
+                    setInviteCodeDraft(e.target.value.toUpperCase());
+                    inviteCodeDirtyRef.current = true;
+                    setInviteCodeDirty(true);
+                    setInviteCodeFeedback(null);
+                  }}
+                  placeholder="Ex: VET2-ONIRIS ou ARA-XXXXXX"
+                  maxLength={64}
+                  className="min-w-[220px] flex-1 border border-border bg-paper px-3 py-2 font-mono text-xs font-bold uppercase tracking-wider text-ink placeholder:font-sans placeholder:font-normal placeholder:normal-case placeholder:tracking-normal placeholder:text-stone/60 focus:border-ink focus:outline-none"
+                />
+
+                <button
+                  type="button"
+                  disabled={settingsBusy !== null}
+                  onClick={generateRandomInviteCode}
+                  className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
+                >
+                  <RefreshCw className="h-3 w-3" />
+                  <span>GÉNÉRER UN CODE</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={!(inviteCodeDraft.trim() || activeInviteCode)}
+                  onClick={() => void copyInviteCode()}
+                  className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-2 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:border-ink disabled:opacity-45"
+                >
+                  {inviteCodeCopied ? (
+                    <Check className="h-3 w-3 text-forest" />
+                  ) : (
+                    <Copy className="h-3 w-3" />
+                  )}
+                  <span>{inviteCodeCopied ? "COPIÉ !" : "COPIER LE CODE"}</span>
+                </button>
+              </div>
+
+              {inviteCodeFeedback && (
+                <div
+                  className={`border px-3 py-2 font-mono text-xs ${
+                    inviteCodeFeedback.kind === "err"
+                      ? "border-carmine/40 bg-carmine/10 text-carmine"
+                      : "border-forest/40 bg-forest/10 text-forest"
+                  }`}
+                >
+                  {inviteCodeFeedback.text}
+                </div>
+              )}
+
+              <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-3">
+                {isInviteCodeEnabled && (
+                  <button
+                    type="button"
+                    disabled={settingsBusy !== null}
+                    onClick={() => void saveInviteCodeSettings(false)}
+                    className="inline-flex items-center gap-1.5 border border-carmine bg-carmine/10 px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-carmine hover:bg-carmine hover:text-card disabled:opacity-50"
+                  >
+                    <Power className="h-3 w-3" />
+                    <span>DÉSACTIVER LE CODE</span>
+                  </button>
+                )}
+
+                <button
+                  type="button"
+                  disabled={settingsBusy !== null || !inviteCodeDraft.trim()}
+                  onClick={() => void saveInviteCodeSettings(true)}
+                  className="inline-flex items-center gap-1.5 border border-ink bg-ink px-3.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
+                >
+                  {settingsBusy === "INVITE_CODE" ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <KeyRound className="h-3 w-3" />
+                  )}
+                  <span>ACTIVER / METTRE À JOUR LE CODE</span>
+                </button>
+              </div>
+            </div>
           </div>
 
           <div
