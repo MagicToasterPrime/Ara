@@ -6,12 +6,14 @@ import {
   CheckCircle2,
   Clock,
   Database,
+  Flame,
   HardDrive,
   ListChecks,
   Loader2,
   Pencil,
   Play,
   Plus,
+  Power,
   RefreshCw,
   Server,
   ShieldAlert,
@@ -20,6 +22,7 @@ import {
   Trash2,
   UserCheck,
   UserX,
+  Zap,
 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import {
@@ -28,6 +31,7 @@ import {
   formatExamBadge,
   type ClassLevel,
 } from "@/lib/class-levels";
+import type { SharedDailyQuizTodayStatus } from "@/lib/revisions";
 import type { BackgroundQueueSnapshot, IndexingQueueItem } from "@/lib/studio";
 
 const ACCENT_COLORS = [
@@ -168,12 +172,18 @@ export default function AdminPage() {
   const [health, setHealth] = useState<HealthData | null>(null);
   const [ues, setUes] = useState<UEAdminItem[]>([]);
   const [queue, setQueue] = useState<BackgroundQueueSnapshot | null>(null);
+  const [dailyQuizStatus, setDailyQuizStatus] =
+    useState<SharedDailyQuizTodayStatus | null>(null);
   const [loading, setLoading] = useState(true);
 
   // Reindex RAG & Background Queue Controls
   const [reindexing, setReindexing] = useState(false);
   const [reindexMsg, setReindexMsg] = useState<string | null>(null);
   const [queueBusy, setQueueBusy] = useState(false);
+  const [settingsBusy, setSettingsBusy] = useState<
+    "24H" | "DAILY_QUIZ" | "REGEN_DAILY" | null
+  >(null);
+  const [queueNotice, setQueueNotice] = useState<string | null>(null);
   const [queueError, setQueueError] = useState<string | null>(null);
 
   // UE Form
@@ -202,9 +212,13 @@ export default function AdminPage() {
       if (qRes.ok) {
         const qData = (await qRes.json()) as {
           queue?: BackgroundQueueSnapshot;
+          dailyQuiz?: SharedDailyQuizTodayStatus;
         };
         if (qData.queue) {
           setQueue(qData.queue);
+        }
+        if (qData.dailyQuiz) {
+          setDailyQuizStatus(qData.dailyQuiz);
         }
       }
     } catch {
@@ -236,9 +250,13 @@ export default function AdminPage() {
       if (qRes.ok) {
         const qData = (await qRes.json()) as {
           queue?: BackgroundQueueSnapshot;
+          dailyQuiz?: SharedDailyQuizTodayStatus;
         };
         if (qData.queue) {
           setQueue(qData.queue);
+        }
+        if (qData.dailyQuiz) {
+          setDailyQuizStatus(qData.dailyQuiz);
         }
       }
     } finally {
@@ -252,6 +270,14 @@ export default function AdminPage() {
 
   const wasRunningRef = useRef(false);
 
+  const isContinuous24h = Boolean(queue?.settings?.continuousGeneration24h);
+  const isDailyQuizEnabled = queue?.settings?.dailyQuizEnabled ?? true;
+  const hasPendingWork = Boolean(
+    queue &&
+      (queue.counts.unindexedDocuments > 0 ||
+        queue.counts.pendingAiArtifacts > 0)
+  );
+
   useEffect(() => {
     const running = Boolean(queue?.worker.isRunning);
     if (wasRunningRef.current && !running) {
@@ -259,14 +285,21 @@ export default function AdminPage() {
     }
     wasRunningRef.current = running;
 
-    if (!running) return;
+    const shouldPoll = running || (isContinuous24h && hasPendingWork);
+    if (!shouldPoll) return;
     const interval = setInterval(() => {
       void fetchQueue();
-    }, 3000);
+    }, running ? 3000 : 5000);
     return () => {
       clearInterval(interval);
     };
-  }, [queue?.worker.isRunning, fetchQueue, fetchAdminData]);
+  }, [
+    queue?.worker.isRunning,
+    isContinuous24h,
+    hasPendingWork,
+    fetchQueue,
+    fetchAdminData,
+  ]);
 
   async function handleQueueAction(
     action: "START_ALL" | "START_INDEXING" | "START_AI" | "STOP",
@@ -274,6 +307,7 @@ export default function AdminPage() {
   ) {
     setQueueBusy(true);
     setQueueError(null);
+    setQueueNotice(null);
     try {
       const res = await fetch("/api/system/queue", {
         method: "POST",
@@ -286,6 +320,8 @@ export default function AdminPage() {
       });
       const data = (await res.json().catch(() => ({}))) as {
         queue?: BackgroundQueueSnapshot;
+        dailyQuiz?: SharedDailyQuizTodayStatus;
+        notice?: string;
         message?: string;
         error?: string;
       };
@@ -298,8 +334,63 @@ export default function AdminPage() {
       if (data.queue) {
         setQueue(data.queue);
       }
+      if (data.dailyQuiz) {
+        setDailyQuizStatus(data.dailyQuiz);
+      }
+      if (data.notice) {
+        setQueueNotice(data.notice);
+      }
     } finally {
       setQueueBusy(false);
+    }
+  }
+
+  async function handleSystemSettingToggle(
+    kind: "24H" | "DAILY_QUIZ" | "REGEN_DAILY",
+    enabled?: boolean
+  ) {
+    setSettingsBusy(kind);
+    setQueueError(null);
+    setQueueNotice(null);
+    try {
+      const action =
+        kind === "24H"
+          ? "TOGGLE_24H"
+          : kind === "DAILY_QUIZ"
+          ? "TOGGLE_DAILY_QUIZ"
+          : "REGENERATE_DAILY_QUIZ";
+      const res = await fetch("/api/system/queue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          ...(typeof enabled === "boolean" ? { enabled } : {}),
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        queue?: BackgroundQueueSnapshot;
+        dailyQuiz?: SharedDailyQuizTodayStatus;
+        notice?: string;
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setQueueError(
+          data.message || data.error || "Erreur lors de la mise à jour."
+        );
+        return;
+      }
+      if (data.queue) {
+        setQueue(data.queue);
+      }
+      if (data.dailyQuiz) {
+        setDailyQuizStatus(data.dailyQuiz);
+      }
+      if (data.notice) {
+        setQueueNotice(data.notice);
+      }
+    } finally {
+      setSettingsBusy(null);
     }
   }
 
@@ -516,7 +607,9 @@ export default function AdminPage() {
         <section className="space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="font-mono text-xs font-semibold uppercase tracking-wider text-ink">
-              01 / MONITORING SANTÉ, FILES D&apos;ATTENTE HEURES CREUSES (00H–07H) &amp; ETA
+              {isContinuous24h
+                ? "01 / MONITORING SANTÉ, MODE CONTINU 24H/24 & ETA"
+                : "01 / MONITORING SANTÉ, FILES D'ATTENTE HEURES CREUSES (00H–07H) & ETA"}
             </h2>
             <button
               type="button"
@@ -623,6 +716,188 @@ export default function AdminPage() {
                 </div>
               </div>
 
+              {/* Automation Controls: 24/24 Continuous Generation & Daily Quiz Toggle */}
+              {queue && (
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                  {/* Card 1: 24/24 Continuous Generation Mode */}
+                  <div
+                    className="flex flex-col justify-between gap-3 border border-border bg-card p-4"
+                    style={{
+                      borderTop: `3px solid ${
+                        isContinuous24h ? "#D99B26" : "#DCDAD3"
+                      }`,
+                    }}
+                  >
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                          <Zap
+                            className={`h-3.5 w-3.5 ${
+                              isContinuous24h ? "text-amber" : "text-stone"
+                            }`}
+                          />
+                          <span>MODE GÉNÉRATION CONTINUE 24H/24</span>
+                        </span>
+                        <span
+                          className={`border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
+                            isContinuous24h
+                              ? "border-amber bg-amber/15 text-ink"
+                              : "border-border bg-paper text-stone"
+                          }`}
+                        >
+                          {isContinuous24h
+                            ? "ACTIF · 24H/24"
+                            : "INACTIF · 00H–07H UNIQUEMENT"}
+                        </span>
+                      </div>
+                      <p className="text-xs leading-relaxed text-stone">
+                        {isContinuous24h
+                          ? "Indexation RAG et génération IA (Fiches, Flashcards, Quiz) tournent en continu 24h/24 et démarrent automatiquement à chaque nouvel upload PDF. Désactivez-le une fois le gros des cours préparé."
+                          : "Mode normal : la génération automatique ne s'exécute que pendant les heures creuses (00h00–07h00). Activez le mode 24h/24 pour préparer beaucoup de contenu d'un coup en journée."}
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-3">
+                      <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+                        {isContinuous24h
+                          ? "DRAIN AUTOMATIQUE TOUTES LES 60 S + UPLOAD"
+                          : "FENÊTRE AUTOMATIQUE : 00H00–07H00"}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={settingsBusy !== null}
+                        onClick={() =>
+                          void handleSystemSettingToggle(
+                            "24H",
+                            !isContinuous24h
+                          )
+                        }
+                        className={`inline-flex items-center gap-1.5 border px-3.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider transition-colors disabled:opacity-50 ${
+                          isContinuous24h
+                            ? "border-carmine bg-carmine/10 text-carmine hover:bg-carmine hover:text-card"
+                            : "border-ink bg-ink text-card hover:bg-ink/90"
+                        }`}
+                      >
+                        {settingsBusy === "24H" ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : isContinuous24h ? (
+                          <Power className="h-3 w-3" />
+                        ) : (
+                          <Zap className="h-3 w-3 text-amber" />
+                        )}
+                        <span>
+                          {isContinuous24h
+                            ? "DÉSACTIVER LE MODE 24H/24"
+                            : "ACTIVER LA GÉNÉRATION 24H/24"}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Card 2: Global Daily Quiz Toggle */}
+                  <div
+                    className="flex flex-col justify-between gap-3 border border-border bg-card p-4"
+                    style={{
+                      borderTop: `3px solid ${
+                        isDailyQuizEnabled ? "#3B7A57" : "#C83E4D"
+                      }`,
+                    }}
+                  >
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="inline-flex items-center gap-1.5 font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                          <Flame
+                            className={`h-3.5 w-3.5 ${
+                              isDailyQuizEnabled
+                                ? "text-amber"
+                                : "text-carmine"
+                            }`}
+                          />
+                          <span>QUIZ JOURNALIER COMMUN (06H00)</span>
+                        </span>
+                        <span
+                          className={`border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
+                            isDailyQuizEnabled
+                              ? "border-forest/40 bg-forest/10 text-forest"
+                              : "border-carmine/40 bg-carmine/10 text-carmine"
+                          }`}
+                        >
+                          {isDailyQuizEnabled
+                            ? "ACTIVÉ · TOUTE LA PROMO"
+                            : "DÉSACTIVÉ (EN PAUSE)"}
+                        </span>
+                      </div>
+                      <p className="text-xs leading-relaxed text-stone">
+                        {isDailyQuizEnabled
+                          ? dailyQuizStatus?.readyForToday
+                            ? `Quiz du ${dailyQuizStatus.dateKey} prêt : ${dailyQuizStatus.ueCode || "UE"} (${dailyQuizStatus.totalQuestions} questions${dailyQuizStatus.generatedByAi ? " · IA" : ""}). Renouvellement automatique chaque nuit à 06h00.`
+                            : `Activé pour la promotion (${dailyQuizStatus?.dateKey || "aujourd'hui"} : pas encore généré — sera préparé automatiquement par le planificateur ou au premier accès).`
+                          : "Désactivé globalement : aucune génération automatique à 06h00 (CPU réservé aux cours), bannière masquée sur l'accueil et quiz mis en pause sur /révisions. Le Carnet d'erreurs SRS reste actif."}
+                      </p>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-end gap-2 border-t border-border pt-3">
+                      {isDailyQuizEnabled && (
+                        <button
+                          type="button"
+                          disabled={settingsBusy !== null}
+                          onClick={() =>
+                            void handleSystemSettingToggle("REGEN_DAILY")
+                          }
+                          className="inline-flex items-center gap-1.5 border border-border bg-paper px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:border-ink disabled:opacity-50"
+                        >
+                          <RefreshCw
+                            className={`h-3 w-3 ${
+                              settingsBusy === "REGEN_DAILY"
+                                ? "animate-spin"
+                                : ""
+                            }`}
+                          />
+                          <span>
+                            {dailyQuizStatus?.readyForToday
+                              ? "REGÉNÉRER AUJOURD'HUI"
+                              : "GÉNÉRER MAINTENANT"}
+                          </span>
+                        </button>
+                      )}
+
+                      <button
+                        type="button"
+                        disabled={settingsBusy !== null}
+                        onClick={() =>
+                          void handleSystemSettingToggle(
+                            "DAILY_QUIZ",
+                            !isDailyQuizEnabled
+                          )
+                        }
+                        className={`inline-flex items-center gap-1.5 border px-3.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider transition-colors disabled:opacity-50 ${
+                          isDailyQuizEnabled
+                            ? "border-carmine bg-carmine/10 text-carmine hover:bg-carmine hover:text-card"
+                            : "border-forest bg-forest text-card hover:bg-forest/90"
+                        }`}
+                      >
+                        {settingsBusy === "DAILY_QUIZ" ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Power className="h-3 w-3" />
+                        )}
+                        <span>
+                          {isDailyQuizEnabled
+                            ? "DÉSACTIVER LE DAILY QUIZ"
+                            : "ACTIVER LE DAILY QUIZ"}
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {queueNotice && (
+                <div className="border border-amber/60 bg-pinned px-4 py-2.5 font-mono text-xs text-ink">
+                  {queueNotice}
+                </div>
+              )}
+
               {/* Live Background Queue, Progress & ETA Console */}
               {queue && (
                 <div
@@ -640,17 +915,23 @@ export default function AdminPage() {
                           className={`inline-flex items-center gap-1.5 border px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
                             queue.worker.isRunning
                               ? "border-amber bg-amber/15 text-ink"
+                              : isContinuous24h
+                              ? "border-amber/60 bg-pinned text-ink"
                               : "border-border bg-paper text-stone"
                           }`}
                         >
                           {queue.worker.isRunning ? (
                             <Loader2 className="h-3 w-3 animate-spin text-amber" />
+                          ) : isContinuous24h ? (
+                            <Zap className="h-3 w-3 text-amber" />
                           ) : (
                             <Clock className="h-3 w-3" />
                           )}
                           <span>
                             {queue.worker.isRunning
-                              ? queue.worker.mode === "NIGHTLY_AUTO"
+                              ? queue.worker.mode === "CONTINUOUS_24H"
+                                ? "EN COURS · MODE CONTINU 24H/24"
+                                : queue.worker.mode === "NIGHTLY_AUTO"
                                 ? "EN COURS · MODE AUTO 00H–07H"
                                 : "EN COURS · LANCÉ PAR ADMIN"
                               : `EN VEILLE · ${queue.worker.nextNightlyWindowLabel}`}
@@ -959,6 +1240,8 @@ export default function AdminPage() {
                                       >
                                         {item.status === "RUNNING"
                                           ? "EN COURS"
+                                          : isContinuous24h
+                                          ? "24H/24"
                                           : "00H–07H"}
                                       </span>
                                       <span className="truncate font-mono text-[9px] uppercase text-stone">
@@ -1070,6 +1353,8 @@ export default function AdminPage() {
                                     >
                                       {item.status === "RUNNING"
                                         ? "EN COURS"
+                                        : isContinuous24h
+                                        ? "24H/24"
                                         : "00H–07H"}
                                     </span>
                                   </div>

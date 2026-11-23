@@ -12,6 +12,8 @@ import {
 import { extractPdfPages } from "@/lib/pdf";
 import { storeDocumentChunksUnindexed } from "@/lib/ollama";
 import { ensureUploadDir, sanitizeFileName } from "@/lib/storage";
+import { runNightlyOffPeakStudyGeneration } from "@/lib/studio";
+import { getSystemSettings } from "@/lib/system-settings";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 300;
@@ -386,6 +388,15 @@ export async function POST(req: Request) {
       );
     }
 
+    const settings = await getSystemSettings();
+    if (settings.continuousGeneration24h) {
+      void runNightlyOffPeakStudyGeneration({ mode: "CONTINUOUS_24H" }).catch(
+        (err) => {
+          console.warn("[Documents POST] 24/24 auto-trigger warning:", err);
+        }
+      );
+    }
+
     const httpStatus = failedResults.length > 0 ? 207 : 201;
 
     return NextResponse.json(
@@ -393,7 +404,8 @@ export async function POST(req: Request) {
         // Backward-compatible single-upload fields
         document: firstSucceeded.document,
         indexing: firstSucceeded.indexing,
-        scheduledNightly: Boolean(firstSucceeded.scheduledNightly),
+        scheduledNightly: !settings.continuousGeneration24h,
+        continuousGeneration24h: settings.continuousGeneration24h,
         // Bulk-upload fields
         documents: succeededResults
           .map((r) => r.document)

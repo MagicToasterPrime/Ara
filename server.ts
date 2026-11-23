@@ -10,6 +10,7 @@ import {
 } from "./src/lib/revisions";
 import type { WhiteboardCollaborator } from "./src/lib/socket-types";
 import { runNightlyOffPeakStudyGeneration } from "./src/lib/studio";
+import { getSystemSettings } from "./src/lib/system-settings";
 import { getUserAccountMeta } from "./src/lib/user-schema";
 
 if (!process.env.TZ) {
@@ -267,33 +268,38 @@ app.prepare().then(() => {
     if (!globalForSocket.__araNightlyWorkerStarted) {
       globalForSocket.__araNightlyWorkerStarted = true;
 
-      const checkOffPeakGeneration = () => {
-        const hour = getParisHour();
-        if (hour >= 0 && hour < 7) {
-          void runNightlyOffPeakStudyGeneration({ mode: "NIGHTLY_AUTO" })
-            .then((res) => {
-              if (
-                !res.skipped &&
-                (res.indexedCount > 0 || res.generatedCount > 0)
-              ) {
-                console.log(
-                  `[NightlyStudio] Heures creuses (Europe/Paris) : ${res.indexedCount} PDF indexé(s), ${res.generatedCount} ressource(s) IA générée(s).`
-                );
-              }
-            })
-            .catch((err) => {
-              console.warn("[NightlyStudio] Background tick warning:", err);
+      const checkBackgroundGeneration = async () => {
+        try {
+          const settings = await getSystemSettings();
+          const hour = getParisHour();
+          const is24h = settings.continuousGeneration24h;
+          if (is24h || (hour >= 0 && hour < 7)) {
+            const res = await runNightlyOffPeakStudyGeneration({
+              mode: is24h ? "CONTINUOUS_24H" : "NIGHTLY_AUTO",
             });
+            if (
+              !res.skipped &&
+              (res.indexedCount > 0 || res.generatedCount > 0)
+            ) {
+              console.log(
+                `[${is24h ? "Studio24h" : "NightlyStudio"}] ${
+                  is24h ? "Mode continu 24h/24" : "Heures creuses (Europe/Paris)"
+                } : ${res.indexedCount} PDF indexé(s), ${res.generatedCount} ressource(s) IA générée(s).`
+              );
+            }
+          }
+        } catch (err) {
+          console.warn("[NightlyStudio] Background tick warning:", err);
         }
       };
 
       setTimeout(() => {
-        checkOffPeakGeneration();
+        void checkBackgroundGeneration();
       }, 20000);
 
       setInterval(() => {
-        checkOffPeakGeneration();
-      }, 5 * 60 * 1000);
+        void checkBackgroundGeneration();
+      }, 60 * 1000);
     }
 
     if (!globalForSocket.__araDailyQuizSchedulerStarted) {
@@ -303,6 +309,11 @@ app.prepare().then(() => {
         if (globalForSocket.__araDailyQuizRunning) return;
         globalForSocket.__araDailyQuizRunning = true;
         try {
+          const settings = await getSystemSettings();
+          if (!settings.dailyQuizEnabled) {
+            return;
+          }
+
           const hour = getParisHour();
           const todayKey = getLocalDateKey();
           const hasToday = await hasSharedDailyQuizForToday();

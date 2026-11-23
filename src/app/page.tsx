@@ -71,6 +71,7 @@ export default function HomePage() {
     currentStreak: number;
     completedToday: boolean;
   } | null>(null);
+  const [dailyQuizGlobalEnabled, setDailyQuizGlobalEnabled] = useState(true);
 
   const userClassLevel = (session?.user?.classLevel || "VET2").toUpperCase();
 
@@ -94,14 +95,18 @@ export default function HomePage() {
         }
         if (revRes.ok) {
           const revData = (await revRes.json()) as {
+            dailyQuizGlobalEnabled?: boolean;
             userState?: {
               revisionEnabled: boolean;
               currentStreak: number;
               completedToday: boolean;
             };
           };
-          if (active && revData.userState) {
-            setRevisionSummary(revData.userState);
+          if (active) {
+            setDailyQuizGlobalEnabled(revData.dailyQuizGlobalEnabled ?? true);
+            if (revData.userState) {
+              setRevisionSummary(revData.userState);
+            }
           }
         }
       } finally {
@@ -235,7 +240,7 @@ export default function HomePage() {
       </div>
 
       {/* Daily Revision & Streak Strip */}
-      {revisionSummary && (
+      {revisionSummary && dailyQuizGlobalEnabled && (
         <div
           className="mb-6 flex flex-wrap items-center justify-between gap-3 border border-border bg-card px-4 py-3"
           style={{

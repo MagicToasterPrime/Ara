@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
+import os from "node:os";
 import { prisma } from "@/lib/prisma";
 import { setDocumentProcessingStatus } from "@/lib/document-status";
 import {
@@ -10,6 +11,14 @@ import {
 } from "@/lib/pdf";
 
 export const DEFAULT_OLLAMA_MODEL = "gemma3:12b";
+
+/**
+ * Keep models resident in RAM for 30 minutes across consecutive studio / RAG tasks
+ * so Ollama never wastes 15–30s reloading gemma3:12b from disk mid-batch.
+ */
+export const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE?.trim() || "30m";
+
+export const EMBED_BATCH_SIZE = 16;
 
 /**
  * Minimum 20 minutes (1200 seconds) timeout for all Ollama HTTP calls
@@ -23,7 +32,8 @@ export const OLLAMA_TIMEOUT_MS = Math.max(
 export const OLLAMA_DEFAULT_OPTIONS = {
   num_thread: 4,
   temperature: 0.2,
-  num_ctx: 8192,
+  num_ctx: 6144,
+  num_batch: 512,
 } as const;
 
 export const OLLAMA_STRICT_SYSTEM_RULE =
@@ -42,7 +52,16 @@ export function getOptimalOllamaThreads(): number {
   if (Number.isFinite(configured) && configured >= 1) {
     return configured;
   }
-  return OLLAMA_DEFAULT_OPTIONS.num_thread;
+  const detected = os.cpus()?.length || 0;
+  return detected >= 1 ? detected : OLLAMA_DEFAULT_OPTIONS.num_thread;
+}
+
+export function getDefaultOllamaNumCtx(): number {
+  const configured = Number.parseInt(process.env.OLLAMA_NUM_CTX || "", 10);
+  if (Number.isFinite(configured) && configured >= 2048 && configured <= 32768) {
+    return configured;
+  }
+  return OLLAMA_DEFAULT_OPTIONS.num_ctx;
 }
 
 export function getOllamaInferenceOptions(overrides?: {
@@ -51,11 +70,13 @@ export function getOllamaInferenceOptions(overrides?: {
   temperature?: number;
   num_ctx?: number;
   num_thread?: number;
+  num_batch?: number;
 }) {
   return {
     num_thread: overrides?.num_thread ?? getOptimalOllamaThreads(),
     temperature: overrides?.temperature ?? OLLAMA_DEFAULT_OPTIONS.temperature,
-    num_ctx: overrides?.num_ctx ?? OLLAMA_DEFAULT_OPTIONS.num_ctx,
+    num_ctx: overrides?.num_ctx ?? getDefaultOllamaNumCtx(),
+    num_batch: overrides?.num_batch ?? OLLAMA_DEFAULT_OPTIONS.num_batch,
     ...(overrides?.num_predict !== undefined
       ? { num_predict: overrides.num_predict }
       : {}),
@@ -392,7 +413,24 @@ export interface OllamaHealth {
   error?: string;
 }
 
-export async function checkOllamaHealth(): Promise<OllamaHealth> {
+const HEALTH_CACHE_TTL_MS = 15_000;
+
+const globalForOllamaCache = globalThis as typeof globalThis & {
+  __araOllamaHealthCache?: { value: OllamaHealth; expiresAt: number };
+  __araOllamaLegacyEmbedOnly?: boolean;
+};
+
+export async function checkOllamaHealth(options?: {
+  useCache?: boolean;
+}): Promise<OllamaHealth> {
+  if (
+    options?.useCache &&
+    globalForOllamaCache.__araOllamaHealthCache &&
+    Date.now() < globalForOllamaCache.__araOllamaHealthCache.expiresAt
+  ) {
+    return globalForOllamaCache.__araOllamaHealthCache.value;
+  }
+
   const { host, model, embedModel } = getOllamaConfig();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5000);
@@ -403,7 +441,7 @@ export async function checkOllamaHealth(): Promise<OllamaHealth> {
       cache: "no-store",
     });
     if (!res.ok) {
-      return {
+      const value: OllamaHealth = {
         online: false,
         host,
         models: [],
@@ -411,18 +449,28 @@ export async function checkOllamaHealth(): Promise<OllamaHealth> {
         embedModel,
         error: `HTTP ${res.status}`,
       };
+      globalForOllamaCache.__araOllamaHealthCache = {
+        value,
+        expiresAt: Date.now() + 3000,
+      };
+      return value;
     }
     const json = (await res.json()) as { models?: Array<{ name: string }> };
     const models = (json.models || []).map((m) => m.name);
-    return {
+    const value: OllamaHealth = {
       online: true,
       host,
       models,
       configuredModel: model,
       embedModel,
     };
+    globalForOllamaCache.__araOllamaHealthCache = {
+      value,
+      expiresAt: Date.now() + HEALTH_CACHE_TTL_MS,
+    };
+    return value;
   } catch {
-    return {
+    const value: OllamaHealth = {
       online: false,
       host,
       models: [],
@@ -430,47 +478,135 @@ export async function checkOllamaHealth(): Promise<OllamaHealth> {
       embedModel,
       error: `Serveur Ollama hors-ligne (${host.replace(/^https?:\/\//, "")})`,
     };
+    globalForOllamaCache.__araOllamaHealthCache = {
+      value,
+      expiresAt: Date.now() + 3000,
+    };
+    return value;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function generateLegacySingleEmbeddingUnlocked(
+  text: string,
+  embedModel: string
+): Promise<number[] | null> {
+  try {
+    const res = await ollamaPostJson<{ embedding?: number[] }>(
+      "/api/embeddings",
+      {
+        model: embedModel,
+        prompt: text,
+        keep_alive: OLLAMA_KEEP_ALIVE,
+        options: {
+          num_thread: getOptimalOllamaThreads(),
+        },
+      },
+      OLLAMA_TIMEOUT_MS
+    );
+
+    if (!res.ok || !res.data) {
+      return null;
+    }
+    if (
+      !Array.isArray(res.data.embedding) ||
+      res.data.embedding.length !== 768
+    ) {
+      return null;
+    }
+    return res.data.embedding;
+  } catch (err) {
+    console.warn("[Ollama] Legacy embedding request error:", err);
+    return null;
+  }
+}
+
+/**
+ * Generates embeddings for a batch of chunks in ONE /api/embed HTTP call (3x–6x faster on CPU),
+ * with automatic transparent fallback to legacy /api/embeddings if needed.
+ */
+export async function generateEmbeddingsBatch(
+  texts: string[]
+): Promise<Array<number[] | null>> {
+  if (!Array.isArray(texts) || texts.length === 0) {
+    return [];
+  }
+
+  const results: Array<number[] | null> = new Array(texts.length).fill(null);
+  const validIndexes: number[] = [];
+  const validInputs: string[] = [];
+
+  for (let i = 0; i < texts.length; i += 1) {
+    const t = (texts[i] || "").trim();
+    if (t.length > 0) {
+      validIndexes.push(i);
+      validInputs.push(t);
+    }
+  }
+
+  if (validInputs.length === 0) {
+    return results;
+  }
+
+  return withOllamaLock(async () => {
+    const { embedModel } = getOllamaConfig();
+
+    if (!globalForOllamaCache.__araOllamaLegacyEmbedOnly) {
+      try {
+        const res = await ollamaPostJson<{ embeddings?: number[][] }>(
+          "/api/embed",
+          {
+            model: embedModel,
+            input: validInputs,
+            keep_alive: OLLAMA_KEEP_ALIVE,
+            options: {
+              num_thread: getOptimalOllamaThreads(),
+            },
+          },
+          OLLAMA_TIMEOUT_MS
+        );
+
+        if (
+          res.ok &&
+          res.data &&
+          Array.isArray(res.data.embeddings) &&
+          res.data.embeddings.length === validInputs.length
+        ) {
+          for (let j = 0; j < validInputs.length; j += 1) {
+            const vec = res.data.embeddings[j];
+            if (Array.isArray(vec) && vec.length === 768) {
+              results[validIndexes[j]] = vec;
+            }
+          }
+          return results;
+        }
+
+        if (res.status === 404) {
+          globalForOllamaCache.__araOllamaLegacyEmbedOnly = true;
+        }
+      } catch (err) {
+        console.warn("[Ollama] Batch /api/embed warning, falling back:", err);
+      }
+    }
+
+    // Fallback: sequential legacy /api/embeddings inside the same lock
+    for (let j = 0; j < validInputs.length; j += 1) {
+      results[validIndexes[j]] = await generateLegacySingleEmbeddingUnlocked(
+        validInputs[j],
+        embedModel
+      );
+    }
+    return results;
+  });
 }
 
 export async function generateEmbedding(text: string): Promise<number[] | null> {
   if (!text || !text.trim()) {
     return null;
   }
-
-  return withOllamaLock(async () => {
-    const { embedModel } = getOllamaConfig();
-    try {
-      const res = await ollamaPostJson<{ embedding?: number[] }>(
-        "/api/embeddings",
-        {
-          model: embedModel,
-          prompt: text,
-          options: {
-            num_thread: getOptimalOllamaThreads(),
-          },
-        },
-        OLLAMA_TIMEOUT_MS
-      );
-
-      if (!res.ok || !res.data) {
-        return null;
-      }
-
-      if (
-        !Array.isArray(res.data.embedding) ||
-        res.data.embedding.length !== 768
-      ) {
-        return null;
-      }
-      return res.data.embedding;
-    } catch (err) {
-      console.warn("[Ollama] Embedding request error:", err);
-      return null;
-    }
-  });
+  const batch = await generateEmbeddingsBatch([text]);
+  return batch[0] ?? null;
 }
 
 export function chunkPageText(
@@ -633,28 +769,44 @@ export async function embedExistingDocumentChunks(
   let embeddedCount = rows.filter((r) => Boolean(r.hasEmbedding)).length;
   let stopped = false;
 
-  for (const row of rows) {
-    if (row.hasEmbedding) continue;
+  const pendingRows = rows.filter((r) => !r.hasEmbedding);
+  for (let i = 0; i < pendingRows.length; i += EMBED_BATCH_SIZE) {
     if (options?.shouldStop?.()) {
       stopped = true;
       break;
     }
 
+    const batch = pendingRows.slice(i, i + EMBED_BATCH_SIZE);
     const t0 = Date.now();
-    const embedding = await generateEmbedding(row.content);
-    const elapsed = Date.now() - t0;
+    const embeddings = await generateEmbeddingsBatch(
+      batch.map((r) => r.content)
+    );
+    const batchElapsed = Date.now() - t0;
 
-    if (embedding) {
+    const updates = [];
+    for (let j = 0; j < batch.length; j += 1) {
+      const embedding = embeddings[j];
+      if (!embedding) continue;
       const vectorLiteral = formatVectorLiteral(embedding);
-      await prisma.$executeRaw`
-        UPDATE "DocumentChunk"
-        SET "embedding" = CAST(${vectorLiteral} AS vector(768))
-        WHERE "id" = ${row.id}
-      `;
-      embeddedCount += 1;
+      updates.push(
+        prisma.$executeRaw`
+          UPDATE "DocumentChunk"
+          SET "embedding" = CAST(${vectorLiteral} AS vector(768))
+          WHERE "id" = ${batch[j].id}
+        `
+      );
     }
 
-    options?.onProgress?.(embeddedCount, rows.length, elapsed);
+    if (updates.length > 0) {
+      await prisma.$transaction(updates);
+      embeddedCount += updates.length;
+    }
+
+    const avgChunkMs = Math.max(
+      1,
+      Math.round(batchElapsed / Math.max(1, batch.length))
+    );
+    options?.onProgress?.(embeddedCount, rows.length, avgChunkMs);
   }
 
   const isIndexed = embeddedCount === rows.length && rows.length > 0;
@@ -745,28 +897,44 @@ export async function indexDocumentPages(
 
   let embeddedCount = 0;
 
-  for (let i = 0; i < rawChunks.length; i += 1) {
-    const chunk = rawChunks[i];
-    const embedding = await generateEmbedding(chunk.content);
-    const id = crypto.randomUUID();
-    if (embedding) {
-      const vectorLiteral = formatVectorLiteral(embedding);
-      await prisma.$executeRaw`
-        INSERT INTO "DocumentChunk" ("id", "documentId", "content", "pageNumber", "embedding")
-        VALUES (${id}, ${documentId}, ${chunk.content}, ${chunk.pageNumber}, CAST(${vectorLiteral} AS vector(768)))
-      `;
-      embeddedCount += 1;
-    } else {
-      await prisma.documentChunk.create({
-        data: {
-          id,
-          documentId,
-          content: chunk.content,
-          pageNumber: chunk.pageNumber,
-        },
-      });
+  for (let i = 0; i < rawChunks.length; i += EMBED_BATCH_SIZE) {
+    const batch = rawChunks.slice(i, i + EMBED_BATCH_SIZE);
+    const embeddings = await generateEmbeddingsBatch(
+      batch.map((c) => c.content)
+    );
+
+    const ops = [];
+    for (let j = 0; j < batch.length; j += 1) {
+      const chunk = batch[j];
+      const embedding = embeddings[j];
+      const id = crypto.randomUUID();
+      if (embedding) {
+        const vectorLiteral = formatVectorLiteral(embedding);
+        ops.push(
+          prisma.$executeRaw`
+            INSERT INTO "DocumentChunk" ("id", "documentId", "content", "pageNumber", "embedding")
+            VALUES (${id}, ${documentId}, ${chunk.content}, ${chunk.pageNumber}, CAST(${vectorLiteral} AS vector(768)))
+          `
+        );
+        embeddedCount += 1;
+      } else {
+        ops.push(
+          prisma.documentChunk.create({
+            data: {
+              id,
+              documentId,
+              content: chunk.content,
+              pageNumber: chunk.pageNumber,
+            },
+          })
+        );
+      }
     }
-    onProgress?.(i + 1, rawChunks.length);
+
+    if (ops.length > 0) {
+      await prisma.$transaction(ops);
+    }
+    onProgress?.(Math.min(i + batch.length, rawChunks.length), rawChunks.length);
   }
 
   const isIndexed = embeddedCount > 0 && embeddedCount === rawChunks.length;
@@ -818,8 +986,9 @@ export async function describeImageWithOllama(
             promptContext ? ` Contexte demandé : ${promptContext}` : ""
           }`,
           images: [cleanBase64],
+          keep_alive: OLLAMA_KEEP_ALIVE,
           stream: false,
-          options: getOllamaInferenceOptions(),
+          options: getOllamaInferenceOptions({ num_predict: 800 }),
         },
         OLLAMA_TIMEOUT_MS
       );

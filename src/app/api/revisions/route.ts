@@ -19,6 +19,7 @@ import {
   type RevisionQuestion,
   type SharedDailyQuizRecord,
 } from "@/lib/revisions";
+import { getSystemSettings } from "@/lib/system-settings";
 
 function parseJsonSafe<T>(raw: string, fallback: T): T {
   try {
@@ -30,9 +31,12 @@ function parseJsonSafe<T>(raw: string, fallback: T): T {
 
 async function buildPayload(
   userId: string,
-  sharedQuizArg?: SharedDailyQuizRecord | null
+  sharedQuizArg?: SharedDailyQuizRecord | null,
+  dailyQuizGlobalEnabledArg?: boolean
 ) {
   const todayKey = getLocalDateKey();
+  const dailyQuizGlobalEnabled =
+    dailyQuizGlobalEnabledArg ?? (await getSystemSettings()).dailyQuizEnabled;
 
   const [dbUser, todaySession, chunkCount, allParticipants, errorBook, sharedQuiz] =
     await Promise.all([
@@ -48,14 +52,16 @@ async function buildPayload(
           totalRevisionPoints: true,
         },
       }),
-      prisma.dailyRevisionSession.findUnique({
-        where: {
-          userId_dateKey: {
-            userId,
-            dateKey: todayKey,
-          },
-        },
-      }),
+      dailyQuizGlobalEnabled
+        ? prisma.dailyRevisionSession.findUnique({
+            where: {
+              userId_dateKey: {
+                userId,
+                dateKey: todayKey,
+              },
+            },
+          })
+        : Promise.resolve(null),
       prisma.documentChunk.count(),
       prisma.user.findMany({
         where: {
@@ -75,7 +81,9 @@ async function buildPayload(
         },
       }),
       getUserErrorBook(userId),
-      sharedQuizArg !== undefined
+      !dailyQuizGlobalEnabled
+        ? Promise.resolve(null)
+        : sharedQuizArg !== undefined
         ? Promise.resolve(sharedQuizArg)
         : getOrGenerateSharedDailyQuiz(),
     ]);
@@ -118,6 +126,7 @@ async function buildPayload(
     : {};
 
   return {
+    dailyQuizGlobalEnabled,
     userState: {
       revisionEnabled: dbUser?.revisionEnabled ?? false,
       currentStreak: effectiveStreak,
@@ -161,6 +170,12 @@ export async function GET() {
   }
 
   await ensureRevisionSchema();
+  const settings = await getSystemSettings();
+
+  if (!settings.dailyQuizEnabled) {
+    const payload = await buildPayload(user.id, null, false);
+    return NextResponse.json(payload);
+  }
 
   const [dbUser, sharedQuiz] = await Promise.all([
     prisma.user.findUnique({
@@ -208,7 +223,7 @@ export async function GET() {
     }
   }
 
-  const payload = await buildPayload(user.id, sharedQuiz);
+  const payload = await buildPayload(user.id, sharedQuiz, true);
   return NextResponse.json(payload);
 }
 
@@ -257,6 +272,17 @@ export async function POST(req: Request) {
       await reviewErrorBookItem(user.id, errorItemId, rating);
       const payload = await buildPayload(user.id);
       return NextResponse.json(payload);
+    }
+
+    const settings = await getSystemSettings();
+    if (!settings.dailyQuizEnabled) {
+      return NextResponse.json(
+        {
+          error:
+            "Le quiz journalier est actuellement désactivé par le Responsable d'Année.",
+        },
+        { status: 403 }
+      );
     }
 
     if (body.action === "TOGGLE") {

@@ -4,12 +4,14 @@ import {
   checkOllamaHealth,
   getOllamaConfig,
   getOllamaInferenceOptions,
+  OLLAMA_KEEP_ALIVE,
   OLLAMA_STRICT_SYSTEM_RULE,
   OLLAMA_TIMEOUT_MS,
   ollamaPostJson,
   withOllamaLock,
 } from "@/lib/ollama";
 import { hasUsableText } from "@/lib/pdf";
+import { getSystemSettings } from "@/lib/system-settings";
 import { getAllUeMetaMap } from "@/lib/ue-meta";
 import { getUserAccountMeta } from "@/lib/user-schema";
 
@@ -1409,7 +1411,7 @@ async function tryOllamaQuizEnrichment(
   }
 
   return withOllamaLock(async () => {
-    const health = await checkOllamaHealth();
+    const health = await checkOllamaHealth({ useCache: true });
     if (!health.online) return null;
 
     const { model } = getOllamaConfig();
@@ -1427,32 +1429,33 @@ async function tryOllamaQuizEnrichment(
             .join("\n- ")}\n`
         : "";
 
+    // Static system prompt kept identical across all 5 chapter batches for Ollama KV-cache prefix reuse
     const systemPrompt = `Tu es un enseignant universitaire vétérinaire chargé de créer un QCU, un QCM, une QROC et une flashcard de révision à partir de quatre extraits de cours.
-${OLLAMA_STRICT_SYSTEM_RULE}`;
+${OLLAMA_STRICT_SYSTEM_RULE}
 
-    const prompt = `${chapterFocus}${freshnessBlock}${avoidBlock}À partir des quatre extraits ci-dessous, produis un objet JSON respectant strictement le schéma attendu avec les 4 champs racines : "qcu", "qcm", "qroc" et "flashcard".
-
-DESCRIPTION DES CHAMPS ET RÈGLES PÉDAGOGIQUES :
+RÈGLES JSON STRICTES (4 champs racines : "qcu", "qcm", "qroc", "flashcard") :
 1. INTERDIT de recopier des phrases complètes du polycopié en propositions de réponse ou de demander quelle affirmation figure dans le cours.
 2. Champ "qcu" (basé sur l'EXTRAIT 1) :
-   - "prompt" : une question directe, autonome et précise testant un chiffre, un seuil, une définition ou un mécanisme réel de l'extrait 1.
-   - "options" : un tableau de 4 propositions courtes (1 à 8 mots chacune), homogènes, plausibles, sans préfixe alphabétique.
-   - "correctIndices" : un tableau contenant l'unique indice (0 à 3) de la bonne réponse, en variant la position.
+   - "prompt" : question directe, autonome et précise testant un chiffre, un seuil, une définition ou un mécanisme réel de l'extrait 1.
+   - "options" : tableau de 4 propositions courtes (1 à 8 mots chacune), homogènes, plausibles, sans préfixe alphabétique.
+   - "correctIndices" : tableau contenant l'unique indice (0 à 3) de la bonne réponse, en variant la position.
    - "explanation" : justification factuelle concise tirée de l'extrait 1.
 3. Champ "qcm" (basé sur l'EXTRAIT 2) :
-   - "prompt" : une question à choix multiples contextualisée sur le mécanisme ou la notion de l'extrait 2.
-   - "options" : un tableau de 4 propositions courtes (1 à 10 mots chacune), sans préfixe alphabétique.
-   - "correctIndices" : un tableau contenant exactement 2 ou 3 indices (0 à 3) des propositions exactes.
+   - "prompt" : question à choix multiples contextualisée sur le mécanisme ou la notion de l'extrait 2.
+   - "options" : tableau de 4 propositions courtes (1 à 10 mots chacune), sans préfixe alphabétique.
+   - "correctIndices" : tableau contenant exactement 2 ou 3 indices (0 à 3) des propositions exactes.
    - "explanation" : justification factuelle concise tirée de l'extrait 2.
 4. Champ "qroc" (basé sur l'EXTRAIT 3) :
-   - "prompt" : une question ouverte courte et précise appelant un terme scientifique, une valeur ou un mécanisme concret de l'extrait 3.
-   - "correctAnswer" : la réponse exacte attendue en 1 à 4 mots issus de l'extrait 3.
+   - "prompt" : question ouverte courte et précise appelant un terme scientifique, une valeur ou un mécanisme concret de l'extrait 3.
+   - "correctAnswer" : réponse exacte attendue en 1 à 4 mots issus de l'extrait 3.
    - "acceptedKeywords" : liste de mots-clés scientifiques et synonymes pertinents tirés de l'extrait 3.
    - "explanation" : justification factuelle concise tirée de l'extrait 3.
 5. Champ "flashcard" (basé sur l'EXTRAIT 4) :
-   - "prompt" : une question recto directe en une seule phrase portant sur un fait précis de l'extrait 4.
-   - "flashcardBack" : la réponse verso exacte et concise (1 à 2 phrases) issue de l'extrait 4.
-   - "explanation" : repère pédagogique issu de l'extrait 4.
+   - "prompt" : question recto directe en une seule phrase portant sur un fait précis de l'extrait 4.
+   - "flashcardBack" : réponse verso exacte et concise (1 à 2 phrases) issue de l'extrait 4.
+   - "explanation" : repère pédagogique issu de l'extrait 4.`;
+
+    const prompt = `${chapterFocus}${freshnessBlock}${avoidBlock}Produis l'objet JSON ("qcu", "qcm", "qroc", "flashcard") à partir de ces quatre extraits :
 
 EXTRAIT 1 (pour qcu) [${qcuChunk.ueCode} · ${qcuChunk.chapterTitle}]:
 ${ex1}
@@ -1472,8 +1475,12 @@ ${ex4}`;
         system: systemPrompt,
         prompt,
         format: REVISION_ENRICHMENT_SCHEMA as unknown,
+        keep_alive: OLLAMA_KEEP_ALIVE,
         stream: false,
-        options: getOllamaInferenceOptions({ num_predict: 1800 }),
+        options: getOllamaInferenceOptions({
+          num_predict: 1400,
+          repeat_penalty: 1.12,
+        }),
       };
 
       let res = await ollamaPostJson<{ response?: string }>(
@@ -2148,6 +2155,60 @@ export async function getOrGenerateSharedDailyQuiz(options?: {
   return task;
 }
 
+export interface SharedDailyQuizTodayStatus {
+  dateKey: string;
+  readyForToday: boolean;
+  ueCode: string | null;
+  ueTitle: string | null;
+  totalQuestions: number;
+  generatedByAi: boolean;
+  generatedAt: string | null;
+}
+
+export async function getSharedDailyQuizMetaForToday(): Promise<SharedDailyQuizTodayStatus> {
+  await ensureRevisionSchema();
+  const dateKey = getLocalDateKey();
+  const rows = await prisma.$queryRaw<
+    Array<{
+      dateKey: string;
+      ueCode: string | null;
+      ueTitle: string | null;
+      totalQuestions: number;
+      generatedByAi: boolean;
+      generatedAt: Date | string;
+    }>
+  >`
+    SELECT "dateKey", "ueCode", "ueTitle", "totalQuestions", "generatedByAi", "generatedAt"
+    FROM "SharedDailyQuiz"
+    WHERE "dateKey" = ${dateKey}
+    LIMIT 1
+  `;
+  const row = rows[0];
+  if (!row) {
+    return {
+      dateKey,
+      readyForToday: false,
+      ueCode: null,
+      ueTitle: null,
+      totalQuestions: 0,
+      generatedByAi: false,
+      generatedAt: null,
+    };
+  }
+  return {
+    dateKey: row.dateKey,
+    readyForToday: Number(row.totalQuestions || 0) > 0,
+    ueCode: row.ueCode || null,
+    ueTitle: row.ueTitle || null,
+    totalQuestions: Number(row.totalQuestions || 0),
+    generatedByAi: Boolean(row.generatedByAi),
+    generatedAt:
+      row.generatedAt instanceof Date
+        ? row.generatedAt.toISOString()
+        : String(row.generatedAt),
+  };
+}
+
 export async function runScheduled6AmDailyQuizGeneration(options?: {
   force?: boolean;
 }): Promise<{
@@ -2157,6 +2218,11 @@ export async function runScheduled6AmDailyQuizGeneration(options?: {
   generatedByAi: boolean;
   preparedSessions: number;
 } | null> {
+  const settings = await getSystemSettings();
+  if (!settings.dailyQuizEnabled) {
+    return null;
+  }
+
   const shared = await getOrGenerateSharedDailyQuiz({
     forceRegenerate: options?.force,
   });

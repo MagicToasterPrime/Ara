@@ -111,6 +111,7 @@ interface SharedQuizMeta {
 }
 
 interface RevisionsPayload {
+  dailyQuizGlobalEnabled?: boolean;
   userState: UserRevisionState;
   todayKey: string;
   hasCourseContent: boolean;
@@ -235,6 +236,7 @@ export default function RevisionsPage() {
     setAnswers((prev) => ({ ...prev, [questionId]: val }));
   }
 
+  const dailyQuizGlobalEnabled = data?.dailyQuizGlobalEnabled ?? true;
   const userState = data?.userState;
   const sessionData = data?.todaySession;
   const sharedMeta = data?.sharedQuizMeta || null;
@@ -269,30 +271,36 @@ export default function RevisionsPage() {
             </p>
           </div>
 
-          {userState && (
-            <button
-              type="button"
-              disabled={busy}
-              onClick={() =>
-                postAction({
-                  action: "TOGGLE",
-                  enabled: !userState.revisionEnabled,
-                })
-              }
-              className={`inline-flex items-center gap-2 border px-4 py-2 font-mono text-xs uppercase tracking-wider transition-colors disabled:opacity-50 ${
-                userState.revisionEnabled
-                  ? "border-forest bg-forest/10 font-semibold text-forest hover:bg-forest/20"
-                  : "border-ink bg-ink text-card hover:bg-ink/90"
-              }`}
-            >
-              <Power className="h-3.5 w-3.5" />
-              <span>
-                {userState.revisionEnabled
-                  ? "RÉVISIONS JOURNALIÈRES : ACTIVÉES"
-                  : "ACTIVER LES RÉVISIONS JOURNALIÈRES"}
+          {userState &&
+            (dailyQuizGlobalEnabled ? (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() =>
+                  postAction({
+                    action: "TOGGLE",
+                    enabled: !userState.revisionEnabled,
+                  })
+                }
+                className={`inline-flex items-center gap-2 border px-4 py-2 font-mono text-xs uppercase tracking-wider transition-colors disabled:opacity-50 ${
+                  userState.revisionEnabled
+                    ? "border-forest bg-forest/10 font-semibold text-forest hover:bg-forest/20"
+                    : "border-ink bg-ink text-card hover:bg-ink/90"
+                }`}
+              >
+                <Power className="h-3.5 w-3.5" />
+                <span>
+                  {userState.revisionEnabled
+                    ? "RÉVISIONS JOURNALIÈRES : ACTIVÉES"
+                    : "ACTIVER LES RÉVISIONS JOURNALIÈRES"}
+                </span>
+              </button>
+            ) : (
+              <span className="inline-flex items-center gap-2 border border-carmine/40 bg-carmine/10 px-4 py-2 font-mono text-xs font-semibold uppercase tracking-wider text-carmine">
+                <Power className="h-3.5 w-3.5" />
+                <span>QUIZ JOURNALIER EN PAUSE (ADMIN)</span>
               </span>
-            </button>
-          )}
+            ))}
         </div>
 
         {error && (
@@ -364,7 +372,9 @@ export default function RevisionsPage() {
                   userState.completedToday ? "text-forest" : "text-ink"
                 }`}
               >
-                {userState.completedToday
+                {!dailyQuizGlobalEnabled
+                  ? "EN PAUSE (ADMIN)"
+                  : userState.completedToday
                   ? "VALIDÉE AUJOURD'HUI"
                   : userState.revisionEnabled
                   ? "EN ATTENTE"
@@ -382,7 +392,36 @@ export default function RevisionsPage() {
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
             {/* Left 8 Columns: Daily Quiz Engine */}
             <section className="space-y-4 lg:col-span-8">
-              {!userState?.revisionEnabled ? (
+              {!dailyQuizGlobalEnabled ? (
+                <div
+                  className="border border-border bg-card p-8"
+                  style={{ borderTop: "3px solid #C83E4D" }}
+                >
+                  <p className="font-mono text-xs font-semibold uppercase tracking-wider text-carmine">
+                    QUIZ JOURNALIER MOMENTANÉMENT DÉSACTIVÉ
+                  </p>
+                  <h2 className="mt-2 text-lg font-bold uppercase tracking-tight text-ink">
+                    SÉANCE QUOTIDIENNE EN PAUSE PAR L&apos;ADMINISTRATION
+                  </h2>
+                  <p className="mt-2 text-sm leading-relaxed text-stone">
+                    Le Responsable d&apos;Année a temporairement désactivé le
+                    quiz journalier de la promotion (par exemple pendant une
+                    phase de préparation intensive de contenus IA). Votre record
+                    personnel, vos points cumulés, votre Carnet d&apos;erreurs
+                    (SRS) et les Quiz communautaires ci-dessous restent
+                    pleinement accessibles.
+                  </p>
+                  {isYearAdmin && (
+                    <Link
+                      href="/admin"
+                      className="mt-5 inline-flex items-center gap-2 border border-ink bg-ink px-5 py-2.5 font-mono text-xs uppercase tracking-wider text-card hover:bg-ink/90"
+                    >
+                      <Power className="h-4 w-4" />
+                      <span>RÉACTIVER DANS L&apos;ESPACE ADMIN</span>
+                    </Link>
+                  )}
+                </div>
+              ) : !userState?.revisionEnabled ? (
                 <div
                   className="border border-border bg-card p-8"
                   style={{ borderTop: "3px solid #D99B26" }}

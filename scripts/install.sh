@@ -142,6 +142,8 @@ OLLAMA_HOST="http://127.0.0.1:11434"
 OLLAMA_MODEL="gemma3:12b"
 OLLAMA_EMBED_MODEL="nomic-embed-text"
 OLLAMA_NUM_THREAD="4"
+OLLAMA_NUM_CTX="6144"
+OLLAMA_KEEP_ALIVE="30m"
 OLLAMA_TIMEOUT_MS="1200000"
 UPLOAD_DIR="./storage/uploads"
 PORT="3000"
@@ -197,7 +199,8 @@ if systemctl list-unit-files | grep -q "ollama.service"; then
 [Service]
 Environment="OLLAMA_HOST=127.0.0.1:11434"
 Environment="OLLAMA_NUM_PARALLEL=1"
-Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=2"
+Environment="OLLAMA_KEEP_ALIVE=30m"
 EOF
   systemctl daemon-reload
   systemctl enable --now ollama

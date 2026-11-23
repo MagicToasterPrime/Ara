@@ -104,18 +104,25 @@ main() {
   if ! grep -q '^OLLAMA_NUM_THREAD=' "${APP_DIR}/.env"; then
     echo 'OLLAMA_NUM_THREAD="4"' >> "${APP_DIR}/.env"
   fi
+  if ! grep -q '^OLLAMA_NUM_CTX=' "${APP_DIR}/.env"; then
+    echo 'OLLAMA_NUM_CTX="6144"' >> "${APP_DIR}/.env"
+  fi
+  if ! grep -q '^OLLAMA_KEEP_ALIVE=' "${APP_DIR}/.env"; then
+    echo 'OLLAMA_KEEP_ALIVE="30m"' >> "${APP_DIR}/.env"
+  fi
   if ! grep -q '^OLLAMA_TIMEOUT_MS=' "${APP_DIR}/.env"; then
     echo 'OLLAMA_TIMEOUT_MS="1200000"' >> "${APP_DIR}/.env"
   fi
 
-  # Protection concurrence = 1 côté systemd Ollama
+  # Optimisation Ollama : concurrence = 1 (CPU dédié), mais 2 modèles résidents (LLM + embed) pour éviter les rechargements disque
   if systemctl list-unit-files | grep -q "ollama.service"; then
     mkdir -p /etc/systemd/system/ollama.service.d
     cat > /etc/systemd/system/ollama.service.d/override.conf <<'EOF'
 [Service]
 Environment="OLLAMA_HOST=127.0.0.1:11434"
 Environment="OLLAMA_NUM_PARALLEL=1"
-Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_MAX_LOADED_MODELS=2"
+Environment="OLLAMA_KEEP_ALIVE=30m"
 EOF
     systemctl daemon-reload
     systemctl restart ollama || true

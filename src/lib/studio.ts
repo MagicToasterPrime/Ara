@@ -15,6 +15,7 @@ import {
   getOllamaConfig,
   getOllamaInferenceOptions,
   getParisHour,
+  OLLAMA_KEEP_ALIVE,
   OLLAMA_STRICT_SYSTEM_RULE,
   OLLAMA_TIMEOUT_MS,
   ollamaPostJson,
@@ -40,6 +41,11 @@ import {
   type RevisionQuestion,
 } from "@/lib/revisions";
 import { resolveDocumentFilePath } from "@/lib/storage";
+import {
+  getSystemSettings,
+  isContinuous24hModeCached,
+  type SystemSettings,
+} from "@/lib/system-settings";
 
 export type StudioArtifactKind =
   | "SVG_DIAGRAM"
@@ -941,7 +947,7 @@ async function callOllamaJson<T>(
   const schemaOrJson = options?.format ?? "json";
 
   return withOllamaLock(async () => {
-    const health = await checkOllamaHealth();
+    const health = await checkOllamaHealth({ useCache: true });
     if (!health.online) return null;
 
     const { model } = getOllamaConfig();
@@ -952,8 +958,12 @@ async function callOllamaJson<T>(
         system: systemPrompt,
         prompt,
         format: schemaOrJson,
+        keep_alive: OLLAMA_KEEP_ALIVE,
         stream: false,
-        options: getOllamaInferenceOptions({ num_predict: numPredict }),
+        options: getOllamaInferenceOptions({
+          num_predict: numPredict,
+          repeat_penalty: 1.12,
+        }),
       };
 
       let res = await ollamaPostJson<{ response?: string }>(
@@ -1076,16 +1086,18 @@ async function callOllamaText(
     timeoutMs?: number;
     numPredict?: number;
     temperature?: number;
+    shouldStop?: () => boolean;
   }
 ): Promise<string | null> {
   const timeoutMs = Math.max(options?.timeoutMs ?? OLLAMA_TIMEOUT_MS, OLLAMA_TIMEOUT_MS);
-  const numPredict = options?.numPredict ?? 1800;
+  const numPredict = options?.numPredict ?? 1700;
   const systemPrompt = options?.system
     ? `${options.system}\n${OLLAMA_STRICT_SYSTEM_RULE}`
     : OLLAMA_STRICT_SYSTEM_RULE;
 
   return withOllamaLock(async () => {
-    const health = await checkOllamaHealth();
+    if (options?.shouldStop?.()) return null;
+    const health = await checkOllamaHealth({ useCache: true });
     if (!health.online) return null;
 
     const { model } = getOllamaConfig();
@@ -1098,6 +1110,7 @@ async function callOllamaText(
           model,
           system: systemPrompt,
           prompt,
+          keep_alive: OLLAMA_KEEP_ALIVE,
           stream: true,
           options: getOllamaInferenceOptions({
             temperature: options?.temperature,
@@ -1113,6 +1126,10 @@ async function callOllamaText(
       const decoder = new TextDecoder();
       let buffer = "";
       for (;;) {
+        if (options?.shouldStop?.()) {
+          res.abort();
+          return null;
+        }
         const { done, value } = await reader.read();
         if (done) break;
         buffer += decoder.decode(value, { stream: true });
@@ -1133,6 +1150,7 @@ async function callOllamaText(
       }
       return acc.trim() || null;
     } catch (err) {
+      if (options?.shouldStop?.()) return null;
       console.warn("[Studio] Ollama text stream warning:", err);
       return acc.trim() || null;
     }
@@ -1219,10 +1237,23 @@ function splitSingleOversizedPiece(
   return parts;
 }
 
+function stripSequentialChunkOverlap(
+  prevText: string,
+  nextText: string
+): string {
+  const maxCheck = Math.min(160, prevText.length, nextText.length);
+  for (let len = maxCheck; len >= 24; len -= 1) {
+    if (nextText.startsWith(prevText.slice(prevText.length - len))) {
+      return nextText.slice(len).trimStart();
+    }
+  }
+  return nextText;
+}
+
 /**
  * Splits the ENTIRE selected course (all chunks in document & page order) into consecutive
  * context-window-safe segments processed sequentially one after another so large handouts
- * NEVER exceed num_ctx (8192) or suffer silent truncation.
+ * NEVER exceed num_ctx (6144) or suffer silent truncation.
  */
 function splitChunksIntoContextWindows(
   chunks: SourceChunk[],
@@ -1250,8 +1281,20 @@ function splitChunksIntoContextWindows(
   );
 
   const pieces: Array<{ chunk: SourceChunk; text: string; words: number }> = [];
+  let prevChunkRef: SourceChunk | null = null;
+  let prevCleaned = "";
   for (const chunk of sorted) {
-    const cleaned = cleanChunkTextForAi(chunk.content);
+    let cleaned = cleanChunkTextForAi(chunk.content);
+    if (
+      prevChunkRef &&
+      prevChunkRef.documentId === chunk.documentId &&
+      prevChunkRef.pageNumber === chunk.pageNumber &&
+      prevCleaned
+    ) {
+      cleaned = stripSequentialChunkOverlap(prevCleaned, cleaned);
+    }
+    prevChunkRef = chunk;
+    prevCleaned = cleanChunkTextForAi(chunk.content);
     if (cleaned.length < 20) continue;
     const subTexts = splitSingleOversizedPiece(cleaned, maxWordsCap, maxCharsCap);
     for (const sub of subTexts) {
@@ -1737,7 +1780,7 @@ ${contextText}`,
         system:
           "Tu es Spix, professeur universitaire vétérinaire spécialisé dans la synthèse visuelle scientifique.",
         format: SVG_DIAGRAM_SCHEMA,
-        numPredict: 2000,
+        numPredict: 1400,
       }
     );
 
@@ -1831,16 +1874,12 @@ ${contextText}`,
   }
 
   if (kind === "FLASHCARDS") {
-    // Split large handouts into sequential context-safe windows (never overflowing num_ctx = 8192)
+    // Pack consecutive pages into dense context-safe windows (zero artificial over-splitting)
     const windows = fullCourseMode
       ? splitChunksIntoContextWindows(orderedChunks, {
-          maxWords: 1600,
-          maxChars: 9500,
-          maxWindows: 30,
-          targetMinWindows: Math.min(
-            10,
-            Math.max(1, Math.ceil(orderedChunks.length / 4))
-          ),
+          maxWords: 1750,
+          maxChars: 10500,
+          maxWindows: 25,
         })
       : splitChunksIntoContextWindows(orderedChunks.slice(0, 12), {
           maxWords: 1800,
@@ -1849,13 +1888,20 @@ ${contextText}`,
         });
 
     const targetCount = fullCourseMode
-      ? Math.min(100, Math.max(60, windows.length * 5))
+      ? Math.min(72, Math.max(18, windows.length * 10))
       : 10;
     const title =
       params.title?.trim() ||
       (fullCourseMode
         ? `Flashcards complètes — ${chunks[0]?.documentTitle || defaultTopic}`
         : `Flashcards ciblées : ${defaultTopic}`);
+
+    const flashcardsSystemPrompt = `Tu es un créateur de flashcards pédagogiques universitaires vétérinaires exigeant et rigoureux.
+RÈGLES JSON STRICTES (objet contenant le tableau "cards") :
+- "front" : une question directe, courte et autonome en une seule phrase (10 à 22 mots) portant sur une valeur exacte, un mécanisme, un rôle anatomique/physiologique ou une distinction réelle du document. Interdit de formuler une question méta sur la page ou de recopier une phrase brute.
+- "back" : la réponse exacte, nette et concise en 1 à 2 phrases en mettant le terme ou la valeur clé en gras au début.
+- "tag" : une catégorie thématique courte en majuscules adaptée à la discipline.
+- "sourcePage" : l'entier correspondant au numéro de page exact [P.X] indiqué dans les extraits.`;
 
     const cards: FlashcardItem[] = [];
     const seenFronts = new Set<string>();
@@ -1880,20 +1926,13 @@ ${contextText}`,
         `Génère exactement ${desiredCount} flashcards de révision active fondées uniquement sur les faits, valeurs chiffrées, définitions, mécanismes et critères présents dans les extraits ci-dessous.
 ${passLabel}
 ${customContextBlock}${avoidHint}
-DESCRIPTION DES CHAMPS JSON ATTENDUS (objet contenant le tableau "cards") :
-- "front" : une question directe, courte et autonome en une seule phrase (10 à 22 mots) portant sur une valeur exacte, un mécanisme, un rôle anatomique/physiologique ou une distinction réelle du document. Interdit de formuler une question méta sur la page ou de recopier une phrase brute.
-- "back" : la réponse exacte, nette et concise en 1 à 2 phrases en mettant le terme ou la valeur clé en gras au début.
-- "tag" : une catégorie thématique courte en majuscules adaptée à la discipline (ex. catégorie scientifique pertinente du passage).
-- "sourcePage" : l'entier correspondant au numéro de page exact [P.X] indiqué dans les extraits.
-
 EXTRAITS DU COURS (${win.pageRange}) :
 ${win.text}`,
         {
-          system:
-            "Tu es un créateur de flashcards pédagogiques universitaires vétérinaires exigeant et rigoureux.",
+          system: flashcardsSystemPrompt,
           format: FLASHCARDS_SCHEMA,
           arrayKeys: ["cards"],
-          numPredict: 2600,
+          numPredict: Math.min(2200, Math.max(700, desiredCount * 160)),
         }
       );
 
@@ -1937,7 +1976,7 @@ ${win.text}`,
     };
 
     const perWindowCount = fullCourseMode
-      ? Math.max(4, Math.ceil(targetCount / Math.max(1, windows.length)))
+      ? Math.max(8, Math.ceil(targetCount / Math.max(1, windows.length)))
       : 10;
 
     for (let sIdx = 0; sIdx < windows.length; sIdx += 1) {
@@ -1956,22 +1995,25 @@ ${win.text}`,
       await runFlashcardPass(win, scopeHint, perWindowCount);
     }
 
-    // AI top-up pass if Ollama is responsive and slightly below targetCount
-    if (anyAiUsed && cards.length < targetCount && !shouldStop?.() && windows.length > 0) {
-      for (let extra = 0; extra < 2 && cards.length < targetCount; extra += 1) {
-        const deficit = Math.min(10, targetCount - cards.length);
-        const topUpWin = windows[extra % windows.length];
-        const avoidList = cards
-          .slice(-8)
-          .map((c) => c.front)
-          .join(" | ");
-        await runFlashcardPass(
-          topUpWin,
-          `COMPLÉMENT (${deficit} nouvelles flashcards distinctes) : explore d'autres faits, chiffres ou mécanismes présents dans le texte non encore traités.`,
-          deficit,
-          avoidHintFromList(avoidList)
-        );
-      }
+    // Single AI top-up pass only if significantly below targetCount (< 75%)
+    if (
+      anyAiUsed &&
+      cards.length < Math.ceil(targetCount * 0.75) &&
+      !shouldStop?.() &&
+      windows.length > 0
+    ) {
+      const deficit = Math.min(10, targetCount - cards.length);
+      const topUpWin = windows[0];
+      const avoidList = cards
+        .slice(-8)
+        .map((c) => c.front)
+        .join(" | ");
+      await runFlashcardPass(
+        topUpWin,
+        `COMPLÉMENT (${deficit} nouvelles flashcards distinctes) : explore d'autres faits, chiffres ou mécanismes présents dans le texte non encore traités.`,
+        deficit,
+        avoidHintFromList(avoidList)
+      );
     }
 
     // Emergency factual extractor fallback only if still incomplete (never raw poly chunks)
@@ -2003,16 +2045,12 @@ ${win.text}`,
   }
 
   if (kind === "QUIZ") {
-    // Split large handouts into sequential context-safe windows (never overflowing num_ctx = 8192)
+    // Pack consecutive pages into dense context-safe windows (zero artificial over-splitting)
     const windows = fullCourseMode
       ? splitChunksIntoContextWindows(orderedChunks, {
-          maxWords: 1600,
-          maxChars: 9500,
-          maxWindows: 25,
-          targetMinWindows: Math.min(
-            10,
-            Math.max(1, Math.ceil(orderedChunks.length / 4))
-          ),
+          maxWords: 1750,
+          maxChars: 10500,
+          maxWindows: 20,
         })
       : splitChunksIntoContextWindows(orderedChunks.slice(0, 12), {
           maxWords: 1800,
@@ -2021,13 +2059,25 @@ ${win.text}`,
         });
 
     const targetCount = fullCourseMode
-      ? Math.min(60, Math.max(30, windows.length * 3))
+      ? Math.min(45, Math.max(12, windows.length * 7))
       : 6;
     const title =
       params.title?.trim() ||
       (fullCourseMode
         ? `Quiz complet (${targetCount} Q) — ${chunks[0]?.documentTitle || defaultTopic}`
         : `Quiz ciblé : ${defaultTopic}`);
+
+    const quizSystemPrompt = `Tu es un concepteur d'examens universitaires vétérinaires rigoureux.
+RÈGLES JSON STRICTES (objet contenant le tableau "questions") :
+Chaque élément de "questions" doit contenir :
+- "type" : "QCU" (majoritaire, une seule bonne réponse), "QCM" (2 ou 3 bonnes réponses) ou "QROC" (question ouverte à réponse courte exacte).
+- "prompt" : énoncé interrogatif direct, autonome et contextualisé portant sur un fait précis du cours (interdit de recopier des phrases du polycopié en propositions ou de demander quelle phrase figure dans le cours).
+- "options" : pour QCU et QCM, un tableau de exactement 4 propositions courtes (1 à 10 mots chacune), homogènes entre elles, plausibles et sans préfixe alphabétique ; pour QROC, un tableau vide.
+- "correctIndices" : pour QCU, un tableau contenant l'unique indice entier (0 à 3) de la bonne réponse en variant la position ; pour QCM, 2 ou 3 indices entiers (0 à 3) ; pour QROC, un tableau vide.
+- "correctAnswer" : pour QROC uniquement, la réponse exacte attendue en 1 à 4 mots tirée du cours ; chaîne vide pour QCU/QCM.
+- "acceptedKeywords" : pour QROC uniquement, liste des mots-clés scientifiques exacts et synonymes acceptés tirés du cours ; tableau vide pour QCU/QCM.
+- "explanation" : justification pédagogique concise rédigée à partir des faits précis du cours.
+- "sourcePage" : entier correspondant au numéro de page exact [P.X] figurant dans les extraits.`;
 
     const questions: RevisionQuestion[] = [];
     const seenPrompts = new Set<string>();
@@ -2058,25 +2108,13 @@ ${win.text}`,
         `Génère exactement ${batchSize} questions d'examen originales et précises testant les valeurs, seuils, définitions et mécanismes scientifiques extraits du cours ci-dessous.
 ${passLabel}
 ${customContextBlock}${avoidHint}
-DESCRIPTION DES CHAMPS JSON ATTENDUS (objet contenant le tableau "questions") :
-Chaque élément de "questions" doit contenir :
-- "type" : "QCU" (majoritaire, une seule bonne réponse), "QCM" (2 ou 3 bonnes réponses) ou "QROC" (question ouverte à réponse courte exacte).
-- "prompt" : énoncé interrogatif direct, autonome et contextualisé portant sur un fait précis du cours (interdit de recopier des phrases du polycopié en propositions ou de demander quelle phrase figure dans le cours).
-- "options" : pour QCU et QCM, un tableau de exactement 4 propositions courtes (1 à 10 mots chacune), homogènes entre elles, plausibles et sans préfixe alphabétique ; pour QROC, un tableau vide.
-- "correctIndices" : pour QCU, un tableau contenant l'unique indice entier (0 à 3) de la bonne réponse en variant la position ; pour QCM, 2 ou 3 indices entiers (0 à 3) ; pour QROC, un tableau vide.
-- "correctAnswer" : pour QROC uniquement, la réponse exacte attendue en 1 à 4 mots tirée du cours ; chaîne vide pour QCU/QCM.
-- "acceptedKeywords" : pour QROC uniquement, liste des mots-clés scientifiques exacts et synonymes acceptés tirés du cours ; tableau vide pour QCU/QCM.
-- "explanation" : justification pédagogique concise rédigée à partir des faits précis du cours.
-- "sourcePage" : entier correspondant au numéro de page exact [P.X] figurant dans les extraits.
-
 EXTRAITS DU COURS (${win.pageRange}) :
 ${win.text}`,
         {
-          system:
-            "Tu es un concepteur d'examens universitaires vétérinaires rigoureux.",
+          system: quizSystemPrompt,
           format: STUDIO_QUIZ_SCHEMA,
           arrayKeys: ["questions"],
-          numPredict: 2600,
+          numPredict: Math.min(2400, Math.max(800, batchSize * 240)),
         }
       );
 
@@ -2212,7 +2250,7 @@ ${win.text}`,
     };
 
     const batchSizePerWindow = fullCourseMode
-      ? Math.max(3, Math.ceil(targetCount / Math.max(1, windows.length)))
+      ? Math.max(6, Math.ceil(targetCount / Math.max(1, windows.length)))
       : 6;
 
     for (let sIdx = 0; sIdx < windows.length; sIdx += 1) {
@@ -2231,26 +2269,25 @@ ${win.text}`,
       await runQuizPass(win, scopeHint, batchSizePerWindow);
     }
 
-    // AI top-up pass if Ollama is responsive and slightly below targetCount
-    if (anyAiUsed && questions.length < targetCount && !shouldStop?.() && windows.length > 0) {
-      for (
-        let extra = 0;
-        extra < 2 && questions.length < targetCount;
-        extra += 1
-      ) {
-        const deficit = Math.min(6, targetCount - questions.length);
-        const topUpWin = windows[extra % windows.length];
-        const avoidList = questions
-          .slice(-6)
-          .map((q) => q.prompt)
-          .join(" | ");
-        await runQuizPass(
-          topUpWin,
-          `COMPLÉMENT (${deficit} nouvelles questions distinctes) : interroge d'autres valeurs, cas ou notions non encore posés.`,
-          deficit,
-          avoidHintFromList(avoidList)
-        );
-      }
+    // Single AI top-up pass only if significantly below targetCount (< 75%)
+    if (
+      anyAiUsed &&
+      questions.length < Math.ceil(targetCount * 0.75) &&
+      !shouldStop?.() &&
+      windows.length > 0
+    ) {
+      const deficit = Math.min(6, targetCount - questions.length);
+      const topUpWin = windows[0];
+      const avoidList = questions
+        .slice(-6)
+        .map((q) => q.prompt)
+        .join(" | ");
+      await runQuizPass(
+        topUpWin,
+        `COMPLÉMENT (${deficit} nouvelles questions distinctes) : interroge d'autres valeurs, cas ou notions non encore posés.`,
+        deficit,
+        avoidHintFromList(avoidList)
+      );
     }
 
     // Emergency factual/value fallback (zero raw poly paragraph copying)
@@ -2303,18 +2340,9 @@ ${win.text}`,
   const seenPitfalls = new Set<string>();
   let anyAiUsed = false;
 
-  const buildSummaryPrompt = (
-    winText: string,
-    pageRange: string,
-    wIdx: number,
-    totalWindows: number
-  ) => {
-    const scope = fullCourseMode
-      ? `Tu traites la PARTIE ${wIdx + 1}/${totalWindows} du polycopié (pages ${pageRange}). Couvre de façon exhaustive toutes les notions scientifiques présentes dans ces pages.`
-      : "Réponds précisément à la demande de l'étudiant à partir de ces extraits.";
+  // Static system prompt kept identical across all windows & documents for Ollama KV-cache prefix reuse
+  const summarySystemPrompt = `Tu es un major de promotion vétérinaire qui rédige une fiche de révision universitaire exhaustive, rigoureuse et strictement fidèle aux extraits de cours fournis.
 
-    return `${scope}
-${customContextBlock}
 RÈGLES IMPÉRATIVES :
 1. Conserve 100 % des notions scientifiques réelles du texte : définitions, molécules, hormones, récepteurs, mécanismes, organes, classifications, abréviations expliquées, valeurs chiffrées et exceptions.
 2. Ignore totalement les bruits de diapositives : numéros de pages isolés, questions orales de l'enseignant, références bibliographiques et en-têtes répétés.
@@ -2327,14 +2355,23 @@ SYNTAXE MARKDOWN OBLIGATOIRE (Markdown pur, sans JSON) :
 - Utilise des citations Markdown (">") avec l'emoji 💡 pour une définition exacte et l'emoji ⚠️ pour une règle majeure ou un seuil chiffré tiré du cours.
 - Rédige au moins 4 puces Markdown ("-") détaillées par sous-partie, en mettant en gras le nom du concept réel suivi de deux-points et de son explication complète (avec sous-puces indentées de deux espaces pour les exceptions ou précisions).
 - Ajoute un tableau Markdown uniquement si le cours compare explicitement plusieurs entités réelles.
-- Termine par une ligne "PIÈGES:" suivie d'une liste à puces des distinctions et pièges réels issus du passage.
+- Termine par une ligne "PIÈGES:" suivie d'une liste à puces des distinctions et pièges réels issus du passage.`;
+
+  const buildSummaryPrompt = (
+    winText: string,
+    pageRange: string,
+    wIdx: number,
+    totalWindows: number
+  ) => {
+    const scope = fullCourseMode
+      ? `PARTIE ${wIdx + 1}/${totalWindows} du polycopié (pages ${pageRange}) : rédige la fiche complète de ces pages.`
+      : "Réponds précisément à la demande de l'étudiant à partir de ces extraits.";
+
+    return `${scope}${customContextBlock ? `\n${customContextBlock}` : ""}
 
 EXTRAITS DU COURS (pages ${pageRange}) :
 ${winText}`;
   };
-
-  const summarySystemPrompt =
-    "Tu es un major de promotion vétérinaire qui rédige une fiche de révision universitaire exhaustive, rigoureuse et strictement fidèle aux extraits de cours fournis.";
 
   for (let wIdx = 0; wIdx < windows.length; wIdx += 1) {
     if (shouldStop?.()) break;
@@ -2363,8 +2400,9 @@ ${winText}`;
       buildSummaryPrompt(win.text, win.pageRange, wIdx, windows.length),
       {
         system: summarySystemPrompt,
-        numPredict: 1800,
+        numPredict: 1700,
         timeoutMs: OLLAMA_TIMEOUT_MS,
+        shouldStop,
       }
     );
     let parsed = md ? parseSummaryMarkdown(md) : null;
@@ -2377,8 +2415,9 @@ ${winText}`;
         buildSummaryPrompt(condensed, win.pageRange, wIdx, windows.length),
         {
           system: summarySystemPrompt,
-          numPredict: 1400,
+          numPredict: 1300,
           timeoutMs: OLLAMA_TIMEOUT_MS,
+          shouldStop,
         }
       );
       parsed = md ? parseSummaryMarkdown(md) : null;
@@ -2675,7 +2714,7 @@ export interface BackgroundQueueSnapshot {
   worker: {
     isRunning: boolean;
     stopRequested: boolean;
-    mode: "IDLE" | "NIGHTLY_AUTO" | "ADMIN_MANUAL";
+    mode: "IDLE" | "NIGHTLY_AUTO" | "ADMIN_MANUAL" | "CONTINUOUS_24H";
     currentPhase: "IDLE" | "INDEXING" | "AI_GENERATION";
     currentTaskLabel: string | null;
     currentItemProgressPercent: number;
@@ -2687,6 +2726,7 @@ export interface BackgroundQueueSnapshot {
     lastRunSummary: string | null;
     nextNightlyWindowLabel: string;
   };
+  settings: SystemSettings;
   eta: {
     indexingEtaSeconds: number;
     aiEtaSeconds: number;
@@ -2711,7 +2751,7 @@ export interface BackgroundQueueSnapshot {
 interface InternalBackgroundQueueState {
   isRunning: boolean;
   stopRequested: boolean;
-  mode: "IDLE" | "NIGHTLY_AUTO" | "ADMIN_MANUAL";
+  mode: "IDLE" | "NIGHTLY_AUTO" | "ADMIN_MANUAL" | "CONTINUOUS_24H";
   currentPhase: "IDLE" | "INDEXING" | "AI_GENERATION";
   currentDocumentId: string | null;
   currentAiKind: "SUMMARY" | "FLASHCARDS" | "QUIZ" | null;
@@ -2771,11 +2811,23 @@ export function requestStopBackgroundQueue(): void {
   }
 }
 
+export function requestStopContinuous24hIfOutsideOffPeak(): void {
+  const state = getQueueState();
+  if (
+    state.isRunning &&
+    state.mode === "CONTINUOUS_24H" &&
+    !isWithinOffPeakWindow()
+  ) {
+    state.stopRequested = true;
+  }
+}
+
 export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnapshot> {
   await Promise.all([ensureStudioSchema(), ensureDocumentStatusSchema()]);
   const state = getQueueState();
 
-  const [docs, docStatusMap, chunkStatsRows, publicArtifactRows] = await Promise.all([
+  const [docs, docStatusMap, chunkStatsRows, publicArtifactRows, settings] =
+    await Promise.all([
     prisma.document.findMany({
       orderBy: { createdAt: "asc" },
       select: {
@@ -2815,6 +2867,7 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
         contentJson: true,
       },
     }),
+    getSystemSettings(),
   ]);
 
   const chunkStatsMap = new Map<
@@ -2966,10 +3019,11 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
   }
 
   const nowHour = getParisHour();
-  const nextNightlyWindowLabel =
-    nowHour >= 0 && nowHour < 7
-      ? "FENÊTRE HEURES CREUSES ACTIVE (00H00–07H00)"
-      : "PROCHAINE FENÊTRE AUTO : 00H00–07H00";
+  const nextNightlyWindowLabel = settings.continuousGeneration24h
+    ? "MODE CONTINU 24H/24 ACTIF (PRÉPARATION INTENSIVE)"
+    : nowHour >= 0 && nowHour < 7
+    ? "FENÊTRE HEURES CREUSES ACTIVE (00H00–07H00)"
+    : "PROCHAINE FENÊTRE AUTO : 00H00–07H00";
 
   return {
     worker: {
@@ -2987,6 +3041,7 @@ export async function getBackgroundQueueSnapshot(): Promise<BackgroundQueueSnaps
       lastRunSummary: state.lastRunSummary,
       nextNightlyWindowLabel,
     },
+    settings,
     eta: {
       indexingEtaSeconds,
       aiEtaSeconds,
@@ -3017,7 +3072,7 @@ function isWithinOffPeakWindow(): boolean {
 export async function runNightlyOffPeakStudyGeneration(options?: {
   force?: boolean;
   maxItems?: number;
-  mode?: "NIGHTLY_AUTO" | "ADMIN_MANUAL";
+  mode?: "NIGHTLY_AUTO" | "ADMIN_MANUAL" | "CONTINUOUS_24H";
   scope?: "ALL" | "INDEXING_ONLY" | "AI_ONLY";
   chapterId?: string;
   documentId?: string;
@@ -3039,24 +3094,15 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
     };
   }
 
-  const mode = options?.mode || (options?.force ? "ADMIN_MANUAL" : "NIGHTLY_AUTO");
   const scope = options?.scope || "ALL";
   const targetChapterId = options?.chapterId?.trim() || undefined;
   const targetDocumentId = options?.documentId?.trim() || undefined;
 
-  if (!options?.force && !isWithinOffPeakWindow()) {
-    return {
-      skipped: true,
-      reason: "outside-off-peak-hours",
-      indexedCount: 0,
-      generatedCount: 0,
-    };
-  }
-
   // Acquire lock synchronously before any async I/O so overlapping triggers cannot race
   state.isRunning = true;
   state.stopRequested = false;
-  state.mode = mode;
+  state.mode =
+    options?.mode || (options?.force ? "ADMIN_MANUAL" : "NIGHTLY_AUTO");
   state.currentPhase = "IDLE";
   state.currentDocumentId = null;
   state.currentAiKind = null;
@@ -3074,10 +3120,37 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
       ? options.maxItems
       : Number.POSITIVE_INFINITY;
 
-  const shouldAbort = () =>
-    state.stopRequested || (mode === "NIGHTLY_AUTO" && !isWithinOffPeakWindow());
-
   try {
+    const initialSettings = await getSystemSettings();
+    const effectiveMode: "NIGHTLY_AUTO" | "ADMIN_MANUAL" | "CONTINUOUS_24H" =
+      options?.mode ||
+      (options?.force
+        ? "ADMIN_MANUAL"
+        : initialSettings.continuousGeneration24h
+        ? "CONTINUOUS_24H"
+        : "NIGHTLY_AUTO");
+    state.mode = effectiveMode;
+
+    if (
+      !options?.force &&
+      effectiveMode !== "CONTINUOUS_24H" &&
+      !isWithinOffPeakWindow()
+    ) {
+      return {
+        skipped: true,
+        reason: "outside-off-peak-hours",
+        indexedCount: 0,
+        generatedCount: 0,
+      };
+    }
+
+    const shouldAbort = () =>
+      state.stopRequested ||
+      ((effectiveMode === "NIGHTLY_AUTO" ||
+        effectiveMode === "CONTINUOUS_24H") &&
+        !isContinuous24hModeCached() &&
+        !isWithinOffPeakWindow());
+
     const health = await checkOllamaHealth();
     if (!health.online) {
       return {
@@ -3105,8 +3178,10 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
         : 0;
 
     if (totalIdxPlanned === 0 && totalAiPlanned === 0) {
-      state.lastRunAt = new Date().toISOString();
-      state.lastRunSummary = "Aucun document ni contenu IA en attente.";
+      if (effectiveMode === "ADMIN_MANUAL" || !state.lastRunSummary) {
+        state.lastRunAt = new Date().toISOString();
+        state.lastRunSummary = "Aucun document ni contenu IA en attente.";
+      }
       return {
         skipped: false,
         reason: "nothing-pending",
@@ -3118,8 +3193,36 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
     state.currentTaskLabel = "Initialisation de la file...";
     state.totalItemsInRun = totalIdxPlanned + totalAiPlanned;
 
-    // Phase 1: Index ALL unindexed non-error documents strictly sequentially (one by one)
-    if (scope === "ALL" || scope === "INDEXING_ONLY") {
+    const MAX_CONTINUOUS_PASSES = 10;
+    let pass = 0;
+
+    while (!shouldAbort()) {
+      pass += 1;
+      let passIndexed = 0;
+      let passGenerated = 0;
+
+      if (pass > 1) {
+        const freshSettings = await getSystemSettings();
+        if (!freshSettings.continuousGeneration24h && !isWithinOffPeakWindow()) {
+          break;
+        }
+        const nextSnap = await getBackgroundQueueSnapshot();
+        const nextIdx =
+          scope === "ALL" || scope === "INDEXING_ONLY"
+            ? nextSnap.indexingQueue.filter(matchesTarget).length
+            : 0;
+        const nextAi =
+          scope === "ALL" || scope === "AI_ONLY"
+            ? nextSnap.aiContentQueue.filter(matchesTarget).length
+            : 0;
+        if (nextIdx === 0 && nextAi === 0) {
+          break;
+        }
+        state.totalItemsInRun = state.completedItemsInRun + nextIdx + nextAi;
+      }
+
+      // Phase 1: Index ALL unindexed non-error documents strictly sequentially (one by one)
+      if (scope === "ALL" || scope === "INDEXING_ONLY") {
       const [unindexedDocs, statusMap] = await Promise.all([
         prisma.document.findMany({
           where: {
@@ -3197,7 +3300,7 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
               state.currentItemProgressPercent = Math.round(
                 (done / Math.max(1, total)) * 100
               );
-              if (chunkMs > 20 && chunkMs < 60000) {
+              if (chunkMs >= 2 && chunkMs < 60000) {
                 state.avgMsPerChunk = Math.round(
                   state.avgMsPerChunk * 0.75 + chunkMs * 0.25
                 );
@@ -3207,6 +3310,7 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
 
           if (res.indexed) {
             indexedCount += 1;
+            passIndexed += 1;
           }
           if (!res.stopped) {
             state.completedItemsInRun += 1;
@@ -3340,6 +3444,7 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
                 });
               }
               generatedCount += 1;
+              passGenerated += 1;
             }
 
             state.completedItemsInRun += 1;
@@ -3351,6 +3456,16 @@ export async function runNightlyOffPeakStudyGeneration(options?: {
             state.completedItemsInRun += 1;
           }
         }
+      }
+    }
+
+      if (
+        (effectiveMode !== "CONTINUOUS_24H" && !isContinuous24hModeCached()) ||
+        pass >= MAX_CONTINUOUS_PASSES ||
+        generatedCount >= maxItems ||
+        (passIndexed === 0 && passGenerated === 0)
+      ) {
+        break;
       }
     }
 

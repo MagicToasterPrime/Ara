@@ -94,6 +94,7 @@ export function BulkPdfUploader({
     total: number;
     succeeded: number;
     failed: number;
+    continuousGeneration24h?: boolean;
   } | null>(null);
 
   const hasChapters = chapterGroups.some((g) => g.chapters.length > 0);
@@ -246,6 +247,7 @@ export function BulkPdfUploader({
         error?: string;
         document?: { id: string; title: string };
         scheduledNightly?: boolean;
+        continuousGeneration24h?: boolean;
         results?: ApiPerFileResult[];
         summary?: { total: number; succeeded: number; failed: number };
       };
@@ -291,7 +293,10 @@ export function BulkPdfUploader({
           succeeded: data.results.filter((r) => r.ok).length,
           failed: data.results.filter((r) => !r.ok).length,
         };
-        setBatchSummary(summary);
+        setBatchSummary({
+          ...summary,
+          continuousGeneration24h: Boolean(data.continuousGeneration24h),
+        });
 
         if (summary.succeeded > 0) {
           setSingleTitle("");
@@ -410,8 +415,10 @@ export function BulkPdfUploader({
           }`}
         >
           <span>
-            RÉSULTAT DU LOT : {batchSummary.succeeded}/{batchSummary.total} PRÊT(S)
-            POUR LE BATCH DE NUIT
+            RÉSULTAT DU LOT : {batchSummary.succeeded}/{batchSummary.total}{" "}
+            {batchSummary.continuousGeneration24h
+              ? "PRIS EN CHARGE (MODE CONTINU 24H/24)"
+              : "PRÊT(S) POUR LE BATCH DE NUIT"}
             {batchSummary.failed > 0
               ? ` · ${batchSummary.failed} ERREUR(S) ISOLÉE(S)`
               : ""}

@@ -8,6 +8,7 @@ import {
   generateEmbedding,
   getOllamaConfig,
   getOllamaInferenceOptions,
+  OLLAMA_KEEP_ALIVE,
   OLLAMA_STRICT_SYSTEM_RULE,
   OLLAMA_TIMEOUT_MS,
   ollamaPostStream,
@@ -391,6 +392,7 @@ ${contextBlock}`;
         "/api/chat",
         {
           model,
+          keep_alive: OLLAMA_KEEP_ALIVE,
           stream: true,
           options: getOllamaInferenceOptions(),
           messages: [
