@@ -150,11 +150,35 @@ function buildPrintableSummaryHtml(title: string, summary: SummaryPayload): stri
           : "";
 
       return `<section class="chapter">
-        <h2>${sIdx + 1}. ${escapeHtml(sec.title)}</h2>
+        <h2><span>${sIdx + 1}. ${escapeHtml(sec.title)}</span>${
+          sec.pageRange
+            ? `<span class="chapter-pages">${escapeHtml(sec.pageRange)}</span>`
+            : ""
+        }</h2>
         ${subsHtml || fallbackPointsHtml}
       </section>`;
     })
     .join("");
+
+  const conceptsHtml =
+    summary.keyConcepts && summary.keyConcepts.length > 0
+      ? `<section class="chapter glossary-section">
+          <h2><span>Glossaire &amp; Notions clés du cours</span><span class="chapter-pages">${summary.keyConcepts.length} NOTIONS</span></h2>
+          <table>
+            <thead><tr><th style="width:28%">Notion</th><th>Définition &amp; mécanisme clé</th><th style="width:18%">Source</th></tr></thead>
+            <tbody>${summary.keyConcepts
+              .map(
+                (kc) =>
+                  `<tr><td><strong>${formatInlineToHtml(kc.term)}</strong></td><td>${formatInlineToHtml(
+                    kc.definition
+                  )}</td><td style="font-size:8pt;color:#64748b">${escapeHtml(
+                    kc.sourceLabel || `P.${kc.pageNumber || 1}`
+                  )}</td></tr>`
+              )
+              .join("")}</tbody>
+          </table>
+        </section>`
+      : "";
 
   const pitfallsHtml =
     summary.examPitfalls.length > 0
@@ -204,7 +228,8 @@ function buildPrintableSummaryHtml(title: string, summary: SummaryPayload): stri
   .toc-page { color: #64748b; font-size: 8.5pt; margin-left: 4px; }
   .chapter { border-top: 1px dashed #cbd5e1; padding-top: 12px; margin-top: 16px; }
   .chapter:first-of-type { border-top: none; padding-top: 0; margin-top: 0; }
-  h2 { font-size: 13.5pt; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin: 0 0 10px; break-after: avoid; page-break-after: avoid; }
+  h2 { font-size: 13.5pt; font-weight: 700; color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 5px; margin: 0 0 10px; display: flex; justify-content: space-between; align-items: baseline; gap: 12px; break-after: avoid; page-break-after: avoid; }
+  .chapter-pages { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 8.5pt; font-weight: 600; color: #3d6b99; background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 3px; padding: 1px 6px; white-space: nowrap; }
   .subsection { margin-bottom: 12px; }
   h3 { font-size: 11pt; font-weight: 700; color: #3b5bdb; margin: 10px 0 6px; break-after: avoid; page-break-after: avoid; }
   .callout { background: #fef9e7; border-left: 3px solid #d99b26; border-radius: 4px; padding: 9px 12px; margin: 8px 0; break-inside: avoid; page-break-inside: avoid; }
@@ -212,6 +237,7 @@ function buildPrintableSummaryHtml(title: string, summary: SummaryPayload): stri
   ul, ol { margin: 5px 0 8px 20px; padding: 0; }
   li { margin-bottom: 3.5px; }
   table { width: 100%; border-collapse: collapse; margin: 9px 0; font-size: 9.5pt; break-inside: avoid; page-break-inside: avoid; }
+  .glossary-section table { break-inside: auto; page-break-inside: auto; }
   tr { break-inside: avoid; page-break-inside: avoid; }
   th { background: #f1f5f9; text-align: left; font-weight: 700; border-bottom: 1px solid #cbd5e1; padding: 6px 8px; }
   td { border-bottom: 1px solid #e2e8f0; padding: 6px 8px; }
@@ -227,6 +253,7 @@ function buildPrintableSummaryHtml(title: string, summary: SummaryPayload): stri
   ${hasCleanOverview ? `<p class="overview">${formatInlineToHtml(summary.overview)}</p>` : ""}
   ${tocHtml}
   ${sectionsHtml}
+  ${conceptsHtml}
   ${pitfallsHtml}
   <div class="footer-end">— Fin — · Généré localement par ARA</div>
 </body>
