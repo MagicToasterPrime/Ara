@@ -7,6 +7,7 @@ import {
   reviewErrorBookItem,
   type SrsRating,
 } from "@/lib/error-book";
+import { getUserGlobalFlashcardSrsSummary } from "@/lib/flashcard-srs";
 import {
   computeEffectiveStreak,
   ensureRevisionSchema,
@@ -38,8 +39,15 @@ async function buildPayload(
   const dailyQuizGlobalEnabled =
     dailyQuizGlobalEnabledArg ?? (await getSystemSettings()).dailyQuizEnabled;
 
-  const [dbUser, todaySession, chunkCount, allParticipants, errorBook, sharedQuiz] =
-    await Promise.all([
+  const [
+    dbUser,
+    todaySession,
+    chunkCount,
+    allParticipants,
+    errorBook,
+    flashcardSrs,
+    sharedQuiz,
+  ] = await Promise.all([
       prisma.user.findUnique({
         where: { id: userId },
         select: {
@@ -81,6 +89,7 @@ async function buildPayload(
         },
       }),
       getUserErrorBook(userId),
+      getUserGlobalFlashcardSrsSummary(userId),
       !dailyQuizGlobalEnabled
         ? Promise.resolve(null)
         : sharedQuizArg !== undefined
@@ -151,6 +160,7 @@ async function buildPayload(
       : null,
     leaderboard,
     errorBook,
+    flashcardSrs,
     sharedQuizMeta: sharedQuiz
       ? {
           dateKey: sharedQuiz.dateKey,
@@ -242,13 +252,15 @@ export async function POST(req: Request) {
         | "GENERATE_DAILY"
         | "GENERATE_BONUS"
         | "SUBMIT"
-        | "REVIEW_ERROR";
+        | "REVIEW_ERROR"
+        | "RECORD_MISSED";
       enabled?: boolean;
       forceShared?: boolean;
       sessionId?: string;
       answers?: Record<string, RevisionAnswerValue>;
       errorItemId?: string;
       rating?: SrsRating;
+      missedQuestions?: RevisionQuestion[];
     };
 
     const todayKey = getLocalDateKey();
@@ -272,6 +284,31 @@ export async function POST(req: Request) {
       await reviewErrorBookItem(user.id, errorItemId, rating);
       const payload = await buildPayload(user.id);
       return NextResponse.json(payload);
+    }
+
+    if (body.action === "RECORD_MISSED") {
+      const incoming = Array.isArray(body.missedQuestions)
+        ? body.missedQuestions
+        : [];
+      const validQuestions = incoming.filter(
+        (q): q is RevisionQuestion =>
+          Boolean(
+            q &&
+              typeof q === "object" &&
+              q.prompt &&
+              q.ueId &&
+              q.ueCode &&
+              q.documentId
+          )
+      );
+      if (validQuestions.length > 0) {
+        await recordMissedQuestions(user.id, validQuestions.slice(0, 40));
+      }
+      const errorBook = await getUserErrorBook(user.id);
+      return NextResponse.json({
+        recorded: validQuestions.length,
+        errorBook,
+      });
     }
 
     const settings = await getSystemSettings();

@@ -1,3 +1,6 @@
+import { extractPdfTextViaOcr } from "@/lib/ocr";
+import { logSystemError } from "@/lib/system-logger";
+
 export interface ExtractedPdfPage {
   pageNumber: number;
   text: string;
@@ -10,6 +13,7 @@ export interface ExtractedPdfResult {
   pages: ExtractedPdfPage[];
   hasExtractableText: boolean;
   totalTextChars: number;
+  ocrUsed?: boolean;
   parseError?: string;
 }
 
@@ -363,14 +367,40 @@ export async function extractPdfPages(
     const hasExtractableText = totalTextChars >= MIN_USABLE_TEXT_CHARS;
 
     if (!hasExtractableText) {
+      const ocrRes = await extractPdfTextViaOcr(
+        buffer,
+        Math.min(pageCount, 50),
+        normalizePdfExtractedText
+      );
+      if (
+        ocrRes.pages.length > 0 &&
+        ocrRes.totalTextChars >= MIN_USABLE_TEXT_CHARS
+      ) {
+        console.log(
+          `[PDF/OCR] Fallback OCR réussi : ${ocrRes.totalTextChars} caractères récupérés sur ${ocrRes.pages.length} page(s).`
+        );
+        return {
+          pageCount: Math.max(pageCount, ocrRes.pages.length),
+          pages: ocrRes.pages,
+          hasExtractableText: true,
+          totalTextChars: ocrRes.totalTextChars,
+          ocrUsed: true,
+        };
+      }
+
       console.error(
         `[PDF] Extraction vide : aucun texte exploitable détecté (${totalTextChars} caractères alphanumériques sur ${pageCount} page(s) — PDF probablement scanné sans couche OCR).`
       );
+      void logSystemError({
+        source: "PDF_OCR",
+        message: `PDF sans texte exploitable (${pageCount} pages, ${totalTextChars} caractères extraits, OCR infructueux ou indisponible).`,
+      });
       return {
         pageCount,
         pages: [],
         hasExtractableText: false,
         totalTextChars,
+        ocrUsed: ocrRes.used,
       };
     }
 
@@ -383,11 +413,17 @@ export async function extractPdfPages(
       pages: nonEmptyPages,
       hasExtractableText: true,
       totalTextChars,
+      ocrUsed: false,
     };
   } catch (error) {
     const parseError =
       error instanceof Error ? error.message : "PDF corrompu ou illisible";
     console.error("[PDF] Extraction error:", error);
+    void logSystemError({
+      source: "PDF_OCR",
+      message: "Erreur de lecture PDF.",
+      detail: parseError,
+    });
     return {
       pageCount: 0,
       pages: [],

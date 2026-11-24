@@ -4,6 +4,7 @@ import https from "node:https";
 import os from "node:os";
 import { prisma } from "@/lib/prisma";
 import { setDocumentProcessingStatus } from "@/lib/document-status";
+import { logSystemError } from "@/lib/system-logger";
 import {
   hasUsableExtractedText,
   hasUsableText,
@@ -175,6 +176,13 @@ export function ollamaPostJson<T>(
           const status = res.statusCode ?? 0;
           const rawText = Buffer.concat(chunks).toString("utf8");
           if (status < 200 || status >= 300) {
+            if (status >= 500 || status === 0) {
+              void logSystemError({
+                source: "OLLAMA",
+                message: `Erreur HTTP ${status} sur ${endpointPath}`,
+                detail: rawText.slice(0, 600),
+              });
+            }
             finishResolve({
               ok: false,
               status,
@@ -205,22 +213,25 @@ export function ollamaPostJson<T>(
     );
 
     const wallTimer = setTimeout(() => {
-      req.destroy(
-        new Error(
-          `Timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`
-        )
-      );
+      const msg = `Timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`;
+      void logSystemError({ source: "OLLAMA", message: msg });
+      req.destroy(new Error(msg));
     }, effectiveTimeout);
 
     req.setTimeout(effectiveTimeout, () => {
-      req.destroy(
-        new Error(
-          `Socket timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`
-        )
-      );
+      const msg = `Socket timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`;
+      void logSystemError({ source: "OLLAMA", message: msg });
+      req.destroy(new Error(msg));
     });
 
-    req.on("error", (err) => finishReject(err));
+    req.on("error", (err) => {
+      void logSystemError({
+        source: "OLLAMA",
+        message: `Erreur réseau Ollama sur ${endpointPath}`,
+        detail: err instanceof Error ? err.message : String(err),
+      });
+      finishReject(err);
+    });
     req.write(bodyString);
     req.end();
   });
@@ -281,6 +292,13 @@ export function ollamaPostStream(
           res.on("data", (chunk: Buffer) => errChunks.push(chunk));
           res.on("end", () => {
             cleanup();
+            if (status >= 500 || status === 0) {
+              void logSystemError({
+                source: "OLLAMA",
+                message: `Erreur stream HTTP ${status} sur ${endpointPath}`,
+                detail: Buffer.concat(errChunks).toString("utf8").slice(0, 600),
+              });
+            }
             if (!headerSettled) {
               headerSettled = true;
               resolve({
@@ -376,24 +394,25 @@ export function ollamaPostStream(
 
     const wallTimer = setTimeout(() => {
       cleanup();
-      req.destroy(
-        new Error(
-          `Timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`
-        )
-      );
+      const msg = `Timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`;
+      void logSystemError({ source: "OLLAMA", message: msg });
+      req.destroy(new Error(msg));
     }, effectiveTimeout);
 
     req.setTimeout(effectiveTimeout, () => {
       cleanup();
-      req.destroy(
-        new Error(
-          `Socket timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`
-        )
-      );
+      const msg = `Socket timeout Ollama dépassé (${Math.round(effectiveTimeout / 1000)}s) sur ${endpointPath}`;
+      void logSystemError({ source: "OLLAMA", message: msg });
+      req.destroy(new Error(msg));
     });
 
     req.on("error", (err) => {
       cleanup();
+      void logSystemError({
+        source: "OLLAMA",
+        message: `Erreur stream Ollama sur ${endpointPath}`,
+        detail: err instanceof Error ? err.message : String(err),
+      });
       if (!headerSettled) {
         headerSettled = true;
         reject(err);

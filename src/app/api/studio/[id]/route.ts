@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { getCurrentUser } from "@/lib/auth";
-import { ensureStudioSchema } from "@/lib/studio";
+import { canManageUE, getCurrentUser } from "@/lib/auth";
+import { ensureStudioSchema, type StudioArtifactContent } from "@/lib/studio";
 
 export async function PATCH(
   req: Request,
@@ -25,20 +25,41 @@ export async function PATCH(
     );
   }
 
-  if (existing.userId !== user.id && user.globalRole !== "YEAR_ADMIN") {
+  const canManageExistingUe = existing.ueId
+    ? await canManageUE(user.id, user.globalRole, existing.ueId)
+    : false;
+
+  if (existing.userId !== user.id && !canManageExistingUe) {
     return NextResponse.json({ error: "Accès refusé." }, { status: 403 });
   }
 
   const body = (await req.json()) as {
     isPublic?: boolean;
     title?: string;
+    content?: StudioArtifactContent;
   };
+
+  let nextContentJson: string | undefined;
+  if (body.content !== undefined) {
+    if (
+      !body.content ||
+      typeof body.content !== "object" ||
+      body.content.kind !== existing.kind
+    ) {
+      return NextResponse.json(
+        { error: "Type de contenu incohérent avec l'artefact cible." },
+        { status: 400 }
+      );
+    }
+    nextContentJson = JSON.stringify(body.content);
+  }
 
   const artifact = await prisma.studyArtifact.update({
     where: { id: params.id },
     data: {
       ...(body.isPublic !== undefined ? { isPublic: Boolean(body.isPublic) } : {}),
       ...(body.title?.trim() ? { title: body.title.trim() } : {}),
+      ...(nextContentJson !== undefined ? { contentJson: nextContentJson } : {}),
     },
     include: {
       user: { select: { id: true, name: true } },

@@ -1,16 +1,19 @@
 import { NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { checkOllamaHealth } from "@/lib/ollama";
+import { prisma } from "@/lib/prisma";
 import {
   getSharedDailyQuizMetaForToday,
   runScheduled6AmDailyQuizGeneration,
 } from "@/lib/revisions";
 import {
+  ensureStudioSchema,
   getBackgroundQueueSnapshot,
   requestStopBackgroundQueue,
   requestStopContinuous24hIfOutsideOffPeak,
   runNightlyOffPeakStudyGeneration,
 } from "@/lib/studio";
+import { clearSystemErrors } from "@/lib/system-logger";
 import {
   getSystemSettings,
   normalizeInviteCode,
@@ -70,7 +73,9 @@ export async function POST(req: Request) {
         | "REGENERATE_DAILY_QUIZ"
         | "TOGGLE_USER_AI"
         | "UPDATE_ANNOUNCEMENT"
-        | "UPDATE_INVITE_CODE";
+        | "UPDATE_INVITE_CODE"
+        | "REGENERATE_DOCUMENT_AI"
+        | "CLEAR_ERROR_LOGS";
       enabled?: boolean;
       announcementType?: SiteAnnouncementType;
       announcementMessage?: string;
@@ -248,6 +253,56 @@ export async function POST(req: Request) {
       return NextResponse.json(
         await buildAdminQueueResponse(
           "Génération d'un nouveau quiz journalier lancée en arrière-plan (20 questions · 5 chapitres aléatoires)."
+        )
+      );
+    }
+
+    if (action === "CLEAR_ERROR_LOGS") {
+      await clearSystemErrors();
+      return NextResponse.json(
+        await buildAdminQueueResponse("Journal d'erreurs système vidé.")
+      );
+    }
+
+    if (action === "REGENERATE_DOCUMENT_AI") {
+      if (!documentId || typeof documentId !== "string") {
+        return NextResponse.json(
+          { error: "documentId manquant." },
+          { status: 400 }
+        );
+      }
+
+      const health = await checkOllamaHealth();
+      if (!health.online) {
+        return NextResponse.json(
+          {
+            error: "OLLAMA_OFFLINE",
+            message: `Serveur Ollama hors-ligne (${health.host.replace(/^https?:\/\//, "")}). Démarrez Ollama avant de régénérer.`,
+          },
+          { status: 503 }
+        );
+      }
+
+      await ensureStudioSchema();
+      await prisma.studyArtifact.deleteMany({
+        where: {
+          documentId,
+          isPublic: true,
+          kind: { in: ["SUMMARY", "FLASHCARDS", "QUIZ"] },
+        },
+      });
+
+      void runNightlyOffPeakStudyGeneration({
+        force: true,
+        mode: "ADMIN_MANUAL",
+        scope: "AI_ONLY",
+        documentId,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return NextResponse.json(
+        await buildAdminQueueResponse(
+          "Régénération ciblée du document lancée en arrière-plan (Fiche, Flashcards, Quiz)."
         )
       );
     }

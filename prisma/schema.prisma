@@ -318,4 +318,58 @@ model SystemSetting {
   updatedAt DateTime @default(now())
 }
 
+model FlashcardReview {
+  id             String   @id @default(cuid())
+  userId         String
+  artifactId     String
+  cardKey        String
+  ueId           String   @default("")
+  ueCode         String   @default("")
+  documentId     String   @default("")
+  rating         String
+  repetitions    Int      @default(0)
+  intervalDays   Int      @default(0)
+  easeFactor     Float    @default(2.5)
+  mastered       Boolean  @default(false)
+  nextReviewDate String
+  updatedAt      DateTime @default(now())
+
+  @@unique([userId, artifactId, cardKey])
+  @@index([userId, nextReviewDate])
+  @@index([userId, ueId])
+}
+
+model ContentIssueReport {
+  id             String    @id @default(cuid())
+  reporterId     String
+  reporterName   String
+  ueId           String?
+  ueCode         String    @default("")
+  documentId     String?
+  artifactId     String?
+  targetKind     String
+  itemLabel      String
+  description    String
+  status         String    @default("OPEN")
+  resolvedBy     String?
+  resolutionNote String?
+  createdAt      DateTime  @default(now())
+  resolvedAt     DateTime?
+
+  @@index([status, createdAt])
+  @@index([ueId, status])
+}
+
+model SystemErrorLog {
+  id         String   @id @default(cuid())
+  source     String
+  message    String
+  detail     String?
+  documentId String?
+  createdAt  DateTime @default(now())
+
+  @@index([createdAt])
+}
+
+
 

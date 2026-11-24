@@ -10,7 +10,9 @@ import {
   Check,
   CheckCircle2,
   FileText,
+  Flag,
   Flame,
+  Layers,
   Loader2,
   Power,
   RefreshCw,
@@ -22,6 +24,8 @@ import {
 import { AppShell } from "@/components/AppShell";
 import { CommunityQuizSection } from "@/components/CommunityQuizSection";
 import { useSpix } from "@/components/SpixContext";
+import type { UserFlashcardSrsSummary } from "@/lib/flashcard-srs";
+import { isRevisionQuestionCorrect } from "@/lib/question-grading";
 import type {
   ImagePointAnswer,
   RevisionAnswerValue,
@@ -118,6 +122,7 @@ interface RevisionsPayload {
   todaySession: DailySessionData | null;
   leaderboard: LeaderboardEntry[];
   errorBook?: UserErrorBookPayload;
+  flashcardSrs?: UserFlashcardSrsSummary;
   gradingResults?: Record<string, boolean>;
   sharedQuizMeta?: SharedQuizMeta | null;
 }
@@ -149,6 +154,32 @@ export default function RevisionsPage() {
   const [revealedErrorIds, setRevealedErrorIds] = useState<
     Record<string, boolean>
   >({});
+
+  // Global Flashcards SRS Deck state
+  const [srsIdx, setSrsIdx] = useState(0);
+  const [srsFlipped, setSrsFlipped] = useState(false);
+  const [srsBusy, setSrsBusy] = useState(false);
+  const [srsTouchStartX, setSrsTouchStartX] = useState<number | null>(null);
+
+  // Carnet d'erreurs filter + Quiz de rattrapage state
+  const [errorUeFilter, setErrorUeFilter] = useState<string>("ALL");
+  const [catchupActive, setCatchupActive] = useState(false);
+  const [catchupAnswers, setCatchupAnswers] = useState<
+    Record<string, RevisionAnswerValue>
+  >({});
+  const [catchupResults, setCatchupResults] = useState<
+    Record<string, boolean> | null
+  >(null);
+  const [catchupSubmitted, setCatchupSubmitted] = useState(false);
+  const [catchupBusy, setCatchupBusy] = useState(false);
+
+  // Content issue reporting state
+  const [reportingQId, setReportingQId] = useState<string | null>(null);
+  const [reportText, setReportText] = useState("");
+  const [reportSentIds, setReportSentIds] = useState<Record<string, boolean>>(
+    {}
+  );
+  const [reportBusy, setReportBusy] = useState(false);
 
   useEffect(() => {
     setPageContext({ mode: "GLOBAL" });
@@ -234,6 +265,96 @@ export default function RevisionsPage() {
   function handleImagePoint(questionId: string, val: ImagePointAnswer) {
     if (data?.todaySession?.completed) return;
     setAnswers((prev) => ({ ...prev, [questionId]: val }));
+  }
+
+  async function handleRateSrsCard(
+    rating: "AGAIN" | "HARD" | "GOOD" | "EASY"
+  ) {
+    const deck = data?.flashcardSrs?.dueDeck || [];
+    const card = deck[srsIdx];
+    if (!card || srsBusy) return;
+    setSrsBusy(true);
+    try {
+      const res = await fetch("/api/studio/srs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          artifactId: card.artifactId,
+          cardKey: card.cardKey,
+          front: card.front,
+          ueId: card.ueId,
+          ueCode: card.ueCode,
+          documentId: card.documentId,
+          rating,
+        }),
+      });
+      if (res.ok) {
+        setSrsFlipped(false);
+        await loadRevisions();
+        setSrsIdx((prev) => (prev >= Math.max(0, deck.length - 2) ? 0 : prev));
+      }
+    } finally {
+      setSrsBusy(false);
+    }
+  }
+
+  async function handleSubmitDailyReport(q: RevisionQuestion) {
+    if (!reportText.trim() || reportBusy) return;
+    setReportBusy(true);
+    try {
+      const res = await fetch("/api/studio/reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ueId: q.ueId,
+          ueCode: q.ueCode,
+          documentId: q.documentId,
+          targetKind: "DAILY_QUIZ",
+          itemLabel: `Quiz jour · ${q.type} · ${q.prompt.slice(0, 70)}`,
+          description: reportText.trim(),
+        }),
+      });
+      if (res.ok) {
+        setReportSentIds((p) => ({ ...p, [q.id]: true }));
+        setReportingQId(null);
+        setReportText("");
+      }
+    } finally {
+      setReportBusy(false);
+    }
+  }
+
+  async function handleSubmitCatchupQuiz(
+    items: Array<{ id: string; question: RevisionQuestion }>
+  ) {
+    if (catchupBusy || items.length === 0) return;
+    setCatchupBusy(true);
+    try {
+      const resMap: Record<string, boolean> = {};
+      await Promise.all(
+        items.map(async (item) => {
+          const ok = isRevisionQuestionCorrect(
+            item.question,
+            catchupAnswers[item.id]
+          );
+          resMap[item.id] = ok;
+          await fetch("/api/revisions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              action: "REVIEW_ERROR",
+              errorItemId: item.id,
+              rating: ok ? "GOOD" : "AGAIN",
+            }),
+          }).catch(() => null);
+        })
+      );
+      setCatchupResults(resMap);
+      setCatchupSubmitted(true);
+      await loadRevisions();
+    } finally {
+      setCatchupBusy(false);
+    }
   }
 
   const dailyQuizGlobalEnabled = data?.dailyQuizGlobalEnabled ?? true;
@@ -952,6 +1073,57 @@ export default function RevisionsPage() {
                             </div>
                           </div>
                         )}
+
+                        {/* Issue Report Row */}
+                        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2">
+                          {reportSentIds[q.id] ? (
+                            <span className="font-mono text-[10px] uppercase tracking-wider text-forest">
+                              ✓ SIGNALEMENT ENVOYÉ À L&apos;ADMINISTRATION
+                            </span>
+                          ) : reportingQId === q.id ? (
+                            <div className="w-full space-y-2">
+                              <textarea
+                                rows={2}
+                                value={reportText}
+                                onChange={(e) => setReportText(e.target.value)}
+                                placeholder="Décrivez brièvement l'erreur (réponse fausse, imprécision, coquille...)"
+                                className="w-full border border-border bg-paper px-2.5 py-1.5 text-xs text-ink focus:border-ink focus:outline-none"
+                              />
+                              <div className="flex items-center justify-end gap-2">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setReportingQId(null);
+                                    setReportText("");
+                                  }}
+                                  className="border border-border bg-paper px-2.5 py-1 font-mono text-[10px] uppercase text-stone hover:text-ink"
+                                >
+                                  ANNULER
+                                </button>
+                                <button
+                                  type="button"
+                                  disabled={reportBusy || reportText.trim().length < 4}
+                                  onClick={() => void handleSubmitDailyReport(q)}
+                                  className="border border-carmine bg-carmine px-3 py-1 font-mono text-[10px] font-semibold uppercase text-card disabled:opacity-50"
+                                >
+                                  {reportBusy ? "ENVOI..." : "ENVOYER SIGNALEMENT"}
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setReportingQId(q.id);
+                                setReportText("");
+                              }}
+                              className="inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-stone hover:text-carmine"
+                            >
+                              <Flag className="h-3 w-3" />
+                              <span>SIGNALER UNE ERREUR</span>
+                            </button>
+                          )}
+                        </div>
                       </article>
                       </div>
                     );
@@ -1061,32 +1233,426 @@ export default function RevisionsPage() {
           </div>
         )}
 
+        {/* Flashcards SRS (SM-2) du jour */}
+        {!loading &&
+          data?.flashcardSrs &&
+          data.flashcardSrs.dueDeck.length > 0 &&
+          (() => {
+            const deck = data.flashcardSrs.dueDeck;
+            const currentSrsCard = deck[Math.min(srsIdx, deck.length - 1)];
+            return (
+              <section
+                id="srs-flashcards"
+                className="space-y-4 border-t border-border pt-6"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="flex items-center gap-2 text-base font-bold uppercase tracking-tight text-ink">
+                      <Layers className="h-4 w-4 text-badge-text" />
+                      <span>
+                        FLASHCARDS À RÉVISER AUJOURD&apos;HUI (SRS SM-2)
+                      </span>
+                    </h2>
+                    <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
+                      [ {data.flashcardSrs.dueTodayCount} CARTE
+                      {data.flashcardSrs.dueTodayCount > 1 ? "S" : ""} DUE
+                      {data.flashcardSrs.dueTodayCount > 1 ? "S" : ""} ·{" "}
+                      {data.flashcardSrs.masteredCount} MAÎTRISÉE
+                      {data.flashcardSrs.masteredCount > 1 ? "S" : ""} · SWIPE OU
+                      CLIC POUR RETOURNER ]
+                    </p>
+                  </div>
+                  <span className="border border-badge-text/40 bg-badge-bg px-2.5 py-1 font-mono text-[10px] font-bold uppercase text-badge-text">
+                    {Math.min(srsIdx, deck.length - 1) + 1} / {deck.length}
+                  </span>
+                </div>
+
+                {currentSrsCard && (
+                  <div
+                    className="mx-auto max-w-2xl border border-ink bg-card p-5"
+                    onTouchStart={(e) =>
+                      setSrsTouchStartX(e.changedTouches[0]?.clientX ?? null)
+                    }
+                    onTouchEnd={(e) => {
+                      if (srsTouchStartX === null) return;
+                      const dx =
+                        (e.changedTouches[0]?.clientX ?? srsTouchStartX) -
+                        srsTouchStartX;
+                      setSrsTouchStartX(null);
+                      if (Math.abs(dx) > 55) {
+                        setSrsFlipped(false);
+                        setSrsIdx((i) =>
+                          dx < 0
+                            ? Math.min(deck.length - 1, i + 1)
+                            : Math.max(0, i - 1)
+                        );
+                      }
+                    }}
+                  >
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2 font-mono text-[10px] uppercase tracking-wider text-stone">
+                      <span className="bg-badge-bg px-2 py-0.5 font-bold text-badge-text">
+                        {currentSrsCard.ueCode || "ARA"} · {currentSrsCard.tag}
+                      </span>
+                      <span>
+                        {currentSrsCard.fileName} (P.{currentSrsCard.pageNumber}
+                        )
+                      </span>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setSrsFlipped((f) => !f)}
+                      className={`flex min-h-[160px] w-full flex-col justify-center border border-border p-5 text-center transition-colors ${
+                        srsFlipped ? "bg-pinned" : "bg-paper"
+                      }`}
+                    >
+                      <p className="mb-2 font-mono text-[10px] uppercase tracking-wider text-stone">
+                        {srsFlipped ? "VERSO · RÉPONSE" : "RECTO · QUESTION"}
+                      </p>
+                      <p className="text-sm font-bold leading-relaxed text-ink sm:text-base">
+                        {srsFlipped
+                          ? currentSrsCard.back
+                          : currentSrsCard.front}
+                      </p>
+                    </button>
+
+                    {srsFlipped ? (
+                      <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                        {(
+                          [
+                            {
+                              r: "AGAIN",
+                              lbl: "À REVOIR (<1J)",
+                              cls: "border-carmine bg-carmine/10 text-carmine hover:bg-carmine hover:text-card",
+                            },
+                            {
+                              r: "HARD",
+                              lbl: "DIFFICILE (1J)",
+                              cls: "border-amber bg-amber/15 text-ink hover:bg-amber hover:text-card",
+                            },
+                            {
+                              r: "GOOD",
+                              lbl: "BIEN (3J+)",
+                              cls: "border-badge-text bg-badge-bg text-badge-text hover:bg-badge-text hover:text-card",
+                            },
+                            {
+                              r: "EASY",
+                              lbl: "FACILE · ACQUIS",
+                              cls: "border-forest bg-forest/15 text-forest hover:bg-forest hover:text-card",
+                            },
+                          ] as const
+                        ).map((btn) => (
+                          <button
+                            key={btn.r}
+                            type="button"
+                            disabled={srsBusy}
+                            onClick={() => void handleRateSrsCard(btn.r)}
+                            className={`min-h-[42px] border px-2.5 py-2 font-mono text-[10px] font-bold uppercase tracking-wider transition-colors disabled:opacity-50 ${btn.cls}`}
+                          >
+                            {btn.lbl}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="mt-4 flex justify-center">
+                        <button
+                          type="button"
+                          onClick={() => setSrsFlipped(true)}
+                          className="min-h-[40px] border border-ink bg-ink px-5 py-2 font-mono text-xs uppercase tracking-wider text-card hover:bg-ink/90"
+                        >
+                          AFFICHER LA RÉPONSE
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+            );
+          })()}
+
         {/* Carnet d'Erreurs & Répétition Espacée (SRS) */}
-        {!loading && errorBook && (
-          <section className="space-y-4 border-t border-border pt-6">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h2 className="flex items-center gap-2 text-base font-bold uppercase tracking-tight text-ink">
-                  <Brain className="h-4 w-4 text-carmine" />
-                  <span>CARNET D&apos;ERREURS &amp; RÉPÉTITION ESPACÉE (SRS)</span>
-                </h2>
-                <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
-                  [ REPRISE AUTOMATIQUE DES NOTIONS RATÉES EN QUIZ OU EN PARTIEL BLANC ]
-                </p>
-              </div>
+        {!loading &&
+          errorBook &&
+          (() => {
+            const ueCodes = Array.from(
+              new Set(activeErrorItems.map((i) => i.ueCode).filter(Boolean))
+            ).sort();
+            const filteredErrorItems =
+              errorUeFilter === "ALL"
+                ? activeErrorItems
+                : activeErrorItems.filter((i) => i.ueCode === errorUeFilter);
+            const catchupItems = filteredErrorItems
+              .filter((i) => i.question.type !== "IMAGE_POINT")
+              .slice(0, 15);
+            const catchupScore = catchupResults
+              ? catchupItems.filter((it) => catchupResults[it.id]).length
+              : 0;
 
-              <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-wider">
-                <span className="border border-carmine/40 bg-carmine/10 px-2.5 py-1 text-carmine">
-                  {errorBook.dueCount} À REVOIR AUJOURD&apos;HUI
-                </span>
-                <span className="border border-border bg-card px-2.5 py-1 text-ink">
-                  {errorBook.activeCount} ACTIVES · {errorBook.masteredCount}{" "}
-                  MAÎTRISÉES
-                </span>
-              </div>
-            </div>
+            return (
+              <section
+                id="carnet-erreurs"
+                className="space-y-4 border-t border-border pt-6"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="flex items-center gap-2 text-base font-bold uppercase tracking-tight text-ink">
+                      <Brain className="h-4 w-4 text-carmine" />
+                      <span>CARNET D&apos;ERREURS &amp; RÉPÉTITION ESPACÉE (SRS)</span>
+                    </h2>
+                    <p className="font-mono text-[11px] uppercase tracking-wider text-stone">
+                      [ REPRISE AUTOMATIQUE DES NOTIONS RATÉES EN QUIZ, STUDIO OU PARTIEL BLANC ]
+                    </p>
+                  </div>
 
-            {activeErrorItems.length === 0 ? (
+                  <div className="flex flex-wrap items-center gap-2 font-mono text-[10px] uppercase tracking-wider">
+                    <span className="border border-carmine/40 bg-carmine/10 px-2.5 py-1 text-carmine">
+                      {errorBook.dueCount} À REVOIR AUJOURD&apos;HUI
+                    </span>
+                    <span className="border border-border bg-card px-2.5 py-1 text-ink">
+                      {errorBook.activeCount} ACTIVES · {errorBook.masteredCount}{" "}
+                      MAÎTRISÉES
+                    </span>
+                    {catchupItems.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setCatchupActive((a) => !a);
+                          setCatchupAnswers({});
+                          setCatchupResults(null);
+                          setCatchupSubmitted(false);
+                        }}
+                        className="border border-ink bg-ink px-3 py-1 font-semibold text-card hover:bg-ink/90"
+                      >
+                        {catchupActive
+                          ? "FERMER LE QUIZ DE RATTRAPAGE"
+                          : `LANCER UN QUIZ DE RATTRAPAGE (${catchupItems.length})`}
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {ueCodes.length > 1 && (
+                  <div className="flex flex-wrap items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider">
+                    <button
+                      type="button"
+                      onClick={() => setErrorUeFilter("ALL")}
+                      className={`border px-2.5 py-1 ${
+                        errorUeFilter === "ALL"
+                          ? "border-ink bg-ink text-card"
+                          : "border-border bg-card text-ink hover:border-ink"
+                      }`}
+                    >
+                      TOUTES ({activeErrorItems.length})
+                    </button>
+                    {ueCodes.map((code) => (
+                      <button
+                        key={code}
+                        type="button"
+                        onClick={() => setErrorUeFilter(code)}
+                        className={`border px-2.5 py-1 ${
+                          errorUeFilter === code
+                            ? "border-ink bg-ink text-card"
+                            : "border-border bg-card text-ink hover:border-ink"
+                        }`}
+                      >
+                        {code} (
+                        {activeErrorItems.filter((i) => i.ueCode === code).length}
+                        )
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {catchupActive && catchupItems.length > 0 && (
+                  <div
+                    className="space-y-4 border border-ink bg-card p-5"
+                    style={{ borderTop: "3px solid #C83E4D" }}
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border pb-3">
+                      <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                        QUIZ DE RATTRAPAGE CIBLÉ ({catchupItems.length} QUESTIONS)
+                      </span>
+                      {catchupSubmitted && (
+                        <span className="bg-badge-bg px-2.5 py-1 font-mono text-xs font-bold uppercase text-badge-text">
+                          SCORE : {catchupScore} / {catchupItems.length} · BOÎTES SRS MISES À JOUR
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="space-y-4">
+                      {catchupItems.map((item, idx) => {
+                        const q = item.question;
+                        const ok = catchupResults
+                          ? catchupResults[item.id]
+                          : undefined;
+                        return (
+                          <div
+                            key={`cu-${item.id}`}
+                            className={`border p-4 ${
+                              catchupSubmitted && ok === true
+                                ? "border-forest bg-forest/5"
+                                : catchupSubmitted && ok === false
+                                ? "border-carmine bg-carmine/5"
+                                : "border-border bg-paper"
+                            }`}
+                          >
+                            <div className="mb-2 flex items-center justify-between gap-2 font-mono text-[10px] uppercase text-stone">
+                              <span>
+                                Q{idx + 1} · {item.ueCode} · {q.type}
+                              </span>
+                              <span>{item.chapterTitle}</span>
+                            </div>
+                            <p className="mb-3 text-sm font-semibold text-ink">
+                              {q.prompt}
+                            </p>
+
+                            {(q.type === "QCU" || q.type === "QCM") &&
+                              q.options && (
+                                <div className="space-y-1.5">
+                                  {q.options.map((opt, oIdx) => {
+                                    const sel = Array.isArray(
+                                      catchupAnswers[item.id]
+                                    )
+                                      ? (catchupAnswers[item.id] as number[])
+                                      : [];
+                                    const active = sel.includes(oIdx);
+                                    const exp =
+                                      q.correctIndices?.includes(oIdx) ?? false;
+                                    return (
+                                      <button
+                                        key={oIdx}
+                                        type="button"
+                                        disabled={catchupSubmitted}
+                                        onClick={() => {
+                                          if (q.type === "QCU") {
+                                            setCatchupAnswers((p) => ({
+                                              ...p,
+                                              [item.id]: [oIdx],
+                                            }));
+                                          } else {
+                                            const next = active
+                                              ? sel.filter((x) => x !== oIdx)
+                                              : [...sel, oIdx];
+                                            setCatchupAnswers((p) => ({
+                                              ...p,
+                                              [item.id]: next,
+                                            }));
+                                          }
+                                        }}
+                                        className={`flex w-full items-center gap-2 border px-3 py-2 text-left text-xs ${
+                                          catchupSubmitted && exp
+                                            ? "border-forest bg-forest/10 font-semibold text-ink"
+                                            : catchupSubmitted && active && !exp
+                                            ? "border-carmine bg-carmine/10 text-carmine"
+                                            : active
+                                            ? "border-ink bg-pinned font-semibold text-ink"
+                                            : "border-border bg-card text-ink"
+                                        }`}
+                                      >
+                                        <span className="font-mono font-bold">
+                                          {String.fromCharCode(65 + oIdx)}.
+                                        </span>
+                                        <span>{opt}</span>
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              )}
+
+                            {(q.type === "QROC" || q.type === "FILL_BLANK") && (
+                              <input
+                                type="text"
+                                disabled={catchupSubmitted}
+                                value={
+                                  typeof catchupAnswers[item.id] === "string"
+                                    ? (catchupAnswers[item.id] as string)
+                                    : ""
+                                }
+                                onChange={(e) =>
+                                  setCatchupAnswers((p) => ({
+                                    ...p,
+                                    [item.id]: e.target.value,
+                                  }))
+                                }
+                                placeholder="Votre réponse..."
+                                className="w-full border border-border bg-card px-3 py-2 text-xs text-ink"
+                              />
+                            )}
+
+                            {q.type === "FLASHCARD" && (
+                              <div className="space-y-2">
+                                <p className="border border-border bg-card p-2 text-xs text-ink">
+                                  Verso : {q.flashcardBack || q.explanation}
+                                </p>
+                                <div className="flex gap-2">
+                                  <button
+                                    type="button"
+                                    disabled={catchupSubmitted}
+                                    onClick={() =>
+                                      setCatchupAnswers((p) => ({
+                                        ...p,
+                                        [item.id]: "KNOWN",
+                                      }))
+                                    }
+                                    className={`flex-1 border px-3 py-1.5 font-mono text-[10px] uppercase ${
+                                      catchupAnswers[item.id] === "KNOWN"
+                                        ? "border-forest bg-forest text-card"
+                                        : "border-border bg-card text-forest"
+                                    }`}
+                                  >
+                                    JE SAVAIS
+                                  </button>
+                                  <button
+                                    type="button"
+                                    disabled={catchupSubmitted}
+                                    onClick={() =>
+                                      setCatchupAnswers((p) => ({
+                                        ...p,
+                                        [item.id]: "REVIEW",
+                                      }))
+                                    }
+                                    className={`flex-1 border px-3 py-1.5 font-mono text-[10px] uppercase ${
+                                      catchupAnswers[item.id] === "REVIEW"
+                                        ? "border-carmine bg-carmine text-card"
+                                        : "border-border bg-card text-carmine"
+                                    }`}
+                                  >
+                                    À REVOIR
+                                  </button>
+                                </div>
+                              </div>
+                            )}
+
+                            {catchupSubmitted && (
+                              <p className="mt-2 border-t border-border pt-2 text-xs text-stone">
+                                {q.explanation}
+                              </p>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {!catchupSubmitted && (
+                      <div className="flex justify-end">
+                        <button
+                          type="button"
+                          disabled={catchupBusy}
+                          onClick={() =>
+                            void handleSubmitCatchupQuiz(catchupItems)
+                          }
+                          className="border border-ink bg-ink px-5 py-2.5 font-mono text-xs font-semibold uppercase tracking-wider text-card hover:bg-ink/90 disabled:opacity-50"
+                        >
+                          {catchupBusy
+                            ? "CORRECTION..."
+                            : "CORRIGER & METTRE À JOUR MON SRS"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+            {filteredErrorItems.length === 0 ? (
               <div className="border border-border bg-card p-6 text-center font-mono text-xs uppercase tracking-wider text-stone">
                 CARNET D&apos;ERREURS VIERGE — TOUTES VOS QUESTIONS RATÉES ONT
                 ÉTÉ MAÎTRISÉES OU AUCUNE ERREUR ENREGISTRÉE.
@@ -1123,7 +1689,7 @@ export default function RevisionsPage() {
 
                 {/* SRS Error Cards */}
                 <div className="space-y-3 lg:col-span-8">
-                  {activeErrorItems.slice(0, 6).map((item) => {
+                  {filteredErrorItems.slice(0, 6).map((item) => {
                     const q = item.question;
                     const revealed = Boolean(revealedErrorIds[item.id]);
                     const isDue = item.nextReviewDate <= (data?.todayKey || "");
@@ -1260,8 +1826,9 @@ export default function RevisionsPage() {
                 </div>
               </div>
             )}
-          </section>
-        )}
+              </section>
+            );
+          })()}
 
         {/* Community Custom Quizzes & Image Occlusion Editor */}
         <section className="border-t border-border pt-6">

@@ -68,7 +68,7 @@ fi
 log_info "1/9 — Vérification des prérequis système (Node.js 20, Docker, UFW, Fail2ban)..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl git openssl ca-certificates gnupg lsb-release build-essential ufw fail2ban cron
+apt-get install -y -qq curl git openssl ca-certificates gnupg lsb-release build-essential ufw fail2ban cron poppler-utils tesseract-ocr tesseract-ocr-fra tesseract-ocr-eng postgresql-client
 
 NEED_NODE=false
 if ! command -v node &>/dev/null; then
@@ -363,8 +363,9 @@ cat > /usr/local/bin/ara-backup.sh <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 APP_DIR="${APP_DIR}"
+APP_USER="${APP_USER}"
 BACKUP_DIR="\${APP_DIR}/storage/backups"
-mkdir -p "\${BACKUP_DIR}"
+mkdir -p "\${BACKUP_DIR}" "\${APP_DIR}/storage/uploads"
 set -a
 source "\${APP_DIR}/.env"
 set +a
@@ -373,7 +374,8 @@ STAMP="\$(date +%Y%m%d_%H%M%S)"
 cd "\${APP_DIR}"
 docker compose exec -T postgres pg_dump -U "\${POSTGRES_USER:-ara}" "\${POSTGRES_DB:-ara}" | gzip > "\${BACKUP_DIR}/db_\${STAMP}.sql.gz"
 tar -czf "\${BACKUP_DIR}/uploads_\${STAMP}.tar.gz" -C "\${APP_DIR}/storage" uploads
-chmod 600 "\${BACKUP_DIR}/db_\${STAMP}.sql.gz" "\${BACKUP_DIR}/uploads_\${STAMP}.tar.gz"
+chmod 640 "\${BACKUP_DIR}/db_\${STAMP}.sql.gz" "\${BACKUP_DIR}/uploads_\${STAMP}.tar.gz"
+chown -R "\${APP_USER}:\${APP_USER}" "\${BACKUP_DIR}" || true
 find "\${BACKUP_DIR}" -type f -mtime +7 -delete
 EOF
 chmod 700 /usr/local/bin/ara-backup.sh

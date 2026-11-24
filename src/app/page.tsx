@@ -7,12 +7,15 @@ import {
   Archive,
   ArrowUpRight,
   BookOpen,
+  Brain,
   Flame,
+  Layers,
   MessageSquare,
   MoreVertical,
   PenTool,
   Plus,
   Search,
+  Timer,
 } from "lucide-react";
 import { AppShell } from "@/components/AppShell";
 import { useSpix } from "@/components/SpixContext";
@@ -72,6 +75,17 @@ export default function HomePage() {
     completedToday: boolean;
   } | null>(null);
   const [dailyQuizGlobalEnabled, setDailyQuizGlobalEnabled] = useState(true);
+  const [srsStats, setSrsStats] = useState<{
+    dueTodayCount: number;
+    dueByUe: Record<string, number>;
+    activeErrorCount: number;
+    errorsByUe: Record<string, number>;
+  }>({
+    dueTodayCount: 0,
+    dueByUe: {},
+    activeErrorCount: 0,
+    errorsByUe: {},
+  });
 
   const userClassLevel = (session?.user?.classLevel || "VET2").toUpperCase();
 
@@ -101,12 +115,32 @@ export default function HomePage() {
               currentStreak: number;
               completedToday: boolean;
             };
+            errorBook?: {
+              activeCount?: number;
+              items?: Array<{ ueId: string; mastered: boolean }>;
+            };
+            flashcardSrs?: {
+              dueTodayCount?: number;
+              dueByUe?: Record<string, number>;
+            };
           };
           if (active) {
             setDailyQuizGlobalEnabled(revData.dailyQuizGlobalEnabled ?? true);
             if (revData.userState) {
               setRevisionSummary(revData.userState);
             }
+            const errorsByUe: Record<string, number> = {};
+            for (const item of revData.errorBook?.items || []) {
+              if (!item.mastered && item.ueId) {
+                errorsByUe[item.ueId] = (errorsByUe[item.ueId] || 0) + 1;
+              }
+            }
+            setSrsStats({
+              dueTodayCount: revData.flashcardSrs?.dueTodayCount ?? 0,
+              dueByUe: revData.flashcardSrs?.dueByUe || {},
+              activeErrorCount: revData.errorBook?.activeCount ?? 0,
+              errorsByUe,
+            });
           }
         }
       } finally {
@@ -174,6 +208,26 @@ export default function HomePage() {
   const isYearAdmin = session?.user?.globalRole === "YEAR_ADMIN";
   const visibleArchives = showAllArchives ? archiveUes : archiveUes.slice(0, 4);
 
+  const radarUes = useMemo(() => {
+    return filteredUes
+      .map((ue) => {
+        const exam = formatExamBadge(ue.examType, ue.examDate);
+        if (exam.daysRemaining === null || exam.daysRemaining < -1) {
+          return null;
+        }
+        const ueErrors = srsStats.errorsByUe[ue.id] || 0;
+        const ueDueCards = srsStats.dueByUe[ue.id] || 0;
+        const priorityScore =
+          (ue.coeff ?? 4) * (100 / Math.max(3, exam.daysRemaining + 3)) +
+          ueErrors * 8 +
+          ueDueCards * 4;
+        return { ue, exam, ueErrors, ueDueCards, priorityScore };
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null)
+      .sort((a, b) => b.priorityScore - a.priorityScore)
+      .slice(0, 4);
+  }, [filteredUes, srsStats]);
+
   return (
     <AppShell>
       {/* Toolbar: Search + Class Filter + Semester Filter */}
@@ -240,33 +294,57 @@ export default function HomePage() {
       </div>
 
       {/* Daily Revision & Streak Strip */}
-      {revisionSummary && dailyQuizGlobalEnabled && (
+      {(revisionSummary || srsStats.dueTodayCount > 0 || srsStats.activeErrorCount > 0) && (
         <div
           className="mb-6 flex flex-wrap items-center justify-between gap-3 border border-border bg-card px-4 py-3"
           style={{
             borderLeft: `3px solid ${
-              revisionSummary.revisionEnabled ? "#D99B26" : "#DCDAD3"
+              revisionSummary?.revisionEnabled ? "#D99B26" : "#3D6B99"
             }`,
           }}
         >
           <div className="flex flex-wrap items-center gap-3">
-            <Flame
-              className={`h-4 w-4 ${
-                revisionSummary.revisionEnabled ? "text-amber" : "text-stone"
-              }`}
-            />
-            <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
-              {revisionSummary.revisionEnabled
-                ? `STREAK : ${revisionSummary.currentStreak} JOURS`
-                : "RÉVISIONS JOURNALIÈRES DÉSACTIVÉES"}
-            </span>
-            <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
-              {revisionSummary.revisionEnabled
-                ? revisionSummary.completedToday
-                  ? "· SÉANCE DU JOUR VALIDÉE ✓"
-                  : "· QUIZ IA QUOTIDIEN · UE & COURS ALÉATOIRES (QCU, QCM, QROC, FLASHCARDS)"
-                : "· ACTIVEZ LE QUIZ IA QUOTIDIEN (QCU, QCM, QROC, FLASHCARDS)"}
-            </span>
+            {revisionSummary && dailyQuizGlobalEnabled && (
+              <>
+                <Flame
+                  className={`h-4 w-4 ${
+                    revisionSummary.revisionEnabled ? "text-amber" : "text-stone"
+                  }`}
+                />
+                <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                  {revisionSummary.revisionEnabled
+                    ? `STREAK : ${revisionSummary.currentStreak} JOURS`
+                    : "RÉVISIONS JOURNALIÈRES DÉSACTIVÉES"}
+                </span>
+                <span className="font-mono text-[11px] uppercase tracking-wider text-stone">
+                  {revisionSummary.revisionEnabled
+                    ? revisionSummary.completedToday
+                      ? "· SÉANCE DU JOUR VALIDÉE ✓"
+                      : "· QUIZ IA QUOTIDIEN"
+                    : "· ACTIVEZ LE QUIZ IA QUOTIDIEN"}
+                </span>
+              </>
+            )}
+
+            {srsStats.dueTodayCount > 0 && (
+              <Link
+                href="/revisions#srs-flashcards"
+                className="inline-flex items-center gap-1 border border-badge-text/40 bg-badge-bg px-2.5 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-badge-text hover:bg-badge-text hover:text-card"
+              >
+                <Layers className="h-3 w-3" />
+                <span>{srsStats.dueTodayCount} CARTES SRS DUES</span>
+              </Link>
+            )}
+
+            {srsStats.activeErrorCount > 0 && (
+              <Link
+                href="/revisions#carnet-erreurs"
+                className="inline-flex items-center gap-1 border border-carmine/40 bg-carmine/10 px-2.5 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider text-carmine hover:bg-carmine hover:text-card"
+              >
+                <Brain className="h-3 w-3" />
+                <span>{srsStats.activeErrorCount} ERREURS À RATTRAPER</span>
+              </Link>
+            )}
           </div>
 
           <Link
@@ -274,15 +352,109 @@ export default function HomePage() {
             className="inline-flex items-center gap-1.5 border border-ink bg-ink px-3.5 py-1.5 font-mono text-[11px] uppercase tracking-wider text-card hover:bg-ink/90"
           >
             <span>
-              {revisionSummary.revisionEnabled
-                ? revisionSummary.completedToday
-                  ? "CLASSEMENT & CARNET D'ERREURS"
-                  : "LANCER LA SÉANCE DU JOUR"
-                : "ACTIVER LES RÉVISIONS"}
+              {revisionSummary && dailyQuizGlobalEnabled
+                ? revisionSummary.revisionEnabled
+                  ? revisionSummary.completedToday
+                    ? "CLASSEMENT & CARNET D'ERREURS"
+                    : "LANCER LA SÉANCE DU JOUR"
+                  : "ACTIVER LES RÉVISIONS"
+                : "FLASHCARDS SRS & RATTRAPAGE"}
             </span>
             <ArrowUpRight className="h-3.5 w-3.5" />
           </Link>
         </div>
+      )}
+
+      {/* Radar Partiels J-X & Priorités */}
+      {!loading && radarUes.length > 0 && (
+        <section
+          className="mb-6 border border-border bg-card p-4"
+          style={{ borderTop: "3px solid #C83E4D" }}
+        >
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Timer className="h-4 w-4 text-carmine" />
+              <span className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                RADAR PARTIELS &amp; PRIORITÉS DE RÉVISION
+              </span>
+            </div>
+            <span className="font-mono text-[10px] uppercase tracking-wider text-stone">
+              TRIÉ PAR ÉCHÉANCE · COEFF · ERREURS &amp; CARTES DUES
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            {radarUes.map(({ ue, exam, ueErrors, ueDueCards }) => {
+              const isUrgent =
+                exam.daysRemaining !== null && exam.daysRemaining <= 14;
+              const isSoon =
+                exam.daysRemaining !== null &&
+                exam.daysRemaining > 14 &&
+                exam.daysRemaining <= 30;
+              return (
+                <div
+                  key={ue.id}
+                  className="flex flex-col justify-between border border-border bg-paper p-3"
+                >
+                  <div>
+                    <div className="mb-1.5 flex items-center justify-between gap-2">
+                      <span
+                        className={`border px-1.5 py-0.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
+                          isUrgent
+                            ? "border-carmine bg-carmine text-card"
+                            : isSoon
+                            ? "border-amber bg-amber/20 text-ink"
+                            : "border-badge-text/40 bg-badge-bg text-badge-text"
+                        }`}
+                      >
+                        {exam.countdownLabel || exam.dateLabel}
+                      </span>
+                      <span className="font-mono text-[10px] font-semibold uppercase text-stone">
+                        COEFF {ue.coeff ?? 4}
+                      </span>
+                    </div>
+                    <p className="font-mono text-[10px] font-bold uppercase tracking-wider text-stone">
+                      {ue.code} · {exam.dateLabel}
+                    </p>
+                    <p className="mt-0.5 line-clamp-1 text-xs font-bold text-ink">
+                      {ue.title}
+                    </p>
+                    {(ueErrors > 0 || ueDueCards > 0) && (
+                      <div className="mt-2 flex flex-wrap gap-1 font-mono text-[9px] uppercase">
+                        {ueErrors > 0 && (
+                          <span className="border border-carmine/40 bg-carmine/10 px-1.5 py-0.5 text-carmine">
+                            {ueErrors} ERREUR{ueErrors > 1 ? "S" : ""}
+                          </span>
+                        )}
+                        {ueDueCards > 0 && (
+                          <span className="border border-badge-text/40 bg-badge-bg px-1.5 py-0.5 text-badge-text">
+                            {ueDueCards} CARTE{ueDueCards > 1 ? "S" : ""} DUE
+                            {ueDueCards > 1 ? "S" : ""}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-3 grid grid-cols-2 gap-1.5 border-t border-border pt-2 font-mono text-[9px] uppercase tracking-wider">
+                    <Link
+                      href={`/ue/${ue.id}?tab=studio`}
+                      className="border border-border bg-card px-2 py-1 text-center font-semibold text-ink hover:border-ink hover:bg-pinned"
+                    >
+                      STUDIO
+                    </Link>
+                    <Link
+                      href={`/ue/${ue.id}?tab=exam`}
+                      className="border border-ink bg-ink px-2 py-1 text-center font-semibold text-card hover:bg-ink/90"
+                    >
+                      PARTIEL BLANC
+                    </Link>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
       )}
 
       {/* Content */}

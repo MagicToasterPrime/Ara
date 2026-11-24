@@ -8,29 +8,33 @@ import {
   Copy,
   Download,
   FileText,
+  Flag,
+  Loader2,
   Maximize2,
   Minimize2,
+  Pencil,
+  Plus,
   Printer,
+  Save,
+  Trash2,
   X,
 } from "lucide-react";
+import {
+  buildAnkiTsvExport,
+  buildFlashcardKey,
+  buildFlashcardsCsvExport,
+  buildSummaryMarkdownExport,
+} from "@/lib/artifact-export";
+import { isRevisionQuestionCorrect } from "@/lib/question-grading";
 import type { RevisionQuestion } from "@/lib/revisions";
 import type {
+  FlashcardItem,
   StudioArtifactContent,
   StudioSourceRef,
   SummaryPayload,
 } from "@/lib/studio";
 
 const OPTION_LETTERS = ["A", "B", "C", "D"];
-
-function normalizeTextForMatch(input: string): string {
-  return input
-    .trim()
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, " ");
-}
 
 function escapeHtml(str: string): string {
   return str
@@ -261,16 +265,28 @@ function buildPrintableSummaryHtml(title: string, summary: SummaryPayload): stri
 }
 
 interface StudioArtifactViewerProps {
+  artifactId?: string;
+  ueId?: string;
+  ueCode?: string;
+  documentId?: string | null;
   title: string;
   content: StudioArtifactContent;
   compact?: boolean;
+  canEdit?: boolean;
+  onArtifactUpdated?: (content: StudioArtifactContent, newTitle?: string) => void;
   onOpenSource?: (source: StudioSourceRef) => void;
 }
 
 export function StudioArtifactViewer({
+  artifactId,
+  ueId,
+  ueCode,
+  documentId,
   title,
   content,
   compact = false,
+  canEdit = false,
+  onArtifactUpdated,
   onOpenSource,
 }: StudioArtifactViewerProps) {
   // SVG state
@@ -279,24 +295,119 @@ export function StudioArtifactViewer({
 
   // Flashcards SRS state
   const [cardIndex, setCardIndex] = useState(0);
-  const [cardFilter, setCardFilter] = useState<"ALL" | "REVIEW">("ALL");
+  const [cardFilter, setCardFilter] = useState<"ALL" | "DUE" | "REVIEW">("ALL");
   const [flipped, setFlipped] = useState(false);
   const [masteredIds, setMasteredIds] = useState<Record<string, boolean>>({});
   const [srsRatings, setSrsRatings] = useState<
     Record<string, "AGAIN" | "HARD" | "GOOD" | "EASY">
   >({});
+  const [srsByCardKey, setSrsByCardKey] = useState<
+    Record<
+      string,
+      {
+        rating: "AGAIN" | "HARD" | "GOOD" | "EASY";
+        nextReviewDate: string;
+        mastered: boolean;
+      }
+    >
+  >({});
+  const [todayKey, setTodayKey] = useState<string>("");
+  const [cardTouchStartX, setCardTouchStartX] = useState<number | null>(null);
 
   // Quiz state
   const [quizAnswers, setQuizAnswers] = useState<
     Record<string, number[] | string>
   >({});
   const [quizSubmitted, setQuizSubmitted] = useState(false);
+  const [missedRecordedCount, setMissedRecordedCount] = useState<number | null>(
+    null
+  );
+
+  // Inline Edit & Reporting state
+  const [isEditing, setIsEditing] = useState(false);
+  const [editTitle, setEditTitle] = useState(title);
+  const [editDraft, setEditDraft] = useState<StudioArtifactContent | null>(
+    null
+  );
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editStatusMsg, setEditStatusMsg] = useState<string | null>(null);
+
+  const [reportOpen, setReportOpen] = useState(false);
+  const [reportItemLabel, setReportItemLabel] = useState("");
+  const [reportDescription, setReportDescription] = useState("");
+  const [reportBusy, setReportBusy] = useState(false);
+  const [reportSuccess, setReportSuccess] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEditTitle(title);
+    setEditDraft(null);
+    setIsEditing(false);
+    setEditStatusMsg(null);
+  }, [artifactId, title]);
 
   const isFlashcards = content.kind === "FLASHCARDS";
+
+  useEffect(() => {
+    if (!isFlashcards || !artifactId) return;
+    let active = true;
+    fetch(`/api/studio/srs?artifactId=${encodeURIComponent(artifactId)}`, {
+      cache: "no-store",
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then(
+        (
+          data: {
+            todayKey?: string;
+            reviews?: Record<
+              string,
+              {
+                rating: "AGAIN" | "HARD" | "GOOD" | "EASY";
+                nextReviewDate: string;
+                mastered: boolean;
+              }
+            >;
+          } | null
+        ) => {
+          if (!active || !data) return;
+          if (data.todayKey) setTodayKey(data.todayKey);
+          if (data.reviews) {
+            setSrsByCardKey(data.reviews);
+            const nextMastered: Record<string, boolean> = {};
+            const nextRatings: Record<
+              string,
+              "AGAIN" | "HARD" | "GOOD" | "EASY"
+            > = {};
+            const cards = content.kind === "FLASHCARDS" ? content.cards || [] : [];
+            for (const c of cards) {
+              const rev = data.reviews[buildFlashcardKey(c.front)];
+              if (rev) {
+                nextMastered[c.id] = Boolean(rev.mastered);
+                nextRatings[c.id] = rev.rating;
+              }
+            }
+            setMasteredIds(nextMastered);
+            setSrsRatings(nextRatings);
+          }
+        }
+      )
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [isFlashcards, artifactId, content]);
+
   const allCards = isFlashcards ? content.cards || [] : [];
   const unmasteredCards = allCards.filter((c) => !masteredIds[c.id]);
+  const dueCards = allCards.filter((c) => {
+    const rev = srsByCardKey[buildFlashcardKey(c.front)];
+    if (!rev) return true;
+    if (rev.mastered) return false;
+    return !todayKey || rev.nextReviewDate <= todayKey;
+  });
   const visibleCards =
-    cardFilter === "REVIEW" && unmasteredCards.length > 0
+    cardFilter === "DUE" && dueCards.length > 0
+      ? dueCards
+      : cardFilter === "REVIEW" && unmasteredCards.length > 0
       ? unmasteredCards
       : allCards;
   const safeCardIdx = Math.min(
@@ -318,7 +429,7 @@ export function StudioArtifactViewer({
 
   // Keyboard shortcuts ("Space" to flip, "←/→" to navigate) for Flashcards
   useEffect(() => {
-    if (!isFlashcards || visibleCards.length === 0) return;
+    if (!isFlashcards || visibleCards.length === 0 || isEditing) return;
 
     function onKeyDown(e: KeyboardEvent) {
       const target = e.target as HTMLElement | null;
@@ -344,25 +455,158 @@ export function StudioArtifactViewer({
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isFlashcards, visibleCards.length, handlePrevCard, handleNextCard]);
+  }, [isFlashcards, visibleCards.length, isEditing, handlePrevCard, handleNextCard]);
 
-  function handleDownloadSvg(svgMarkup: string) {
-    const blob = new Blob([svgMarkup], {
-      type: "image/svg+xml;charset=utf-8",
-    });
+  function downloadFileWithSlug(
+    fileContent: string,
+    ext: string,
+    mimeType: string
+  ) {
+    const blob = new Blob([fileContent], { type: mimeType });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     const slug =
       title
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
-        .replace(/^-|-$/g, "") || "schema-ara";
+        .replace(/^-|-$/g, "") || "ara-export";
     a.href = url;
-    a.download = `${slug}.svg`;
+    a.download = `${slug}.${ext}`;
     document.body.appendChild(a);
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+  }
+
+  function handleDownloadSvg(svgMarkup: string) {
+    downloadFileWithSlug(svgMarkup, "svg", "image/svg+xml;charset=utf-8");
+  }
+
+  function startInlineEdit() {
+    setEditDraft(JSON.parse(JSON.stringify(content)) as StudioArtifactContent);
+    setEditTitle(title);
+    setIsEditing(true);
+    setEditStatusMsg(null);
+  }
+
+  async function saveInlineEdit() {
+    if (!artifactId || !editDraft || savingEdit) return;
+    setSavingEdit(true);
+    setEditStatusMsg(null);
+    try {
+      const res = await fetch(`/api/studio/${artifactId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: editTitle.trim() || title,
+          content: editDraft,
+        }),
+      });
+      if (!res.ok) {
+        setEditStatusMsg("Erreur lors de l'enregistrement des modifications.");
+        return;
+      }
+      onArtifactUpdated?.(editDraft, editTitle.trim() || title);
+      setIsEditing(false);
+      setEditStatusMsg("Modifications enregistrées.");
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+  async function submitIssueReport(defaultLabel: string) {
+    if (reportDescription.trim().length < 4 || reportBusy) return;
+    setReportBusy(true);
+    try {
+      const res = await fetch("/api/studio/reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ueId,
+          ueCode,
+          documentId,
+          artifactId,
+          targetKind: content.kind,
+          itemLabel: (reportItemLabel || defaultLabel).slice(0, 160),
+          description: reportDescription.trim(),
+        }),
+      });
+      if (res.ok) {
+        setReportOpen(false);
+        setReportDescription("");
+        setReportSuccess(
+          "Signalement envoyé aux responsables. Merci pour votre aide !"
+        );
+      }
+    } finally {
+      setReportBusy(false);
+    }
+  }
+
+  function renderReportBlock(defaultLabel: string) {
+    return (
+      <div className="border-t border-border bg-paper/60 px-3.5 py-2.5">
+        {reportSuccess && (
+          <p className="mb-1.5 font-mono text-[10px] uppercase tracking-wider text-forest">
+            ✓ {reportSuccess}
+          </p>
+        )}
+        {!reportOpen ? (
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            {editStatusMsg && (
+              <span className="font-mono text-[10px] uppercase tracking-wider text-forest">
+                ✓ {editStatusMsg}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setReportItemLabel(defaultLabel);
+                setReportOpen(true);
+                setReportSuccess(null);
+              }}
+              className="ml-auto inline-flex items-center gap-1 font-mono text-[10px] uppercase tracking-wider text-stone hover:text-carmine"
+            >
+              <Flag className="h-3 w-3" />
+              <span>SIGNALER UNE ERREUR</span>
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <p className="font-mono text-[10px] font-bold uppercase tracking-wider text-ink">
+              SIGNALEMENT : {reportItemLabel || defaultLabel}
+            </p>
+            <textarea
+              rows={2}
+              value={reportDescription}
+              onChange={(e) => setReportDescription(e.target.value)}
+              placeholder="Précisez l'erreur repérée (valeur, réponse, formulation)..."
+              className="w-full border border-border bg-card px-2.5 py-1.5 text-xs text-ink focus:border-ink focus:outline-none"
+            />
+            <div className="flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setReportOpen(false);
+                  setReportDescription("");
+                }}
+                className="border border-border bg-card px-2.5 py-1 font-mono text-[10px] uppercase text-stone hover:text-ink"
+              >
+                ANNULER
+              </button>
+              <button
+                type="button"
+                disabled={reportBusy || reportDescription.trim().length < 4}
+                onClick={() => void submitIssueReport(defaultLabel)}
+                className="border border-carmine bg-carmine px-3 py-1 font-mono text-[10px] font-semibold uppercase text-card disabled:opacity-50"
+              >
+                {reportBusy ? "ENVOI..." : "ENVOYER LE SIGNALEMENT"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    );
   }
 
   async function handleCopySvg(svgMarkup: string) {
@@ -488,19 +732,73 @@ export function StudioArtifactViewer({
       rating: "AGAIN" | "HARD" | "GOOD" | "EASY",
       mastered: boolean
     ) => {
+      const card = currentCard;
+      const cKey = buildFlashcardKey(card.front);
       setMasteredIds((prev) => ({
         ...prev,
-        [currentCard.id]: mastered,
+        [card.id]: mastered,
       }));
       setSrsRatings((prev) => ({
         ...prev,
-        [currentCard.id]: rating,
+        [card.id]: rating,
       }));
+      setSrsByCardKey((prev) => ({
+        ...prev,
+        [cKey]: {
+          rating,
+          mastered,
+          nextReviewDate:
+            rating === "AGAIN"
+              ? todayKey || "2099-01-01"
+              : "2099-01-01",
+        },
+      }));
+      if (artifactId) {
+        void fetch("/api/studio/srs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            artifactId,
+            cardKey: cKey,
+            front: card.front,
+            ueId: ueId || card.ueId,
+            ueCode: ueCode || "",
+            documentId: documentId || card.documentId,
+            rating,
+          }),
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .then(
+            (
+              d: {
+                review?: {
+                  rating: "AGAIN" | "HARD" | "GOOD" | "EASY";
+                  nextReviewDate: string;
+                  mastered: boolean;
+                };
+              } | null
+            ) => {
+              if (d?.review) {
+                setSrsByCardKey((prev) => ({ ...prev, [cKey]: d.review! }));
+                setMasteredIds((prev) => ({
+                  ...prev,
+                  [card.id]: Boolean(d.review!.mastered),
+                }));
+              }
+            }
+          )
+          .catch(() => null);
+      }
       setFlipped(false);
       if (safeCardIdx < visibleCards.length - 1) {
         setCardIndex(safeCardIdx + 1);
       }
     };
+
+    const editingCardsDraft =
+      isEditing && editDraft?.kind === "FLASHCARDS"
+        ? editDraft.cards
+        : (null as FlashcardItem[] | null);
 
     return (
       <div className="border border-ink bg-card">
@@ -512,7 +810,7 @@ export function StudioArtifactViewer({
             </span>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
             <button
               type="button"
               onClick={() => {
@@ -530,6 +828,22 @@ export function StudioArtifactViewer({
             </button>
             <button
               type="button"
+              disabled={dueCards.length === 0}
+              onClick={() => {
+                setCardFilter("DUE");
+                setCardIndex(0);
+                setFlipped(false);
+              }}
+              className={`border px-2 py-0.5 text-[9px] disabled:opacity-40 ${
+                cardFilter === "DUE"
+                  ? "border-badge-text bg-badge-text text-card"
+                  : "border-border bg-card text-badge-text hover:border-badge-text"
+              }`}
+            >
+              DUES ({dueCards.length})
+            </button>
+            <button
+              type="button"
               disabled={unmasteredCards.length === 0}
               onClick={() => {
                 setCardFilter("REVIEW");
@@ -544,175 +858,337 @@ export function StudioArtifactViewer({
             >
               À REVOIR ({unmasteredCards.length})
             </button>
-          </div>
-        </div>
 
-        <div className="p-4 sm:p-5">
-          {batchRanges.length > 0 && (
-            <div className="mb-3 flex flex-wrap items-center gap-1">
-              <span className="mr-1 font-mono text-[9px] uppercase text-stone">
-                LOTS :
-              </span>
-              {batchRanges.map((b) => {
-                const activeBatch = safeCardIdx >= b.start && safeCardIdx < b.end;
-                return (
-                  <button
-                    key={b.label}
-                    type="button"
-                    onClick={() => {
-                      setFlipped(false);
-                      setCardIndex(b.start);
-                    }}
-                    className={`border px-2 py-0.5 font-mono text-[9px] uppercase ${
-                      activeBatch
-                        ? "border-ink bg-ink font-bold text-card"
-                        : "border-border bg-paper text-stone hover:border-ink hover:text-ink"
-                    }`}
-                  >
-                    {b.label}
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Keyboard hint modeled after NotebookLM Capture 2 */}
-          <p className="mb-3 text-center font-mono text-[10px] text-stone">
-            Appuyer sur &quot;Espace&quot; pour retourner, &quot;←/→&quot; pour
-            naviguer
-          </p>
-
-          {/* Interactive Flashcard */}
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={() => setFlipped((p) => !p)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                setFlipped((p) => !p);
+            <button
+              type="button"
+              onClick={() =>
+                downloadFileWithSlug(
+                  buildAnkiTsvExport(title, allCards, ueCode),
+                  "tsv",
+                  "text/tab-separated-values;charset=utf-8"
+                )
               }
-            }}
-            className={`mx-auto flex w-full max-w-xl cursor-pointer flex-col justify-between border border-ink p-5 text-left transition-colors focus:outline-none ${
-              compact ? "min-h-[180px]" : "min-h-[240px]"
-            } ${flipped ? "bg-pinned" : "bg-paper"}`}
-          >
-            <div className="flex items-center justify-between gap-2 font-mono text-[10px] text-stone">
-              <span className="font-bold text-ink">
-                {safeCardIdx + 1}/{visibleCards.length}
-              </span>
-              <span className="uppercase">
-                {currentCard.tag} · {currentCard.fileName} (P.
-                {currentCard.pageNumber})
-              </span>
-            </div>
+              title="Exporter pour Anki (.tsv)"
+              className="inline-flex items-center gap-1 border border-border bg-card px-2 py-0.5 text-[9px] text-ink hover:border-ink"
+            >
+              <Download className="h-2.5 w-2.5" />
+              <span>ANKI (.TSV)</span>
+            </button>
 
-            <div className="my-5 flex flex-1 items-center justify-center text-center">
-              <p
-                className={`leading-relaxed text-ink ${
-                  flipped
-                    ? "text-sm font-medium sm:text-base"
-                    : "text-base font-bold sm:text-xl"
+            <button
+              type="button"
+              onClick={() =>
+                downloadFileWithSlug(
+                  buildFlashcardsCsvExport(allCards),
+                  "csv",
+                  "text/csv;charset=utf-8"
+                )
+              }
+              title="Exporter en CSV"
+              className="inline-flex items-center gap-1 border border-border bg-card px-2 py-0.5 text-[9px] text-ink hover:border-ink"
+            >
+              <Download className="h-2.5 w-2.5" />
+              <span>.CSV</span>
+            </button>
+
+            {canEdit && artifactId && (
+              <button
+                type="button"
+                onClick={() =>
+                  isEditing ? setIsEditing(false) : startInlineEdit()
+                }
+                className={`inline-flex items-center gap-1 border px-2 py-0.5 text-[9px] font-bold ${
+                  isEditing
+                    ? "border-carmine bg-carmine text-card"
+                    : "border-ink bg-card text-ink hover:bg-pinned"
                 }`}
               >
-                {flipped
-                  ? renderFormattedText(currentCard.back)
-                  : currentCard.front}
-              </p>
-            </div>
-
-            <div className="text-center font-mono text-[11px] text-stone">
-              {flipped ? "Afficher la question" : "Afficher la réponse"}
-            </div>
-          </div>
-
-          {/* NotebookLM Control Bar: ← | ✗ N | M ✓ | → */}
-          <div className="mx-auto mt-4 flex max-w-xl items-center justify-center gap-3">
-            <button
-              type="button"
-              onClick={handlePrevCard}
-              disabled={safeCardIdx === 0}
-              aria-label="Carte précédente"
-              className="inline-flex h-10 w-10 items-center justify-center border border-border bg-paper text-ink hover:border-ink disabled:opacity-35"
-            >
-              <ArrowLeft className="h-4 w-4" />
-            </button>
-
-            <button
-              type="button"
-              onClick={() => gradeCard("AGAIN", false)}
-              className="inline-flex h-10 min-w-[74px] items-center justify-center gap-1.5 border border-carmine/40 bg-carmine/10 px-3 font-mono text-xs font-bold text-carmine hover:bg-carmine hover:text-card"
-              title="À revoir"
-            >
-              <X className="h-3.5 w-3.5" />
-              <span>{reviewCount}</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => gradeCard("EASY", true)}
-              className="inline-flex h-10 min-w-[74px] items-center justify-center gap-1.5 border border-forest/50 bg-forest/10 px-3 font-mono text-xs font-bold text-forest hover:bg-forest hover:text-card"
-              title="Maîtrisée"
-            >
-              <span>{masteredCount}</span>
-              <Check className="h-3.5 w-3.5" />
-            </button>
-
-            <button
-              type="button"
-              onClick={handleNextCard}
-              disabled={safeCardIdx >= visibleCards.length - 1}
-              aria-label="Carte suivante"
-              className="inline-flex h-10 w-10 items-center justify-center border border-ink bg-ink text-card hover:bg-ink/90 disabled:opacity-35"
-            >
-              <ArrowRight className="h-4 w-4" />
-            </button>
+                <Pencil className="h-2.5 w-2.5" />
+                <span>{isEditing ? "QUITTER ÉDITION" : "ÉDITER"}</span>
+              </button>
+            )}
           </div>
         </div>
+
+        {isEditing && editingCardsDraft ? (
+          <div className="space-y-4 p-4">
+            <div>
+              <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
+                TITRE DU PAQUET DE FLASHCARDS
+              </label>
+              <input
+                type="text"
+                value={editTitle}
+                onChange={(e) => setEditTitle(e.target.value)}
+                className="w-full border border-border bg-paper px-3 py-1.5 text-sm font-bold text-ink focus:border-ink focus:outline-none"
+              />
+            </div>
+
+            <div className="max-h-[420px] space-y-3 overflow-y-auto pr-1">
+              {editingCardsDraft.map((fc, idx) => (
+                <div
+                  key={fc.id || idx}
+                  className="space-y-2 border border-border bg-paper p-3"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-[10px] font-bold uppercase text-stone">
+                      CARTE #{idx + 1} · P.{fc.pageNumber}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={editingCardsDraft.length <= 1}
+                      onClick={() => {
+                        setEditDraft({
+                          kind: "FLASHCARDS",
+                          sources: content.sources,
+                          cards: editingCardsDraft.filter((_, i) => i !== idx),
+                        });
+                      }}
+                      className="inline-flex items-center gap-1 font-mono text-[9px] uppercase text-carmine hover:underline disabled:opacity-40"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                      <span>SUPPRIMER</span>
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    value={fc.front}
+                    onChange={(e) => {
+                      const next = editingCardsDraft.map((item, i) =>
+                        i === idx ? { ...item, front: e.target.value } : item
+                      );
+                      setEditDraft({
+                        kind: "FLASHCARDS",
+                        sources: content.sources,
+                        cards: next,
+                      });
+                    }}
+                    placeholder="Question recto"
+                    className="w-full border border-border bg-card px-2.5 py-1.5 text-xs font-semibold text-ink"
+                  />
+                  <textarea
+                    rows={2}
+                    value={fc.back}
+                    onChange={(e) => {
+                      const next = editingCardsDraft.map((item, i) =>
+                        i === idx ? { ...item, back: e.target.value } : item
+                      );
+                      setEditDraft({
+                        kind: "FLASHCARDS",
+                        sources: content.sources,
+                        cards: next,
+                      });
+                    }}
+                    placeholder="Réponse verso"
+                    className="w-full border border-border bg-card px-2.5 py-1.5 text-xs text-ink"
+                  />
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t border-border pt-3">
+              <button
+                type="button"
+                onClick={() => setIsEditing(false)}
+                className="border border-border bg-paper px-3 py-1.5 font-mono text-[10px] uppercase text-stone hover:text-ink"
+              >
+                ANNULER
+              </button>
+              <button
+                type="button"
+                disabled={savingEdit}
+                onClick={() => void saveInlineEdit()}
+                className="inline-flex items-center gap-1.5 border border-ink bg-ink px-4 py-1.5 font-mono text-[10px] font-semibold uppercase text-card disabled:opacity-50"
+              >
+                {savingEdit ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Save className="h-3 w-3" />
+                )}
+                <span>ENREGISTRER LES MODIFICATIONS</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="p-4 sm:p-5">
+            {batchRanges.length > 0 && (
+              <div className="mb-3 flex flex-wrap items-center gap-1">
+                <span className="mr-1 font-mono text-[9px] uppercase text-stone">
+                  LOTS :
+                </span>
+                {batchRanges.map((b) => {
+                  const activeBatch =
+                    safeCardIdx >= b.start && safeCardIdx < b.end;
+                  return (
+                    <button
+                      key={b.label}
+                      type="button"
+                      onClick={() => {
+                        setFlipped(false);
+                        setCardIndex(b.start);
+                      }}
+                      className={`border px-2 py-0.5 font-mono text-[9px] uppercase ${
+                        activeBatch
+                          ? "border-ink bg-ink font-bold text-card"
+                          : "border-border bg-paper text-stone hover:border-ink hover:text-ink"
+                      }`}
+                    >
+                      {b.label}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            <p className="mb-3 text-center font-mono text-[10px] text-stone">
+              &quot;Espace&quot; ou clic pour retourner · &quot;←/→&quot; ou
+              swipe tactile pour naviguer
+            </p>
+
+            {/* Interactive Flashcard with Mobile Horizontal Swipe */}
+            <div
+              role="button"
+              tabIndex={0}
+              onClick={() => setFlipped((p) => !p)}
+              onTouchStart={(e) =>
+                setCardTouchStartX(e.changedTouches[0]?.clientX ?? null)
+              }
+              onTouchEnd={(e) => {
+                if (cardTouchStartX === null) return;
+                const dx =
+                  (e.changedTouches[0]?.clientX ?? cardTouchStartX) -
+                  cardTouchStartX;
+                setCardTouchStartX(null);
+                if (Math.abs(dx) > 55) {
+                  if (dx < 0) {
+                    handleNextCard();
+                  } else {
+                    handlePrevCard();
+                  }
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  setFlipped((p) => !p);
+                }
+              }}
+              className={`mx-auto flex w-full max-w-xl cursor-pointer flex-col justify-between border border-ink p-5 text-left transition-colors focus:outline-none ${
+                compact ? "min-h-[180px]" : "min-h-[240px]"
+              } ${flipped ? "bg-pinned" : "bg-paper"}`}
+            >
+              <div className="flex items-center justify-between gap-2 font-mono text-[10px] text-stone">
+                <span className="font-bold text-ink">
+                  {safeCardIdx + 1}/{visibleCards.length}
+                </span>
+                <span className="uppercase">
+                  {currentCard.tag} · {currentCard.fileName} (P.
+                  {currentCard.pageNumber})
+                </span>
+              </div>
+
+              <div className="my-5 flex flex-1 items-center justify-center text-center">
+                <p
+                  className={`leading-relaxed text-ink ${
+                    flipped
+                      ? "text-sm font-medium sm:text-base"
+                      : "text-base font-bold sm:text-xl"
+                  }`}
+                >
+                  {flipped
+                    ? renderFormattedText(currentCard.back)
+                    : currentCard.front}
+                </p>
+              </div>
+
+              <div className="flex items-center justify-between font-mono text-[11px] text-stone">
+                <span>
+                  {srsByCardKey[buildFlashcardKey(currentCard.front)]
+                    ?.nextReviewDate
+                    ? `SRS : ${
+                        srsByCardKey[buildFlashcardKey(currentCard.front)]
+                          .nextReviewDate
+                      }`
+                    : "NOUVELLE"}
+                </span>
+                <span>
+                  {flipped ? "Afficher la question" : "Afficher la réponse"}
+                </span>
+              </div>
+            </div>
+
+            {/* Mobile-Friendly SM-2 Control Bar */}
+            <div className="mx-auto mt-4 max-w-xl space-y-2.5">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <button
+                  type="button"
+                  onClick={() => gradeCard("AGAIN", false)}
+                  className="inline-flex min-h-[42px] items-center justify-center gap-1 border border-carmine/50 bg-carmine/10 px-2 font-mono text-[10px] font-bold uppercase text-carmine hover:bg-carmine hover:text-card"
+                >
+                  <X className="h-3.5 w-3.5" />
+                  <span>À REVOIR ({reviewCount})</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => gradeCard("HARD", false)}
+                  className="inline-flex min-h-[42px] items-center justify-center border border-amber/60 bg-amber/15 px-2 font-mono text-[10px] font-bold uppercase text-ink hover:bg-amber hover:text-card"
+                >
+                  DIFFICILE (1J)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => gradeCard("GOOD", true)}
+                  className="inline-flex min-h-[42px] items-center justify-center border border-badge-text/50 bg-badge-bg px-2 font-mono text-[10px] font-bold uppercase text-badge-text hover:bg-badge-text hover:text-card"
+                >
+                  BIEN (3J+)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => gradeCard("EASY", true)}
+                  className="inline-flex min-h-[42px] items-center justify-center gap-1 border border-forest/50 bg-forest/10 px-2 font-mono text-[10px] font-bold uppercase text-forest hover:bg-forest hover:text-card"
+                >
+                  <Check className="h-3.5 w-3.5" />
+                  <span>FACILE ({masteredCount})</span>
+                </button>
+              </div>
+
+              <div className="flex items-center justify-between gap-3">
+                <button
+                  type="button"
+                  onClick={handlePrevCard}
+                  disabled={safeCardIdx === 0}
+                  aria-label="Carte précédente"
+                  className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-1.5 border border-border bg-paper px-3 font-mono text-[10px] uppercase text-ink hover:border-ink disabled:opacity-35"
+                >
+                  <ArrowLeft className="h-4 w-4" />
+                  <span>PRÉCÉDENTE</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleNextCard}
+                  disabled={safeCardIdx >= visibleCards.length - 1}
+                  aria-label="Carte suivante"
+                  className="inline-flex min-h-[40px] flex-1 items-center justify-center gap-1.5 border border-ink bg-ink px-3 font-mono text-[10px] uppercase text-card hover:bg-ink/90 disabled:opacity-35"
+                >
+                  <span>SUIVANTE</span>
+                  <ArrowRight className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {renderReportBlock(
+          `Flashcard #${safeCardIdx + 1} : ${currentCard.front.slice(0, 70)}`
+        )}
       </div>
     );
   }
 
   if (content.kind === "QUIZ") {
     const questions = content.questions || [];
-    const checkCorrect = (q: RevisionQuestion): boolean => {
-      const ans = quizAnswers[q.id];
-      if (q.type === "FILL_BLANK") {
-        const g = typeof ans === "string" ? normalizeTextForMatch(ans) : "";
-        const e = q.correctAnswer ? normalizeTextForMatch(q.correctAnswer) : "";
-        return Boolean(e && g === e);
-      }
-      if (q.type === "QROC") {
-        const given = typeof ans === "string" ? normalizeTextForMatch(ans) : "";
-        if (given.length < 2) return false;
-        const expected = q.correctAnswer
-          ? normalizeTextForMatch(q.correctAnswer)
-          : "";
-        const matchesMain = Boolean(
-          expected &&
-            (given === expected ||
-              (expected.length >= 3 && given.includes(expected)) ||
-              (given.length >= 4 && expected.includes(given)))
-        );
-        const keywords = (q.acceptedKeywords || [])
-          .map((k) => normalizeTextForMatch(k))
-          .filter((k) => k.length >= 3);
-        const matchesKeyword = keywords.some(
-          (kw) =>
-            given === kw ||
-            given.includes(kw) ||
-            (given.length >= 4 && kw.includes(given))
-        );
-        return matchesMain || matchesKeyword;
-      }
-      const sel = Array.isArray(ans) ? [...ans].sort((a, b) => a - b) : [];
-      const exp = [...(q.correctIndices || [])].sort((a, b) => a - b);
-      return (
-        exp.length > 0 &&
-        sel.length === exp.length &&
-        sel.every((v, idx) => v === exp[idx])
-      );
-    };
+    const checkCorrect = (q: RevisionQuestion): boolean =>
+      isRevisionQuestionCorrect(q, quizAnswers[q.id]);
 
     const score = quizSubmitted
       ? questions.filter((q) => checkCorrect(q)).length
@@ -724,26 +1200,245 @@ export function StudioArtifactViewer({
         : typeof a === "string" && a.trim().length > 0;
     }).length;
 
+    const handleSubmitStudioQuiz = () => {
+      setQuizSubmitted(true);
+      const missed = questions.filter((q) => !checkCorrect(q));
+      if (missed.length > 0) {
+        void fetch("/api/revisions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "RECORD_MISSED",
+            missedQuestions: missed,
+          }),
+        })
+          .then((r) => (r.ok ? r.json() : null))
+          .then((d: { recorded?: number } | null) => {
+            if (d && typeof d.recorded === "number" && d.recorded > 0) {
+              setMissedRecordedCount(d.recorded);
+            }
+          })
+          .catch(() => null);
+      } else {
+        setMissedRecordedCount(0);
+      }
+    };
+
+    const editingQuestionsDraft =
+      isEditing && editDraft?.kind === "QUIZ" ? editDraft.questions : null;
+
     return (
       <div className="border border-ink bg-card">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border bg-paper px-3.5 py-2.5 font-mono text-[10px] uppercase tracking-wider">
           <span className="font-bold text-ink">
             QUIZ STUDIO ({questions.length} QUESTIONS)
           </span>
-          <div className="flex items-center gap-2">
-            {!quizSubmitted && (
+          <div className="flex flex-wrap items-center gap-2">
+            {!quizSubmitted && !isEditing && (
               <span className="text-stone">
                 RÉPONDUES : {answeredCount} / {questions.length}
               </span>
             )}
-            {quizSubmitted && (
+            {quizSubmitted && !isEditing && (
               <span className="bg-badge-bg px-2 py-0.5 font-bold text-badge-text">
                 SCORE : {score} / {questions.length}
               </span>
             )}
+            {canEdit && artifactId && (
+              <button
+                type="button"
+                onClick={() =>
+                  isEditing ? setIsEditing(false) : startInlineEdit()
+                }
+                className={`inline-flex items-center gap-1 border px-2 py-0.5 text-[9px] font-bold ${
+                  isEditing
+                    ? "border-carmine bg-carmine text-card"
+                    : "border-ink bg-card text-ink hover:bg-pinned"
+                }`}
+              >
+                <Pencil className="h-2.5 w-2.5" />
+                <span>{isEditing ? "QUITTER ÉDITION" : "ÉDITER"}</span>
+              </button>
+            )}
           </div>
         </div>
 
+        {isEditing && editingQuestionsDraft ? (
+          <div className="space-y-4 p-4">
+            <div>
+              <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
+                TITRE DU QUIZ
+              </label>
+              <input
+                type="text"
+                value={editTitle}
+                onChange={(e) => setEditTitle(e.target.value)}
+                className="w-full border border-border bg-paper px-3 py-1.5 text-sm font-bold text-ink"
+              />
+            </div>
+
+            <div className="max-h-[480px] space-y-3 overflow-y-auto pr-1">
+              {editingQuestionsDraft.map((eq, qIdx) => (
+                <div
+                  key={eq.id || qIdx}
+                  className="space-y-2 border border-border bg-paper p-3"
+                >
+                  <div className="flex items-center justify-between font-mono text-[10px] uppercase text-stone">
+                    <span>
+                      Q{qIdx + 1} · {eq.type} · P.{eq.pageNumber}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={editingQuestionsDraft.length <= 1}
+                      onClick={() =>
+                        setEditDraft({
+                          kind: "QUIZ",
+                          sources: content.sources,
+                          questions: editingQuestionsDraft.filter(
+                            (_, i) => i !== qIdx
+                          ),
+                        })
+                      }
+                      className="text-carmine hover:underline disabled:opacity-40"
+                    >
+                      SUPPRIMER
+                    </button>
+                  </div>
+                  <input
+                    type="text"
+                    value={eq.prompt}
+                    onChange={(e) => {
+                      const next = editingQuestionsDraft.map((item, i) =>
+                        i === qIdx ? { ...item, prompt: e.target.value } : item
+                      );
+                      setEditDraft({
+                        kind: "QUIZ",
+                        sources: content.sources,
+                        questions: next,
+                      });
+                    }}
+                    className="w-full border border-border bg-card px-2.5 py-1.5 text-xs font-semibold text-ink"
+                  />
+                  {(eq.type === "QCU" || eq.type === "QCM") && eq.options && (
+                    <div className="space-y-1">
+                      {eq.options.map((opt, oIdx) => {
+                        const checked = (eq.correctIndices || []).includes(
+                          oIdx
+                        );
+                        return (
+                          <div key={oIdx} className="flex items-center gap-2">
+                            <input
+                              type={eq.type === "QCU" ? "radio" : "checkbox"}
+                              checked={checked}
+                              onChange={() => {
+                                const cur = eq.correctIndices || [];
+                                const nextIdx =
+                                  eq.type === "QCU"
+                                    ? [oIdx]
+                                    : checked
+                                    ? cur.filter((x) => x !== oIdx)
+                                    : [...cur, oIdx].sort((a, b) => a - b);
+                                const next = editingQuestionsDraft.map(
+                                  (item, i) =>
+                                    i === qIdx
+                                      ? { ...item, correctIndices: nextIdx }
+                                      : item
+                                );
+                                setEditDraft({
+                                  kind: "QUIZ",
+                                  sources: content.sources,
+                                  questions: next,
+                                });
+                              }}
+                            />
+                            <input
+                              type="text"
+                              value={opt}
+                              onChange={(e) => {
+                                const nextOpts = eq.options!.map((o, oi) =>
+                                  oi === oIdx ? e.target.value : o
+                                );
+                                const next = editingQuestionsDraft.map(
+                                  (item, i) =>
+                                    i === qIdx
+                                      ? { ...item, options: nextOpts }
+                                      : item
+                                );
+                                setEditDraft({
+                                  kind: "QUIZ",
+                                  sources: content.sources,
+                                  questions: next,
+                                });
+                              }}
+                              className="flex-1 border border-border bg-card px-2 py-1 text-xs text-ink"
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {(eq.type === "QROC" || eq.type === "FILL_BLANK") && (
+                    <input
+                      type="text"
+                      value={eq.correctAnswer || ""}
+                      onChange={(e) => {
+                        const next = editingQuestionsDraft.map((item, i) =>
+                          i === qIdx
+                            ? { ...item, correctAnswer: e.target.value }
+                            : item
+                        );
+                        setEditDraft({
+                          kind: "QUIZ",
+                          sources: content.sources,
+                          questions: next,
+                        });
+                      }}
+                      placeholder="Réponse exacte attendue"
+                      className="w-full border border-border bg-card px-2.5 py-1 text-xs text-ink"
+                    />
+                  )}
+                  <textarea
+                    rows={2}
+                    value={eq.explanation}
+                    onChange={(e) => {
+                      const next = editingQuestionsDraft.map((item, i) =>
+                        i === qIdx
+                          ? { ...item, explanation: e.target.value }
+                          : item
+                      );
+                      setEditDraft({
+                        kind: "QUIZ",
+                        sources: content.sources,
+                        questions: next,
+                      });
+                    }}
+                    placeholder="Explication pédagogique"
+                    className="w-full border border-border bg-card px-2.5 py-1 text-xs text-stone"
+                  />
+                </div>
+              ))}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t border-border pt-3">
+              <button
+                type="button"
+                onClick={() => setIsEditing(false)}
+                className="border border-border bg-paper px-3 py-1.5 font-mono text-[10px] uppercase text-stone"
+              >
+                ANNULER
+              </button>
+              <button
+                type="button"
+                disabled={savingEdit}
+                onClick={() => void saveInlineEdit()}
+                className="inline-flex items-center gap-1.5 border border-ink bg-ink px-4 py-1.5 font-mono text-[10px] font-semibold uppercase text-card disabled:opacity-50"
+              >
+                <Save className="h-3 w-3" />
+                <span>ENREGISTRER LES MODIFICATIONS</span>
+              </button>
+            </div>
+          </div>
+        ) : (
         <div className="space-y-4 p-4">
           {questions.map((q, idx) => {
             const isOk = quizSubmitted ? checkCorrect(q) : undefined;
@@ -893,6 +1588,16 @@ export function StudioArtifactViewer({
             );
           })}
 
+          {quizSubmitted && missedRecordedCount !== null && missedRecordedCount > 0 && (
+            <div className="border border-amber/50 bg-amber/10 px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-ink">
+              {missedRecordedCount} question
+              {missedRecordedCount > 1 ? "s" : ""} ratée
+              {missedRecordedCount > 1 ? "s" : ""} enregistrée
+              {missedRecordedCount > 1 ? "s" : ""} automatiquement dans votre
+              Carnet d&apos;erreurs SRS (/revisions).
+            </div>
+          )}
+
           <div className="flex justify-end gap-2">
             {quizSubmitted ? (
               <button
@@ -900,6 +1605,7 @@ export function StudioArtifactViewer({
                 onClick={() => {
                   setQuizAnswers({});
                   setQuizSubmitted(false);
+                  setMissedRecordedCount(null);
                 }}
                 className="border border-border bg-paper px-3 py-1.5 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink"
               >
@@ -908,7 +1614,7 @@ export function StudioArtifactViewer({
             ) : (
               <button
                 type="button"
-                onClick={() => setQuizSubmitted(true)}
+                onClick={handleSubmitStudioQuiz}
                 className="border border-ink bg-ink px-4 py-2 font-mono text-[11px] font-semibold uppercase tracking-wider text-card hover:bg-ink/90"
               >
                 CORRIGER LE QUIZ
@@ -916,11 +1622,17 @@ export function StudioArtifactViewer({
             )}
           </div>
         </div>
+        )}
+
+        {renderReportBlock(`Quiz : ${title.slice(0, 70)}`)}
       </div>
     );
   }
 
   // SUMMARY ("Fiche de Révision Ultime" modeled after attached 7-page PDF)
+  const editingSummaryDraft =
+    isEditing && editDraft?.kind === "SUMMARY" ? editDraft : null;
+
   return (
     <div
       className="border border-ink bg-card"
@@ -935,16 +1647,299 @@ export function StudioArtifactViewer({
             {title}
           </h3>
         </div>
-        <button
-          type="button"
-          onClick={() => handlePrintSummaryPdf(content)}
-          className="inline-flex items-center gap-1.5 border border-ink bg-card px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:bg-pinned"
-        >
-          <Printer className="h-3.5 w-3.5" />
-          <span>IMPRIMER / PDF</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() =>
+              downloadFileWithSlug(
+                buildSummaryMarkdownExport(title, content),
+                "md",
+                "text/markdown;charset=utf-8"
+              )
+            }
+            className="inline-flex items-center gap-1.5 border border-border bg-card px-2.5 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:border-ink"
+          >
+            <Download className="h-3.5 w-3.5" />
+            <span>EXPORT .MD</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => handlePrintSummaryPdf(content)}
+            className="inline-flex items-center gap-1.5 border border-ink bg-card px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink hover:bg-pinned"
+          >
+            <Printer className="h-3.5 w-3.5" />
+            <span>IMPRIMER / PDF</span>
+          </button>
+          {canEdit && artifactId && (
+            <button
+              type="button"
+              onClick={() =>
+                isEditing ? setIsEditing(false) : startInlineEdit()
+              }
+              className={`inline-flex items-center gap-1 border px-2.5 py-1.5 font-mono text-[10px] font-bold uppercase tracking-wider ${
+                isEditing
+                  ? "border-carmine bg-carmine text-card"
+                  : "border-ink bg-ink text-card hover:bg-ink/90"
+              }`}
+            >
+              <Pencil className="h-3 w-3" />
+              <span>{isEditing ? "QUITTER ÉDITION" : "ÉDITER"}</span>
+            </button>
+          )}
+        </div>
       </div>
 
+      {isEditing && editingSummaryDraft ? (
+        <div className="space-y-4 p-4 sm:p-6">
+          <div>
+            <label className="mb-1 block font-mono text-[10px] uppercase tracking-wider text-stone">
+              TITRE DE LA FICHE
+            </label>
+            <input
+              type="text"
+              value={editTitle}
+              onChange={(e) => setEditTitle(e.target.value)}
+              className="w-full border border-border bg-paper px-3 py-2 text-sm font-bold text-ink"
+            />
+          </div>
+
+          <div className="space-y-4">
+            {(editingSummaryDraft.sections || []).map((sec, sIdx) => (
+              <div
+                key={sIdx}
+                className="space-y-3 border border-border bg-paper p-3.5"
+              >
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-xs font-bold text-stone">
+                    {sIdx + 1}.
+                  </span>
+                  <input
+                    type="text"
+                    value={sec.title}
+                    onChange={(e) => {
+                      const nextSecs = (editingSummaryDraft.sections || []).map(
+                        (s, i) => (i === sIdx ? { ...s, title: e.target.value } : s)
+                      );
+                      setEditDraft({
+                        ...editingSummaryDraft,
+                        sections: nextSecs,
+                      });
+                    }}
+                    className="flex-1 border border-border bg-card px-2.5 py-1 text-xs font-bold text-ink"
+                  />
+                </div>
+
+                {(sec.subsections || []).map((sub, subIdx) => (
+                  <div
+                    key={subIdx}
+                    className="space-y-2 border-l-2 border-border pl-3"
+                  >
+                    <input
+                      type="text"
+                      value={sub.title}
+                      onChange={(e) => {
+                        const nextSubs = (sec.subsections || []).map((sb, i) =>
+                          i === subIdx ? { ...sb, title: e.target.value } : sb
+                        );
+                        const nextSecs = (editingSummaryDraft.sections || []).map(
+                          (s, i) =>
+                            i === sIdx ? { ...s, subsections: nextSubs } : s
+                        );
+                        setEditDraft({
+                          ...editingSummaryDraft,
+                          sections: nextSecs,
+                        });
+                      }}
+                      className="w-full border border-border bg-card px-2 py-1 text-xs font-semibold text-ink"
+                    />
+                    {(sub.bullets || []).map((b, bIdx) => (
+                      <div key={bIdx} className="flex items-start gap-1.5">
+                        <input
+                          type="text"
+                          value={b.lead || ""}
+                          onChange={(e) => {
+                            const nextBullets = (sub.bullets || []).map(
+                              (bl, i) =>
+                                i === bIdx ? { ...bl, lead: e.target.value } : bl
+                            );
+                            const nextSubs = (sec.subsections || []).map(
+                              (sb, i) =>
+                                i === subIdx
+                                  ? { ...sb, bullets: nextBullets }
+                                  : sb
+                            );
+                            const nextSecs = (
+                              editingSummaryDraft.sections || []
+                            ).map((s, i) =>
+                              i === sIdx ? { ...s, subsections: nextSubs } : s
+                            );
+                            setEditDraft({
+                              ...editingSummaryDraft,
+                              sections: nextSecs,
+                            });
+                          }}
+                          placeholder="Concept"
+                          className="w-36 shrink-0 border border-border bg-card px-2 py-1 text-xs font-semibold text-ink"
+                        />
+                        <textarea
+                          rows={2}
+                          value={b.text}
+                          onChange={(e) => {
+                            const nextBullets = (sub.bullets || []).map(
+                              (bl, i) =>
+                                i === bIdx ? { ...bl, text: e.target.value } : bl
+                            );
+                            const nextSubs = (sec.subsections || []).map(
+                              (sb, i) =>
+                                i === subIdx
+                                  ? { ...sb, bullets: nextBullets }
+                                  : sb
+                            );
+                            const nextSecs = (
+                              editingSummaryDraft.sections || []
+                            ).map((s, i) =>
+                              i === sIdx ? { ...s, subsections: nextSubs } : s
+                            );
+                            setEditDraft({
+                              ...editingSummaryDraft,
+                              sections: nextSecs,
+                            });
+                          }}
+                          className="flex-1 border border-border bg-card px-2 py-1 text-xs text-ink"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const nextBullets = (sub.bullets || []).filter(
+                              (_, i) => i !== bIdx
+                            );
+                            const nextSubs = (sec.subsections || []).map(
+                              (sb, i) =>
+                                i === subIdx
+                                  ? { ...sb, bullets: nextBullets }
+                                  : sb
+                            );
+                            const nextSecs = (
+                              editingSummaryDraft.sections || []
+                            ).map((s, i) =>
+                              i === sIdx ? { ...s, subsections: nextSubs } : s
+                            );
+                            setEditDraft({
+                              ...editingSummaryDraft,
+                              sections: nextSecs,
+                            });
+                          }}
+                          className="border border-border bg-card p-1.5 text-carmine hover:bg-carmine/10"
+                          title="Supprimer cette puce"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const nextBullets = [
+                          ...(sub.bullets || []),
+                          { lead: "Notion", text: "" },
+                        ];
+                        const nextSubs = (sec.subsections || []).map((sb, i) =>
+                          i === subIdx ? { ...sb, bullets: nextBullets } : sb
+                        );
+                        const nextSecs = (editingSummaryDraft.sections || []).map(
+                          (s, i) =>
+                            i === sIdx ? { ...s, subsections: nextSubs } : s
+                        );
+                        setEditDraft({
+                          ...editingSummaryDraft,
+                          sections: nextSecs,
+                        });
+                      }}
+                      className="inline-flex items-center gap-1 font-mono text-[9px] uppercase text-badge-text hover:underline"
+                    >
+                      <Plus className="h-3 w-3" />
+                      <span>AJOUTER UNE PUCE</span>
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+
+          <div className="space-y-2 border border-border bg-paper p-3.5">
+            <p className="font-mono text-[10px] font-bold uppercase text-ink">
+              POINTS DE VIGILANCE PARTIELS
+            </p>
+            {(editingSummaryDraft.examPitfalls || []).map((pf, pIdx) => (
+              <div key={pIdx} className="flex items-center gap-1.5">
+                <input
+                  type="text"
+                  value={pf}
+                  onChange={(e) => {
+                    const nextPf = editingSummaryDraft.examPitfalls.map(
+                      (x, i) => (i === pIdx ? e.target.value : x)
+                    );
+                    setEditDraft({
+                      ...editingSummaryDraft,
+                      examPitfalls: nextPf,
+                    });
+                  }}
+                  className="flex-1 border border-border bg-card px-2 py-1 text-xs text-ink"
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    setEditDraft({
+                      ...editingSummaryDraft,
+                      examPitfalls: editingSummaryDraft.examPitfalls.filter(
+                        (_, i) => i !== pIdx
+                      ),
+                    });
+                  }}
+                  className="border border-border bg-card p-1 text-carmine"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              onClick={() =>
+                setEditDraft({
+                  ...editingSummaryDraft,
+                  examPitfalls: [
+                    ...(editingSummaryDraft.examPitfalls || []),
+                    "",
+                  ],
+                })
+              }
+              className="inline-flex items-center gap-1 font-mono text-[9px] uppercase text-badge-text hover:underline"
+            >
+              <Plus className="h-3 w-3" />
+              <span>AJOUTER UN PIÈGE</span>
+            </button>
+          </div>
+
+          <div className="flex items-center justify-end gap-2 border-t border-border pt-3">
+            <button
+              type="button"
+              onClick={() => setIsEditing(false)}
+              className="border border-border bg-paper px-3 py-1.5 font-mono text-[10px] uppercase text-stone"
+            >
+              ANNULER
+            </button>
+            <button
+              type="button"
+              disabled={savingEdit}
+              onClick={() => void saveInlineEdit()}
+              className="inline-flex items-center gap-1.5 border border-ink bg-ink px-4 py-1.5 font-mono text-[10px] font-semibold uppercase text-card disabled:opacity-50"
+            >
+              <Save className="h-3 w-3" />
+              <span>ENREGISTRER LES MODIFICATIONS</span>
+            </button>
+          </div>
+        </div>
+      ) : (
       <div className="space-y-5 p-4 sm:p-6">
         {content.overview &&
           !content.overview.trim().startsWith("[") &&
@@ -1162,6 +2157,9 @@ export function StudioArtifactViewer({
           </div>
         )}
       </div>
+      )}
+
+      {renderReportBlock(`Fiche : ${title.slice(0, 70)}`)}
     </div>
   );
 }

@@ -1,14 +1,19 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import Link from "next/link";
 import { useSession } from "next-auth/react";
 import {
+  AlertTriangle,
+  Archive,
   Check,
   CheckCircle2,
   Clock,
   Copy,
+  Cpu,
   Database,
   Flame,
+  Flag,
   HardDrive,
   KeyRound,
   ListChecks,
@@ -34,14 +39,18 @@ import {
   ANNOUNCEMENT_VARIANT_LIST,
   ANNOUNCEMENT_VARIANTS,
 } from "@/lib/announcement-ui";
+import type { DocumentAiQualityRow } from "@/lib/artifact-quality";
+import type { BackupStatus } from "@/lib/backup";
 import {
   CLASS_LEVELS,
   EXAM_TYPES,
   formatExamBadge,
   type ClassLevel,
 } from "@/lib/class-levels";
+import type { ContentIssueReportItem } from "@/lib/content-reports";
 import type { SharedDailyQuizTodayStatus } from "@/lib/revisions";
 import type { BackgroundQueueSnapshot, IndexingQueueItem } from "@/lib/studio";
+import type { SystemErrorLogEntry } from "@/lib/system-logger";
 import type {
   SiteAnnouncementType,
   SystemSettings,
@@ -103,6 +112,29 @@ interface HealthData {
       ue: { id: string; code: string; title: string };
     }>;
   }>;
+  vps?: {
+    cores: number;
+    loadAvg1m: number;
+    loadPercent: number;
+    totalRamBytes: number;
+    usedRamBytes: number;
+    ramPercent: number;
+    nodeRssBytes: number;
+    diskTotalBytes: number;
+    diskFreeBytes: number;
+    diskUsedPercent: number;
+    dbSizeBytes: number;
+    uptimeSeconds: number;
+    ocr: {
+      available: boolean;
+      hasPdftoppm: boolean;
+      hasTesseract: boolean;
+    };
+  };
+  backups?: BackupStatus;
+  recentErrors?: SystemErrorLogEntry[];
+  reports?: ContentIssueReportItem[];
+  documentQuality?: DocumentAiQualityRow[];
 }
 
 interface UEAdminItem {
@@ -127,6 +159,9 @@ interface UEAdminItem {
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} o`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} Ko`;
+  if (bytes >= 1024 * 1024 * 1024) {
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} Go`;
+  }
   return `${(bytes / (1024 * 1024)).toFixed(2)} Mo`;
 }
 
@@ -216,6 +251,15 @@ export default function AdminPage() {
     kind: "ok" | "err";
     text: string;
   } | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupMsg, setBackupMsg] = useState<string | null>(null);
+  const [clearingErrors, setClearingErrors] = useState(false);
+  const [resolvingReportId, setResolvingReportId] = useState<string | null>(
+    null
+  );
+  const [regeneratingDocId, setRegeneratingDocId] = useState<string | null>(
+    null
+  );
 
   // UE Form
   const [editingUeId, setEditingUeId] = useState<string | null>(null);
@@ -608,6 +652,124 @@ export default function AdminPage() {
       }
     } finally {
       setReindexing(false);
+    }
+  }
+
+  async function handleTriggerBackup() {
+    setBackupBusy(true);
+    setBackupMsg(null);
+    try {
+      const res = await fetch("/api/system/backup", { method: "POST" });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        mode?: string;
+        createdFiles?: string[];
+        status?: BackupStatus;
+        warning?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setBackupMsg(data.error || "Erreur lors de la sauvegarde manuelle.");
+        return;
+      }
+      if (data.status) {
+        setHealth((prev) => (prev ? { ...prev, backups: data.status } : prev));
+      }
+      const filesLabel =
+        data.createdFiles && data.createdFiles.length > 0
+          ? data.createdFiles.join(", ")
+          : "archive créée";
+      setBackupMsg(
+        `Sauvegarde créée (${data.mode || "BACKUP"}) : ${filesLabel}${
+          data.warning ? ` · Note : ${data.warning}` : ""
+        }`
+      );
+    } finally {
+      setBackupBusy(false);
+    }
+  }
+
+  async function handleClearErrorLogs() {
+    setClearingErrors(true);
+    try {
+      const res = await fetch("/api/system/queue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "CLEAR_ERROR_LOGS" }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        queue?: BackgroundQueueSnapshot;
+        notice?: string;
+        error?: string;
+      };
+      if (res.ok) {
+        if (data.queue) setQueue(data.queue);
+        if (data.notice) setQueueNotice(data.notice);
+        setHealth((prev) => (prev ? { ...prev, recentErrors: [] } : prev));
+      }
+    } finally {
+      setClearingErrors(false);
+    }
+  }
+
+  async function handleResolveReport(
+    id: string,
+    status: "RESOLVED" | "DISMISSED"
+  ) {
+    setResolvingReportId(id);
+    try {
+      const res = await fetch("/api/studio/reports", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id, status }),
+      });
+      if (res.ok) {
+        setHealth((prev) =>
+          prev
+            ? {
+                ...prev,
+                reports: (prev.reports || []).filter((r) => r.id !== id),
+              }
+            : prev
+        );
+      }
+    } finally {
+      setResolvingReportId(null);
+    }
+  }
+
+  async function handleRegenerateDocument(documentId: string) {
+    setRegeneratingDocId(documentId);
+    setQueueError(null);
+    setQueueNotice(null);
+    try {
+      const res = await fetch("/api/system/queue", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "REGENERATE_DOCUMENT_AI",
+          documentId,
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        queue?: BackgroundQueueSnapshot;
+        notice?: string;
+        message?: string;
+        error?: string;
+      };
+      if (!res.ok) {
+        setQueueError(
+          data.message ||
+            data.error ||
+            "Impossible de lancer la régénération du document."
+        );
+        return;
+      }
+      if (data.queue) setQueue(data.queue);
+      if (data.notice) setQueueNotice(data.notice);
+      void fetchAdminData();
+    } finally {
+      setRegeneratingDocId(null);
     }
   }
 
@@ -1771,6 +1933,481 @@ export default function AdminPage() {
                   </div>
                 </div>
               )}
+            </div>
+          )}
+
+          {health && (
+            <div className="space-y-4">
+              {/* VPS Metrics & Manual Backups */}
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                {/* VPS Metrics Card */}
+                <div className="border border-border bg-card p-4">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
+                    <div className="flex items-center gap-2">
+                      <Cpu className="h-4 w-4 text-ink" />
+                      <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                        MÉTRIQUES SERVEUR VPS &amp; OCR LOCAL
+                      </h3>
+                    </div>
+                    {health.vps && (
+                      <span
+                        className={`border px-2 py-0.5 font-mono text-[10px] font-semibold uppercase ${
+                          health.vps.ocr.available
+                            ? "border-forest/40 bg-forest/10 text-forest"
+                            : "border-amber bg-amber/15 text-ink"
+                        }`}
+                      >
+                        {health.vps.ocr.available
+                          ? "OCR PRÊT (PDFTOPPM + TESSERACT)"
+                          : "OCR NON INSTALLÉ"}
+                      </span>
+                    )}
+                  </div>
+
+                  {health.vps ? (
+                    <div className="space-y-3">
+                      <div>
+                        <div className="mb-1 flex items-center justify-between font-mono text-[11px]">
+                          <span className="text-stone">CPU · LOAD 1M</span>
+                          <span className="font-bold text-ink">
+                            {health.vps.loadPercent}% ({health.vps.loadAvg1m} /{" "}
+                            {health.vps.cores} vCPU)
+                          </span>
+                        </div>
+                        <div className="h-2 w-full bg-paper">
+                          <div
+                            className={`h-full ${
+                              health.vps.loadPercent >= 85
+                                ? "bg-carmine"
+                                : health.vps.loadPercent >= 60
+                                ? "bg-amber"
+                                : "bg-forest"
+                            }`}
+                            style={{ width: `${Math.min(100, health.vps.loadPercent)}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="mb-1 flex items-center justify-between font-mono text-[11px]">
+                          <span className="text-stone">RAM SERVEUR</span>
+                          <span className="font-bold text-ink">
+                            {health.vps.ramPercent}% ·{" "}
+                            {formatBytes(health.vps.usedRamBytes)} /{" "}
+                            {formatBytes(health.vps.totalRamBytes)}
+                          </span>
+                        </div>
+                        <div className="h-2 w-full bg-paper">
+                          <div
+                            className={`h-full ${
+                              health.vps.ramPercent >= 88
+                                ? "bg-carmine"
+                                : health.vps.ramPercent >= 70
+                                ? "bg-amber"
+                                : "bg-forest"
+                            }`}
+                            style={{ width: `${Math.min(100, health.vps.ramPercent)}%` }}
+                          />
+                        </div>
+                      </div>
+
+                      <div>
+                        <div className="mb-1 flex items-center justify-between font-mono text-[11px]">
+                          <span className="text-stone">DISQUE</span>
+                          <span className="font-bold text-ink">
+                            {health.vps.diskUsedPercent}% utilisé · libre{" "}
+                            {formatBytes(health.vps.diskFreeBytes)}
+                          </span>
+                        </div>
+                        <div className="h-2 w-full bg-paper">
+                          <div
+                            className={`h-full ${
+                              health.vps.diskUsedPercent >= 85
+                                ? "bg-carmine"
+                                : health.vps.diskUsedPercent >= 70
+                                ? "bg-amber"
+                                : "bg-forest"
+                            }`}
+                            style={{
+                              width: `${Math.min(100, health.vps.diskUsedPercent)}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-2 border-t border-border pt-2.5 font-mono text-[11px]">
+                        <div className="bg-paper px-2.5 py-2">
+                          <p className="text-[9px] uppercase text-stone">
+                            BASE POSTGRESQL
+                          </p>
+                          <p className="font-bold text-ink">
+                            {formatBytes(health.vps.dbSizeBytes)}
+                          </p>
+                        </div>
+                        <div className="bg-paper px-2.5 py-2">
+                          <p className="text-[9px] uppercase text-stone">
+                            PROCESS NODE RSS
+                          </p>
+                          <p className="font-bold text-ink">
+                            {formatBytes(health.vps.nodeRssBytes)} · up{" "}
+                            {formatEtaSeconds(health.vps.uptimeSeconds)}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="font-mono text-xs text-stone">
+                      Métriques VPS indisponibles.
+                    </p>
+                  )}
+                </div>
+
+                {/* Backups Card */}
+                <div className="flex flex-col justify-between border border-border bg-card p-4">
+                  <div>
+                    <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
+                      <div className="flex items-center gap-2">
+                        <Archive className="h-4 w-4 text-ink" />
+                        <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                          SAUVEGARDES (DB + PDFS)
+                        </h3>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={handleTriggerBackup}
+                        disabled={backupBusy}
+                        className="inline-flex min-h-[38px] items-center gap-1.5 border border-ink bg-ink px-3 py-1.5 font-mono text-[10px] font-semibold uppercase tracking-wider text-card hover:bg-forest disabled:opacity-50"
+                      >
+                        {backupBusy ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Archive className="h-3.5 w-3.5" />
+                        )}
+                        <span>
+                          {backupBusy
+                            ? "SAUVEGARDE..."
+                            : "SAUVEGARDER MAINTENANT"}
+                        </span>
+                      </button>
+                    </div>
+
+                    {health.backups ? (
+                      <div className="space-y-2.5 font-mono text-[11px]">
+                        <div className="flex flex-wrap items-center justify-between gap-2 bg-paper px-3 py-2">
+                          <span className="text-stone">ARCHIVES EN DISQUE</span>
+                          <span className="font-bold text-ink">
+                            {health.backups.count} fichier(s) ·{" "}
+                            {formatBytes(health.backups.totalBytes)}
+                          </span>
+                        </div>
+                        <div className="flex flex-wrap items-center justify-between gap-2 bg-paper px-3 py-2">
+                          <span className="text-stone">DERNIÈRE SAUVEGARDE</span>
+                          <span className="font-bold text-ink">
+                            {health.backups.latestAt
+                              ? new Date(health.backups.latestAt).toLocaleString(
+                                  "fr-FR"
+                                )
+                              : "Aucune archive"}
+                          </span>
+                        </div>
+
+                        {health.backups.files.length > 0 && (
+                          <div className="space-y-1 pt-1">
+                            {health.backups.files.slice(0, 3).map((f) => (
+                              <div
+                                key={f.name}
+                                className="flex items-center justify-between border border-border/70 bg-paper px-2.5 py-1 text-[10px]"
+                              >
+                                <span className="truncate font-semibold text-ink">
+                                  {f.name}
+                                </span>
+                                <span className="shrink-0 text-stone">
+                                  {formatBytes(f.sizeBytes)}
+                                </span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    ) : (
+                      <p className="font-mono text-xs text-stone">
+                        Dossier de sauvegarde non initialisé.
+                      </p>
+                    )}
+                  </div>
+
+                  {backupMsg && (
+                    <div className="mt-3 border border-border bg-pinned px-3 py-2 font-mono text-[11px] text-ink">
+                      {backupMsg}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* System Error Logs */}
+              <div className="border border-border bg-card p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
+                  <div className="flex items-center gap-2">
+                    <AlertTriangle className="h-4 w-4 text-carmine" />
+                    <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                      JOURNAL D&apos;ERREURS SYSTÈME (
+                      {health.recentErrors?.length ?? 0})
+                    </h3>
+                  </div>
+                  {(health.recentErrors?.length ?? 0) > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleClearErrorLogs}
+                      disabled={clearingErrors}
+                      className="inline-flex min-h-[36px] items-center gap-1.5 border border-border bg-paper px-3 py-1 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-carmine hover:text-carmine disabled:opacity-50"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                      <span>
+                        {clearingErrors ? "VIDAGE..." : "VIDER LE JOURNAL"}
+                      </span>
+                    </button>
+                  )}
+                </div>
+
+                {!health.recentErrors || health.recentErrors.length === 0 ? (
+                  <p className="font-mono text-xs text-stone">
+                    Aucune erreur récente enregistrée (Ollama / OCR / Backup / File IA).
+                  </p>
+                ) : (
+                  <div className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
+                    {health.recentErrors.map((err) => (
+                      <div
+                        key={err.id}
+                        className="border border-carmine/30 bg-paper px-3 py-2 font-mono text-[11px]"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="border border-carmine/40 bg-carmine/10 px-1.5 py-0.5 text-[9px] font-bold uppercase text-carmine">
+                            {err.source}
+                          </span>
+                          <span className="text-[10px] text-stone">
+                            {new Date(err.createdAt).toLocaleString("fr-FR")}
+                          </span>
+                        </div>
+                        <p className="mt-1 font-sans text-xs font-semibold text-ink">
+                          {err.message}
+                        </p>
+                        {err.detail && (
+                          <p className="mt-0.5 truncate text-[10px] text-stone">
+                            {err.detail}
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* AI Quality Control per Document */}
+              {health.documentQuality && health.documentQuality.length > 0 && (
+                <div className="border border-border bg-card p-4">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
+                    <div className="flex items-center gap-2">
+                      <Sparkles className="h-4 w-4 text-ink" />
+                      <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                        CONTRÔLE QUALITÉ DES CONTENUS IA PAR DOCUMENT (
+                        {health.documentQuality.length})
+                      </h3>
+                    </div>
+                    <div className="flex flex-wrap gap-1.5 font-mono text-[9px] uppercase">
+                      <span className="border border-forest/40 bg-forest/10 px-1.5 py-0.5 text-forest">
+                        DENSE:{" "}
+                        {
+                          health.documentQuality.filter(
+                            (d) => d.densityStatus === "DENSE"
+                          ).length
+                        }
+                      </span>
+                      <span className="border border-amber bg-amber/15 px-1.5 py-0.5 text-ink">
+                        MOYEN:{" "}
+                        {
+                          health.documentQuality.filter(
+                            (d) => d.densityStatus === "MOYEN"
+                          ).length
+                        }
+                      </span>
+                      <span className="border border-carmine/40 bg-carmine/10 px-1.5 py-0.5 text-carmine">
+                        MAIGRE / MANQUANT:{" "}
+                        {
+                          health.documentQuality.filter(
+                            (d) =>
+                              d.densityStatus === "MAIGRE" ||
+                              d.densityStatus === "MANQUANT"
+                          ).length
+                        }
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="max-h-96 space-y-2 overflow-y-auto pr-1">
+                    {health.documentQuality.map((doc) => {
+                      const badgeStyle =
+                        doc.densityStatus === "DENSE"
+                          ? "border-forest/40 bg-forest/10 text-forest"
+                          : doc.densityStatus === "MOYEN"
+                          ? "border-amber bg-amber/15 text-ink"
+                          : doc.densityStatus === "MAIGRE"
+                          ? "border-carmine/50 bg-carmine/10 text-carmine"
+                          : "border-border bg-paper text-stone";
+                      const isRegenerating = regeneratingDocId === doc.documentId;
+
+                      return (
+                        <div
+                          key={doc.documentId}
+                          className="flex flex-wrap items-center justify-between gap-3 border border-border bg-paper px-3 py-2.5"
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="bg-badge-bg px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase text-badge-text">
+                                {doc.ueCode}
+                              </span>
+                              <span
+                                className={`border px-1.5 py-0.5 font-mono text-[9px] font-bold uppercase ${badgeStyle}`}
+                              >
+                                {doc.densityStatus}
+                              </span>
+                              <span className="font-mono text-[10px] text-stone">
+                                {doc.pageCount} p. · {doc.chapterTitle}
+                              </span>
+                            </div>
+                            <p className="mt-1 truncate text-xs font-bold text-ink">
+                              {doc.title}
+                            </p>
+                            <p className="font-mono text-[10px] text-stone">
+                              {doc.summaryChapters} chap. · {doc.summaryWords}{" "}
+                              mots · {doc.flashcardsCount} flashcards ·{" "}
+                              {doc.quizQuestionsCount} questions QCM
+                            </p>
+                          </div>
+
+                          <div className="flex shrink-0 items-center gap-1.5">
+                            <Link
+                              href={`/ues/${doc.ueId}?doc=${doc.documentId}`}
+                              className="inline-flex min-h-[36px] items-center border border-border bg-card px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink"
+                            >
+                              OUVRIR
+                            </Link>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleRegenerateDocument(doc.documentId)
+                              }
+                              disabled={isRegenerating}
+                              className="inline-flex min-h-[36px] items-center gap-1 border border-ink bg-ink px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-card hover:bg-amber hover:text-ink disabled:opacity-50"
+                            >
+                              <RefreshCw
+                                className={`h-3 w-3 ${
+                                  isRegenerating ? "animate-spin" : ""
+                                }`}
+                              />
+                              <span>
+                                {isRegenerating ? "LANCEMENT..." : "RÉGÉNÉRER"}
+                              </span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Student Content Issue Reports */}
+              <div className="border border-border bg-card p-4">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
+                  <div className="flex items-center gap-2">
+                    <Flag className="h-4 w-4 text-carmine" />
+                    <h3 className="font-mono text-xs font-bold uppercase tracking-wider text-ink">
+                      SIGNALEMENTS D&apos;ERREURS ÉTUDIANTS (OPEN :{" "}
+                      {health.reports?.length ?? 0})
+                    </h3>
+                  </div>
+                </div>
+
+                {!health.reports || health.reports.length === 0 ? (
+                  <p className="font-mono text-xs text-stone">
+                    Aucun signalement étudiant en attente.
+                  </p>
+                ) : (
+                  <div className="space-y-2">
+                    {health.reports.map((rep) => {
+                      const isBusy = resolvingReportId === rep.id;
+                      return (
+                        <div
+                          key={rep.id}
+                          className="flex flex-wrap items-start justify-between gap-3 border border-border bg-paper px-3 py-2.5"
+                        >
+                          <div className="min-w-0 flex-1 space-y-1">
+                            <div className="flex flex-wrap items-center gap-1.5 font-mono text-[10px]">
+                              {rep.ueCode && (
+                                <span className="bg-badge-bg px-1.5 py-0.5 font-bold uppercase text-badge-text">
+                                  {rep.ueCode}
+                                </span>
+                              )}
+                              <span className="border border-carmine/40 bg-carmine/10 px-1.5 py-0.5 font-bold uppercase text-carmine">
+                                {rep.targetKind}
+                              </span>
+                              <span className="font-semibold text-ink">
+                                {rep.itemLabel}
+                              </span>
+                              <span className="text-stone">
+                                · par {rep.reporterName} (
+                                {new Date(rep.createdAt).toLocaleDateString(
+                                  "fr-FR"
+                                )}
+                                )
+                              </span>
+                            </div>
+                            <p className="text-xs leading-relaxed text-ink">
+                              {rep.description}
+                            </p>
+                          </div>
+
+                          <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                            {rep.ueId && (
+                              <Link
+                                href={`/ues/${rep.ueId}${
+                                  rep.documentId
+                                    ? `?doc=${rep.documentId}`
+                                    : ""
+                                }`}
+                                className="inline-flex min-h-[36px] items-center border border-border bg-card px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-ink hover:border-ink"
+                              >
+                                CORRIGER
+                              </Link>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleResolveReport(rep.id, "RESOLVED")
+                              }
+                              disabled={isBusy}
+                              className="inline-flex min-h-[36px] items-center gap-1 border border-ink bg-forest px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-card hover:opacity-90 disabled:opacity-50"
+                            >
+                              <Check className="h-3 w-3" />
+                              <span>MARQUER RÉSOLU</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleResolveReport(rep.id, "DISMISSED")
+                              }
+                              disabled={isBusy}
+                              className="inline-flex min-h-[36px] items-center border border-border bg-card px-2.5 py-1 font-mono text-[10px] uppercase tracking-wider text-stone hover:border-carmine hover:text-carmine disabled:opacity-50"
+                            >
+                              IGNORER
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
           )}
         </section>

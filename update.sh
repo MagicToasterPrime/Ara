@@ -49,6 +49,35 @@ main() {
   # 1/5 — Sauvegarde automatique pré-update
   # ----------------------------------------------------------------------------
   log_info "1/5 — Sauvegarde de sécurité pré-mise à jour..."
+  if [[ ! -x /usr/local/bin/ara-backup.sh ]] && [[ -f "${APP_DIR}/.env" ]]; then
+    log_info "Installation du script de sauvegarde quotidienne (/usr/local/bin/ara-backup.sh)..."
+    cat > /usr/local/bin/ara-backup.sh <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+APP_DIR="${APP_DIR}"
+APP_USER="${APP_USER}"
+BACKUP_DIR="\${APP_DIR}/storage/backups"
+mkdir -p "\${BACKUP_DIR}" "\${APP_DIR}/storage/uploads"
+set -a
+source "\${APP_DIR}/.env"
+set +a
+
+STAMP="\$(date +%Y%m%d_%H%M%S)"
+cd "\${APP_DIR}"
+docker compose exec -T postgres pg_dump -U "\${POSTGRES_USER:-ara}" "\${POSTGRES_DB:-ara}" | gzip > "\${BACKUP_DIR}/db_\${STAMP}.sql.gz"
+tar -czf "\${BACKUP_DIR}/uploads_\${STAMP}.tar.gz" -C "\${APP_DIR}/storage" uploads
+chmod 640 "\${BACKUP_DIR}/db_\${STAMP}.sql.gz" "\${BACKUP_DIR}/uploads_\${STAMP}.tar.gz"
+chown -R "\${APP_USER}:\${APP_USER}" "\${BACKUP_DIR}" || true
+find "\${BACKUP_DIR}" -type f -mtime +7 -delete
+EOF
+    chmod 700 /usr/local/bin/ara-backup.sh
+    cat > /etc/cron.d/ara-backup <<'EOF'
+30 3 * * * root /usr/local/bin/ara-backup.sh >> /var/log/ara-backup.log 2>&1
+EOF
+    chmod 644 /etc/cron.d/ara-backup
+    systemctl enable --now cron || true
+    log_ok "Cron de sauvegarde quotidienne (03h30) installé."
+  fi
   if [[ -x /usr/local/bin/ara-backup.sh ]]; then
     if /usr/local/bin/ara-backup.sh; then
       log_ok "Sauvegarde effectuée."
@@ -56,7 +85,7 @@ main() {
       log_warn "La sauvegarde pré-update a retourné un avertissement (poursuite de la mise à jour)."
     fi
   else
-    log_warn "Script /usr/local/bin/ara-backup.sh absent — étape ignorée."
+    log_warn "Script /usr/local/bin/ara-backup.sh absent (.env manquant) — étape ignorée."
   fi
 
   # ----------------------------------------------------------------------------
@@ -94,6 +123,14 @@ main() {
   # Alignement horloge système sur Europe/Paris (heures creuses 00h–07h & Quiz 06h00)
   if command -v timedatectl &>/dev/null; then
     timedatectl set-timezone Europe/Paris 2>/dev/null || true
+  fi
+
+  # Dépendances système OCR (PDF scannés) + pg_dump client (backups manuels via /admin)
+  if ! command -v pdftoppm >/dev/null 2>&1 || ! command -v tesseract >/dev/null 2>&1 || ! command -v pg_dump >/dev/null 2>&1; then
+    log_info "Installation des outils OCR locaux (poppler-utils, tesseract-ocr) et postgresql-client..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y -qq poppler-utils tesseract-ocr tesseract-ocr-fra tesseract-ocr-eng postgresql-client || log_warn "Installation partielle OCR/pg_dump (relancez apt-get update manuellement si nécessaire)."
   fi
 
   # Bascule automatique vers gemma3:12b (fidélité optimale pour le batch nocturne)

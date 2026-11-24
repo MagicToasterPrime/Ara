@@ -124,6 +124,7 @@ export function CustomPdfReader({
   const [captureMode, setCaptureMode] = useState<boolean>(false);
   const [isDraggingCapture, setIsDraggingCapture] = useState<boolean>(false);
   const captureStartRef = useRef<{ x: number; y: number } | null>(null);
+  const swipeStartRef = useRef<{ x: number; y: number } | null>(null);
   const [captureRectPx, setCaptureRectPx] = useState<CaptureBoxPx | null>(null);
   const [capturedImageUrl, setCapturedImageUrl] = useState<string | null>(null);
   const [sendingToWb, setSendingToWb] = useState<boolean>(false);
@@ -152,13 +153,14 @@ export function CustomPdfReader({
     pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.js";
   }, []);
 
-  // Observe canvas viewport width for FIT mode
+  // Observe canvas viewport width for FIT mode (tighter margins on mobile)
   useEffect(() => {
     const el = viewportRef.current;
     if (!el) return;
 
     const updateWidth = () => {
-      const next = Math.max(320, el.clientWidth - 48);
+      const padding = el.clientWidth < 640 ? 12 : 48;
+      const next = Math.max(250, el.clientWidth - padding);
       setContainerWidth(next);
     };
     updateWidth();
@@ -1220,7 +1222,35 @@ export function CustomPdfReader({
         {/* Viewport */}
         <div
           ref={viewportRef}
-          className="relative flex-1 overflow-auto bg-[#ECEAE3] p-6"
+          onTouchStart={(e) => {
+            if (zoomMode !== "FIT" || captureMode || viewMode !== "CANVAS") {
+              swipeStartRef.current = null;
+              return;
+            }
+            const t = e.changedTouches[0];
+            if (t) {
+              swipeStartRef.current = { x: t.clientX, y: t.clientY };
+            }
+          }}
+          onTouchEnd={(e) => {
+            const start = swipeStartRef.current;
+            swipeStartRef.current = null;
+            if (!start || zoomMode !== "FIT" || captureMode || viewMode !== "CANVAS") {
+              return;
+            }
+            const t = e.changedTouches[0];
+            if (!t) return;
+            const dx = t.clientX - start.x;
+            const dy = t.clientY - start.y;
+            if (Math.abs(dx) > 65 && Math.abs(dx) > Math.abs(dy) * 1.4) {
+              if (dx < 0 && currentPage < totalPages) {
+                goToPage(currentPage + 1);
+              } else if (dx > 0 && currentPage > 1) {
+                goToPage(currentPage - 1);
+              }
+            }
+          }}
+          className="relative flex-1 overflow-auto bg-[#ECEAE3] p-2 sm:p-6"
         >
           {loadingDoc ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 font-mono text-xs uppercase tracking-wider text-stone">

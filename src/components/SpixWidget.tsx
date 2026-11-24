@@ -18,6 +18,7 @@ import {
 import { useSpix } from "@/components/SpixContext";
 import { StudioArtifactViewer } from "@/components/StudioArtifactViewer";
 import { renderPdfPageToDataUrl } from "@/lib/pdf-client";
+import { requestStudioArtifactStream } from "@/lib/studio-stream-client";
 import type {
   PageImageInput,
   StudioArtifactContent,
@@ -38,6 +39,7 @@ interface ChatTurn {
   id: string;
   role: "user" | "assistant";
   content: string;
+  statusText?: string;
   sources?: SpixSource[];
   scopeLabel?: string;
   imagePreviewUrl?: string;
@@ -236,10 +238,11 @@ export function SpixWidget() {
         }
       }
 
-      const res = await fetch("/api/studio", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+      const { ok, status, data } = await requestStudioArtifactStream<{
+        title: string;
+        contentJson: string;
+      }>(
+        {
           kind,
           ueId: effectiveScope !== "GLOBAL" ? pageContext.ueId : undefined,
           documentIds:
@@ -250,17 +253,23 @@ export function SpixWidget() {
             effectiveScope === "DOCUMENT" ? pageContext.currentPage : undefined,
           prompt: customPrompt?.trim() || undefined,
           pageImagesBase64,
-        }),
-      });
+        },
+        (percent, label) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    content: `${percent}% — ${label}`,
+                  }
+                : m
+            )
+          );
+        }
+      );
 
-      const data = (await res.json().catch(() => ({}))) as {
-        artifact?: { title: string; contentJson: string };
-        error?: string;
-        code?: string;
-      };
-
-      if (!res.ok || !data.artifact) {
-        if (res.status === 403 || data.code === "USER_AI_DISABLED") {
+      if (!ok || !data.artifact) {
+        if (status === 403 || data.code === "USER_AI_DISABLED") {
           setUserAiAndSpixEnabled(false);
         }
         const msg =
@@ -360,6 +369,7 @@ export function SpixWidget() {
       id: assistantId,
       role: "assistant",
       content: "",
+      statusText: "Recherche vectorielle dans tes cours...",
       sources: [],
     };
 
@@ -451,7 +461,13 @@ export function SpixWidget() {
             if (event.type === "sources" && event.sources) {
               setMessages((prev) =>
                 prev.map((m) =>
-                  m.id === assistantId ? { ...m, sources: event.sources } : m
+                  m.id === assistantId
+                    ? {
+                        ...m,
+                        sources: event.sources,
+                        statusText: `Extraits chargés (${event.sources!.length} sources) · Rédaction par ${ollamaModel}...`,
+                      }
+                    : m
                 )
               );
             } else if (event.type === "token" && event.content) {
@@ -715,7 +731,9 @@ export function SpixWidget() {
 
                   <div className="whitespace-pre-wrap text-xs leading-relaxed text-ink">
                     {turn.content ||
-                      (isStreaming ? "Analyse en cours..." : "")}
+                      (isStreaming
+                        ? turn.statusText || "Analyse en cours..."
+                        : "")}
                   </div>
 
                   {turn.imagePreviewUrl && (

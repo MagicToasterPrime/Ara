@@ -19,6 +19,7 @@ import {
 import { useSpix } from "@/components/SpixContext";
 import { StudioArtifactViewer } from "@/components/StudioArtifactViewer";
 import { renderPdfPageToDataUrl } from "@/lib/pdf-client";
+import { requestStudioArtifactStream } from "@/lib/studio-stream-client";
 import type {
   PageImageInput,
   StudioArtifactContent,
@@ -87,9 +88,12 @@ export function NotebookStudioPanel({
   const [prompt, setPrompt] = useState("");
   const [wantPublic, setWantPublic] = useState(true);
   const [userAiEnabled, setUserAiEnabled] = useState(true);
+  const [canEditPublic, setCanEditPublic] = useState(false);
   const [generatingKind, setGeneratingKind] =
     useState<StudioArtifactKind | null>(null);
   const [regeneratingId, setRegeneratingId] = useState<string | null>(null);
+  const [progressPercent, setProgressPercent] = useState(0);
+  const [progressLabel, setProgressLabel] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [autoPublishNotice, setAutoPublishNotice] = useState<string | null>(
     null
@@ -125,6 +129,7 @@ export function NotebookStudioPanel({
         artifacts?: StudioArtifactRow[];
         publicCoverage?: Array<{ documentId: string; kind: string }>;
         userAiAndSpixEnabled?: boolean;
+        canEditPublic?: boolean;
       };
       const list = data.artifacts || [];
       setArtifacts(list);
@@ -132,6 +137,9 @@ export function NotebookStudioPanel({
       if (typeof data.userAiAndSpixEnabled === "boolean") {
         setUserAiEnabled(data.userAiAndSpixEnabled);
         setUserAiAndSpixEnabled(data.userAiAndSpixEnabled);
+      }
+      if (typeof data.canEditPublic === "boolean") {
+        setCanEditPublic(data.canEditPublic);
       }
       setActiveArtifact((prev) => {
         if (focusDocumentId) {
@@ -185,6 +193,8 @@ export function NotebookStudioPanel({
   async function handleGenerate(kind: StudioArtifactKind) {
     if (generatingKind || !canGenerateAi) return;
     setGeneratingKind(kind);
+    setProgressPercent(2);
+    setProgressLabel("Initialisation de la génération locale...");
     setError(null);
     setAutoPublishNotice(null);
     setAiNotice(null);
@@ -205,27 +215,24 @@ export function NotebookStudioPanel({
         }
       }
 
-      const res = await fetch("/api/studio", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          kind,
-          ueId,
-          documentIds: selectedDocIds,
-          prompt: prompt.trim() || undefined,
-          isPublic: wantPublic,
-          pageImagesBase64,
-        }),
-      });
-      const data = (await res.json().catch(() => ({}))) as {
-        artifact?: StudioArtifactRow;
-        autoPublishedFirst?: boolean;
-        usedAi?: boolean;
-        error?: string;
-        code?: string;
-      };
-      if (!res.ok || !data.artifact) {
-        if (res.status === 403 || data.code === "USER_AI_DISABLED") {
+      const { ok, status, data } =
+        await requestStudioArtifactStream<StudioArtifactRow>(
+          {
+            kind,
+            ueId,
+            documentIds: selectedDocIds,
+            prompt: prompt.trim() || undefined,
+            isPublic: wantPublic,
+            pageImagesBase64,
+          },
+          (percent, label) => {
+            setProgressPercent(percent);
+            setProgressLabel(label);
+          }
+        );
+
+      if (!ok || !data.artifact) {
+        if (status === 403 || data.code === "USER_AI_DISABLED") {
           setUserAiEnabled(false);
           setUserAiAndSpixEnabled(false);
         }
@@ -246,6 +253,8 @@ export function NotebookStudioPanel({
       await fetchArtifacts();
     } finally {
       setGeneratingKind(null);
+      setProgressPercent(0);
+      setProgressLabel("");
     }
   }
 
@@ -271,31 +280,31 @@ export function NotebookStudioPanel({
   async function handleRegenerate(art: StudioArtifactRow) {
     if (generatingKind || regeneratingId || !canGenerateAi) return;
     setRegeneratingId(art.id);
+    setProgressPercent(2);
+    setProgressLabel("Préparation de la régénération...");
     setError(null);
     setAutoPublishNotice(null);
     setAiNotice(null);
 
     try {
-      const res = await fetch("/api/studio", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          replaceArtifactId: art.id,
-          kind: art.kind,
-          ueId,
-          documentIds: art.documentId ? [art.documentId] : selectedDocIds,
-          prompt: prompt.trim() || art.prompt || undefined,
-          isPublic: art.isPublic,
-        }),
-      });
-      const data = (await res.json().catch(() => ({}))) as {
-        artifact?: StudioArtifactRow;
-        usedAi?: boolean;
-        error?: string;
-        code?: string;
-      };
-      if (!res.ok || !data.artifact) {
-        if (res.status === 403 || data.code === "USER_AI_DISABLED") {
+      const { ok, status, data } =
+        await requestStudioArtifactStream<StudioArtifactRow>(
+          {
+            replaceArtifactId: art.id,
+            kind: art.kind,
+            ueId,
+            documentIds: art.documentId ? [art.documentId] : selectedDocIds,
+            prompt: prompt.trim() || art.prompt || undefined,
+            isPublic: art.isPublic,
+          },
+          (percent, label) => {
+            setProgressPercent(percent);
+            setProgressLabel(label);
+          }
+        );
+
+      if (!ok || !data.artifact) {
+        if (status === 403 || data.code === "USER_AI_DISABLED") {
           setUserAiEnabled(false);
           setUserAiAndSpixEnabled(false);
         }
@@ -311,6 +320,8 @@ export function NotebookStudioPanel({
       await fetchArtifacts();
     } finally {
       setRegeneratingId(null);
+      setProgressPercent(0);
+      setProgressLabel("");
     }
   }
 
@@ -627,11 +638,26 @@ export function NotebookStudioPanel({
             </span>
           </div>
 
-          {generatingKind && (
-            <div className="mb-3 border border-amber/60 bg-pinned px-3 py-2 font-mono text-[10px] uppercase tracking-wider text-ink">
-              LECTURE DE TOUT LE POLYCOPIÉ PAR TRANCHES DE PAGES : SUR UN GROS
-              POLY CELA PEUT DURER PLUSIEURS DIZAINES DE MINUTES (TRAITEMENT
-              CÔTÉ SERVEUR, 100% LOCAL)...
+          {(generatingKind || regeneratingId) && (
+            <div className="mb-3 space-y-2 border border-amber/60 bg-pinned p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-[10px] font-semibold uppercase tracking-wider text-ink">
+                <span className="inline-flex items-center gap-1.5">
+                  <Loader2 className="h-3 w-3 animate-spin text-amber" />
+                  <span>
+                    {progressLabel ||
+                      "Lecture du polycopié et génération IA locale en cours..."}
+                  </span>
+                </span>
+                <span>{progressPercent}%</span>
+              </div>
+              <div className="h-2 w-full border border-border bg-card">
+                <div
+                  className="h-full bg-amber transition-all duration-300"
+                  style={{
+                    width: `${Math.max(4, Math.min(100, progressPercent))}%`,
+                  }}
+                />
+              </div>
             </div>
           )}
 
@@ -801,8 +827,33 @@ export function NotebookStudioPanel({
             )}
             <StudioArtifactViewer
               key={activeArtifact.id}
+              artifactId={activeArtifact.id}
+              ueId={ueId}
+              ueCode={ueCode}
+              documentId={activeArtifact.documentId}
               title={activeArtifact.title}
               content={parsedContent}
+              canEdit={Boolean(
+                canEditPublic ||
+                  activeArtifact.userId === session?.user?.id ||
+                  session?.user?.globalRole === "YEAR_ADMIN"
+              )}
+              onArtifactUpdated={(nextContent, nextTitle) => {
+                const nextJson = JSON.stringify(nextContent);
+                const resolvedTitle = nextTitle || activeArtifact.title;
+                setActiveArtifact((prev) =>
+                  prev && prev.id === activeArtifact.id
+                    ? { ...prev, title: resolvedTitle, contentJson: nextJson }
+                    : prev
+                );
+                setArtifacts((prev) =>
+                  prev.map((item) =>
+                    item.id === activeArtifact.id
+                      ? { ...item, title: resolvedTitle, contentJson: nextJson }
+                      : item
+                  )
+                );
+              }}
               onOpenSource={onOpenSource}
             />
           </div>
